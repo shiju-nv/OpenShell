@@ -2327,6 +2327,7 @@ mod tests {
             mcp: Some(McpOptions {
                 strict_tool_names,
                 allow_all_known_mcp_methods,
+                versions: Vec::new(),
             }),
             ..Default::default()
         }
@@ -2678,6 +2679,7 @@ mod tests {
             Some(McpOptions {
                 strict_tool_names: Some(false),
                 allow_all_known_mcp_methods: Some(true),
+                versions: Vec::new(),
             })
         );
         assert_eq!(promoted.rules, vec![mcp_tool_rule("new-tool")]);

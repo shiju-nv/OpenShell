@@ -28,6 +28,7 @@ pub mod host_pattern;
 pub mod image;
 pub mod inference;
 pub mod jwt;
+pub mod mcp;
 pub mod metadata;
 pub mod middleware;
 pub mod net;
