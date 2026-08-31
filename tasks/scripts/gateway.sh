@@ -247,9 +247,13 @@ cat >"${CONFIG_PATH}" <<EOF
 version = 1
 
 [openshell.gateway]
+name = "${GATEWAY_NAME}"
 compute_drivers = ["${DRIVER}"]
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true
+
+[openshell.gateway.otlp]
+endpoint = "http://127.0.0.1:4317"
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true

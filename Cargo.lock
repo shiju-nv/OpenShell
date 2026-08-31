@@ -2118,11 +2118,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -3974,15 +3972,22 @@ dependencies = [
 name = "openshell-driver-kubernetes"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
  "k8s-openapi",
  "kube",
  "kube-runtime",
  "miette",
  "notify",
  "openshell-core",
+ "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prost",
  "prost-types",
  "serde",
@@ -3993,6 +3998,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4014,6 +4020,26 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-driver-mxc"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "openshell-core",
+ "openshell-policy",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4343,6 +4369,7 @@ dependencies = [
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-kubernetes-secrets",
+ "openshell-driver-mxc",
  "openshell-driver-podman",
  "openshell-driver-vault",
  "openshell-extension-core",
@@ -5342,15 +5369,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
 dependencies = [
  "aws-lc-rs",
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.2",
+ "rand_pcg",
  "ring",
  "rustc-hash 2.1.2",
  "rustls 0.23.38",
@@ -5472,6 +5500,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "rand_xoshiro"

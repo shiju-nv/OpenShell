@@ -29,6 +29,9 @@ pub const DEFAULT_SSH_PORT: u16 = 2222;
 /// Default gateway server port.
 pub const DEFAULT_SERVER_PORT: u16 = 17670;
 
+/// Default operator-facing name for a gateway installation.
+pub const DEFAULT_GATEWAY_NAME: &str = "openshell";
+
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
 
@@ -126,6 +129,8 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    /// Microsoft MXC isolation session (Windows only).
+    Mxc,
 }
 
 impl ComputeDriverKind {
@@ -136,6 +141,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::Mxc => "mxc",
         }
     }
 }
@@ -176,8 +182,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "mxc" => Ok(Self::Mxc),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, mxc"
             )),
         }
     }
@@ -757,6 +764,9 @@ fn docker_socket_responds(path: &Path) -> bool {
 /// `Deserialize` impls for that purpose).
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Operator-assigned name for this gateway installation.
+    pub name: String,
+
     /// Address to bind the server to.
     pub bind_address: SocketAddr,
 
@@ -1164,6 +1174,7 @@ impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
+            name: DEFAULT_GATEWAY_NAME.to_string(),
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
@@ -1189,6 +1200,13 @@ impl Config {
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
         }
+    }
+
+    /// Create a new configuration with the gateway installation name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Create a new configuration with the given bind address.
@@ -1567,6 +1585,15 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn name_defaults_and_can_be_overridden() {
+        assert_eq!(Config::new(None).name, "openshell");
+        assert_eq!(
+            Config::new(None).with_name("production-us-west").name,
+            "production-us-west"
+        );
     }
 
     #[test]

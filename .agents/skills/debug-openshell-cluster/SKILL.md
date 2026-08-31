@@ -440,8 +440,12 @@ openshell gateway list
 openshell status
 ```
 
-A successful plaintext `helm:skaffold:run` registers and selects the local
-gateway; the forwarding task does not modify gateway metadata.
+The forwarding task always exposes the collector on ports `4317` and `18888`.
+It exposes the gateway on port `8090` only when the `openshell` Service exists,
+so collector-only Docker or Podman development remains valid before a Skaffold
+deployment. A successful plaintext `helm:skaffold:run` registers the local
+gateway and selects it as active; the forwarding task does not modify gateway
+metadata.
 
 If the gateway is healthy but sandbox creation fails:
 
@@ -596,6 +600,7 @@ openshell logs <sandbox-name>
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
+| `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Gateway exits while resolving compute-driver listener requirements | Callback alias topology is unsupported, the Podman network cannot be inspected, or the selected address is not private/authorized | Gateway startup error, `podman info --debug`, Podman network inspection, host IPv4 default route |
 | Admin, health, reflection, or HTTP request is denied on an additional Docker/Podman callback-only listener | Additional callback listeners intentionally expose only sandbox-callable gRPC methods | Retry through the gateway's primary endpoint; inspect the listener-purpose startup log if the address was unexpected |

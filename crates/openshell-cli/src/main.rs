@@ -3071,7 +3071,7 @@ async fn run_async() -> Result<()> {
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name);
-                    Box::pin(run::sandbox_create(
+                    let exit_code = Box::pin(run::sandbox_create(
                         endpoint,
                         &ctx.name,
                         run::SandboxCreateConfig {
@@ -3100,6 +3100,9 @@ async fn run_async() -> Result<()> {
                         &tls,
                     ))
                     .await?;
+                    if exit_code != 0 {
+                        std::process::exit(exit_code);
+                    }
                 }
                 SandboxCommands::Upload {
                     name,
@@ -3225,7 +3228,12 @@ async fn run_async() -> Result<()> {
                                 )
                                 .await?;
                             } else {
-                                run::sandbox_connect(endpoint, &name, &tls, &cli.workspace).await?;
+                                let exit_code =
+                                    run::sandbox_connect(endpoint, &name, &tls, &cli.workspace)
+                                        .await?;
+                                if exit_code != 0 {
+                                    std::process::exit(exit_code);
+                                }
                             }
                             let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                         }

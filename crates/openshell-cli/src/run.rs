@@ -224,6 +224,23 @@ fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
 }
 
+fn has_main_process_result(sandbox: &Sandbox) -> bool {
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    if status.exit_code.is_none() {
+        return false;
+    }
+
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase != SandboxPhase::Error
+        || status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "MainProcessFailed"
+        })
+}
+
 fn build_sandbox_resource_limits(
     cpu: Option<&str>,
     memory: Option<&str>,
@@ -339,19 +356,21 @@ async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
     persist: bool,
-    session_result: Result<()>,
+    session_result: Result<i32>,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
-) -> Result<()> {
+) -> Result<i32> {
     if persist {
         return session_result;
     }
 
     let names = [sandbox_name.to_string()];
     if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
-        if session_result.is_ok() {
-            return Err(err);
+        if let Ok(exit_code) = session_result.as_ref() {
+            return Err(miette::miette!(
+                "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
+            ));
         }
         eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
     }
@@ -422,7 +441,7 @@ pub async fn sandbox_create(
     config: SandboxCreateConfig<'_>,
     workspace: &str,
     tls: &TlsOptions,
-) -> Result<()> {
+) -> Result<i32> {
     let SandboxCreateConfig {
         name,
         from,
@@ -454,6 +473,11 @@ pub async fn sandbox_create(
     if !uploads.is_empty() && !command.is_empty() {
         return Err(miette::miette!(
             "--upload cannot be combined with a trailing main command yet because uploads complete after the canonical process starts"
+        ));
+    }
+    if output != "table" && !command.is_empty() && !detach {
+        return Err(miette::miette!(
+            "structured output cannot be combined with an attached trailing command; use table output to stream the command or add --detach"
         ));
     }
 
@@ -538,6 +562,20 @@ pub async fn sandbox_create(
     } else {
         command.to_vec()
     };
+    let persist = sandbox_should_persist(keep, forward.as_ref());
+    let create_detaches = detach
+        || (persist
+            && command.is_empty()
+            && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
+    let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
+    let annotations = if persist {
+        HashMap::new()
+    } else {
+        HashMap::from([(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        )])
+    };
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
@@ -551,8 +589,9 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
-        annotations: HashMap::new(),
+        annotations,
         workspace: workspace.to_string(),
+        await_main_process_attachment,
     };
 
     let response = match client.create_sandbox(request).await {
@@ -571,7 +610,6 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
     let sandbox_name = if sandbox.object_name().is_empty() {
         "unknown".to_string()
     } else {
@@ -748,8 +786,20 @@ pub async fn sandbox_create(
                     saw_non_ready = true;
                 }
 
-                // Capture error reason from conditions only when phase is Error
-                // to avoid showing stale transient error reasons
+                let main_process_result = has_main_process_result(&s);
+                if matches!(
+                    phase,
+                    SandboxPhase::Completed | SandboxPhase::Error | SandboxPhase::Stopped
+                ) && main_process_result
+                {
+                    if let Some(d) = display.as_interactive_mut() {
+                        d.clear();
+                    }
+                    break;
+                }
+
+                // Capture infrastructure error reasons only after excluding a
+                // canonical-command result, which must attach and drain output.
                 if phase == SandboxPhase::Error
                     && let Some(status) = &s.status
                 {
@@ -828,7 +878,11 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    if final_phase != SandboxPhase::Ready
+    let final_has_main_process_result = has_main_process_result(&last_sandbox);
+    if !(matches!(
+        final_phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped
+    ) || final_phase == SandboxPhase::Error && final_has_main_process_result)
         && let Some(d) = display.as_interactive_mut()
     {
         if final_phase == SandboxPhase::Error {
@@ -941,7 +995,7 @@ pub async fn sandbox_create(
 
             if structured_output {
                 crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
-                return Ok(());
+                return Ok(0);
             }
 
             if let Some(editor) = editor {
@@ -955,18 +1009,18 @@ pub async fn sandbox_create(
                     workspace,
                 )
                 .await?;
-                return Ok(());
+                return Ok(0);
             }
 
-            // Persistent non-interactive creates detach implicitly. An
-            // explicitly ephemeral (`--no-keep`) create must still attach so
-            // it can observe the canonical process and delete the sandbox when
-            // that session ends.
+            // An explicit trailing command is foreground regardless of TTY
+            // detection. Only --detach opts out. Scratch shells retain the
+            // non-interactive implicit-detach behavior.
             if detach
                 || (persist
+                    && command.is_empty()
                     && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
             {
-                return Ok(());
+                return Ok(0);
             }
 
             let connect_result = if persist {
@@ -981,6 +1035,32 @@ pub async fn sandbox_create(
                 .await
             };
 
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                connect_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
+        }
+        SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+            if final_has_main_process_result =>
+        {
+            drop(stream);
+            drop(client);
+            if detach {
+                return Ok(0);
+            }
+            let connect_result = crate::ssh::sandbox_connect_terminal_main(
+                &effective_server,
+                &sandbox_name,
+                &effective_tls,
+                workspace,
+            )
+            .await;
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
@@ -1326,6 +1406,9 @@ pub async fn sandbox_get(
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(exit_code) = sandbox.status.as_ref().and_then(|status| status.exit_code) {
+        println!("  {} {}", "Exit Code:".dimmed(), exit_code);
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -2059,8 +2142,16 @@ pub async fn sandbox_list(
     for sandbox in sandboxes {
         let phase = phase_name(sandbox.phase());
         let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
-            Ok(SandboxPhase::Ready) => phase.green().to_string(),
+            Ok(SandboxPhase::Ready | SandboxPhase::Completed) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
+            Ok(SandboxPhase::Stopped)
+                if sandbox
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.exit_code.is_some()) =>
+            {
+                phase.red().to_string()
+            }
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
@@ -2104,6 +2195,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
+        "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
     })
 }
 
@@ -2393,13 +2485,21 @@ pub async fn sandbox_delete(
             }
         }
 
-        let response = client
+        let response = match client
             .delete_sandbox(DeleteSandboxRequest {
                 name: name.clone(),
                 workspace: workspace.to_string(),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) if status.code() == Code::NotFound => {
+                clear_last_sandbox_if_matches(gateway, workspace, name);
+                println!("{} Sandbox {name} already deleted", "✓".green().bold());
+                continue;
+            }
+            Err(status) => return Err(status).into_diagnostic(),
+        };
 
         let deleted = response.into_inner().deleted;
         if deleted {
@@ -2478,9 +2578,9 @@ async fn wait_for_lifecycle_phase(
         return Ok(sandbox);
     }
     if current == SandboxPhase::Error {
-        return Err(miette!(
-            "sandbox entered Error while waiting for {target:?}"
-        ));
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Err(miette!("{detail} while waiting for {target:?}"));
     }
 
     let timeout = Duration::from_secs(
@@ -4822,7 +4922,6 @@ pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
     }
 
     let mut client = grpc_client(server, tls).await?;
-
     let oidc_profile = if from_oidc_token {
         let existing = client
             .get_provider(GetProviderRequest {
@@ -7406,13 +7505,14 @@ mod tests {
     use super::{
         PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_provider_attachment_table, git_sync_files, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        policy_revision_to_json, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        format_provider_attachment_table, git_sync_files, has_main_process_result,
+        inferred_provider_type, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, parse_driver_config_json,
+        parse_secret_material_env_pairs, policy_revision_to_json,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use crate::commands::common::progress_step_from_metadata;
@@ -7959,6 +8059,48 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
+    }
+
+    #[test]
+    fn infrastructure_error_with_observed_exit_is_not_a_main_process_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(137),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ComputeResourceMissing".to_string(),
+                    message: "sandbox runtime disappeared".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(!has_main_process_result(&sandbox));
+    }
+
+    #[test]
+    fn main_process_failed_condition_identifies_command_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(7),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "MainProcessFailed".to_string(),
+                    message: "canonical main process exited with status 7".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(has_main_process_result(&sandbox));
     }
 
     #[test]

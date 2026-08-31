@@ -460,6 +460,10 @@ struct SshHandler {
 impl Drop for SshHandler {
     fn drop(&mut self) {
         for state in self.channels.values_mut() {
+            if state.main_attached {
+                self.main_session.end_terminal_attachment();
+                state.main_attached = false;
+            }
             if let Some(owner) = state.main_input_owner.take() {
                 self.main_session.release_input(owner);
             }
@@ -537,6 +541,9 @@ impl russh::server::Handler for SshHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if let Some(state) = self.channels.remove(&channel) {
+            if state.main_attached {
+                self.main_session.end_terminal_attachment();
+            }
             if let Some(owner) = state.main_input_owner {
                 self.main_session.release_input(owner);
             }
@@ -557,6 +564,12 @@ impl russh::server::Handler for SshHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
         // Validate port range before truncating u32 -> u16.  The SSH protocol
         // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
         // check, port 65537 truncates to port 1 (privileged).
@@ -692,6 +705,10 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         session.channel_success(channel)?;
         // Only allocate a PTY when the client explicitly requested one via
         // pty_request.  VS Code Remote-SSH sends shell_request *without* a
@@ -709,6 +726,10 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.main_session.finished() {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         session.channel_success(channel)?;
         let command = String::from_utf8_lossy(data).trim().to_string();
         if command.is_empty() {
@@ -725,9 +746,20 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if name == "openshell-main" {
-            let state = self.channels.get_mut(&channel).ok_or_else(|| {
-                anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
-            })?;
+            if !self.channels.contains_key(&channel) {
+                return Err(anyhow::anyhow!(
+                    "subsystem_request on unknown channel {channel:?}"
+                ));
+            }
+            if self.main_session.begin_terminal_attachment().is_err() {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+            let state = self
+                .channels
+                .get_mut(&channel)
+                .expect("main channel existence checked above");
+            state.main_attached = true;
             if let Some(pty) = state.pty_request.take() {
                 self.main_session.resize(
                     pty.col_width,
@@ -750,10 +782,10 @@ impl russh::server::Handler for SshHandler {
                     }
                 }
             };
-            state.main_attached = true;
             state.main_detach_prefix_pending = false;
             state.input_sender = input;
             let mut output = self.main_session.subscribe();
+            let terminal_delivery = Arc::clone(&self.main_session);
             let handle = session.handle();
             session.channel_success(channel)?;
             if let Some(error) = input_warning {
@@ -769,11 +801,13 @@ impl russh::server::Handler for SshHandler {
                 loop {
                     match output.recv().await {
                         Ok(event) => {
-                            let exited = matches!(event, MainOutput::Exit(_));
-                            send_main_output(&handle, channel, event).await;
-                            if exited {
+                            if let MainOutput::Exit(code) = event {
+                                terminal_delivery.wait_for_terminal_reported().await;
+                                let _ = send_main_output(&handle, channel, MainOutput::Exit(code))
+                                    .await;
                                 break;
                             }
+                            let _ = send_main_output(&handle, channel, event).await;
                         }
                         Err(error) => {
                             let _ = handle
@@ -796,7 +830,7 @@ impl russh::server::Handler for SshHandler {
             if let Some(state) = self.channels.get_mut(&channel) {
                 state.main_output_task = Some(output_task.abort_handle());
             }
-        } else if name == "sftp" {
+        } else if name == "sftp" && !self.main_session.finished() {
             session.channel_success(channel)?;
             // sftp-server speaks the SFTP binary protocol over stdin/stdout,
             // which is exactly what spawn_pipe_exec wires up.  This enables
@@ -954,20 +988,18 @@ impl russh::server::Handler for SshHandler {
     }
 }
 
-async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) {
+async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) -> bool {
     match event {
-        MainOutput::Stdout(data) => {
-            let _ = handle.data(channel, data).await;
-        }
-        MainOutput::Stderr(data) => {
-            let _ = handle.extended_data(channel, 1, data).await;
-        }
+        MainOutput::Stdout(data) => handle.data(channel, data).await.is_ok(),
+        MainOutput::Stderr(data) => handle.extended_data(channel, 1, data).await.is_ok(),
         MainOutput::Exit(code) => {
-            let _ = handle.eof(channel).await;
-            let _ = handle
+            let eof_sent = handle.eof(channel).await.is_ok();
+            let status_sent = handle
                 .exit_status_request(channel, code.max(0).unsigned_abs())
-                .await;
-            let _ = handle.close(channel).await;
+                .await
+                .is_ok();
+            let close_sent = handle.close(channel).await.is_ok();
+            eof_sent && status_sent && close_sent
         }
     }
 }
@@ -980,6 +1012,10 @@ impl SshHandler {
         error: Option<&str>,
     ) {
         if let Some(state) = self.channels.get_mut(&channel) {
+            if state.main_attached {
+                self.main_session.end_terminal_attachment();
+                state.main_attached = false;
+            }
             if let Some(owner) = state.main_input_owner.take() {
                 self.main_session.release_input(owner);
             }
@@ -988,7 +1024,6 @@ impl SshHandler {
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
             }
-            state.main_attached = false;
         }
         if let Some(error) = error {
             let _ = handle
@@ -2519,6 +2554,59 @@ mod tests {
         })
         .await
         .expect("handler drop should release canonical input lease");
+    }
+
+    #[tokio::test]
+    async fn main_attachment_closes_naturally_after_terminal_delivery() {
+        let main_session = MainSession::inert();
+        let client = authenticated_test_client_with_main(Arc::clone(&main_session)).await;
+        let mut channel = client.channel_open_session().await.expect("open session");
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .expect("attach main subsystem");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match main_session.acquire_input() {
+                    Err(_) => break,
+                    Ok((owner, _)) => main_session.release_input(owner),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("main subsystem should register its attachment");
+
+        assert!(main_session.finish(7, false).await);
+        main_session.mark_terminal_reported();
+
+        let exit_status = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut exit_status = None;
+            loop {
+                match channel.wait().await {
+                    Some(russh::ChannelMsg::ExitStatus {
+                        exit_status: status,
+                    }) => {
+                        exit_status = Some(status);
+                    }
+                    Some(russh::ChannelMsg::Close) => break exit_status,
+                    None => panic!("main channel ended without a close message"),
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("main channel should deliver its exit status");
+        assert_eq!(exit_status, Some(7));
+        drop(channel);
+        drop(client);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            main_session.wait_for_terminal_attachments(),
+        )
+        .await
+        .expect("peer channel close should release terminal delivery");
     }
 
     #[tokio::test]

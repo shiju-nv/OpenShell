@@ -3,99 +3,37 @@
 
 //! OpenTelemetry trace exporting for the Podman compute driver.
 
-use http::Request;
-use openshell_otel::{
-    HeaderMapExtractor, OtlpTraceConfig, RecordGrpcFailure, RecordGrpcStatus, SdkTracerProvider,
-    ServiceName, SetupError,
-};
-use opentelemetry::propagation::TextMapPropagator as _;
-use opentelemetry::trace::TraceContextExt as _;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
-use tower_http::trace::{GrpcMakeClassifier, MakeSpan, TraceLayer};
-use tracing::{Span, Subscriber};
-use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use openshell_otel::{OtlpTraceConfig, SdkTracerProvider, ServiceName, SetupError};
+pub use openshell_otel::{compute_driver_rpc_layer, compute_driver_rpc_operation};
+use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
 
 const SERVICE_NAME: &str = "openshell-driver-podman";
 const INSTRUMENTATION_SCOPE: &str = "openshell-driver-podman";
-const COMPUTE_DRIVER_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
 pub const IN_PROCESS_TARGET_PREFIX: &str = "openshell_driver_podman";
 
-pub fn compute_driver_rpc_layer() -> TraceLayer<
-    GrpcMakeClassifier,
-    ComputeDriverRpcSpan,
-    (),
-    RecordGrpcStatus,
-    (),
-    RecordGrpcStatus,
-    RecordGrpcFailure,
-> {
-    TraceLayer::new_for_grpc()
-        .make_span_with(ComputeDriverRpcSpan)
-        .on_request(())
-        .on_response(RecordGrpcStatus)
-        .on_body_chunk(())
-        .on_eos(RecordGrpcStatus)
-        .on_failure(RecordGrpcFailure)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ComputeDriverRpcSpan;
-
-impl<B> MakeSpan<B> for ComputeDriverRpcSpan {
-    fn make_span(&mut self, request: &Request<B>) -> Span {
-        let (operation, method) = compute_driver_rpc_operation(request.uri().path());
-        let span = tracing::info_span!(
-            "driver_rpc",
-            otel.name = operation,
-            otel.kind = "server",
-            otel.status_code = tracing::field::Empty,
-            rpc.system = "grpc",
-            rpc.service = COMPUTE_DRIVER_SERVICE,
-            rpc.method = method,
-            rpc.grpc.status_code = tracing::field::Empty,
-        );
-        let parent = TraceContextPropagator::new().extract_with_context(
-            &opentelemetry::Context::new(),
-            &HeaderMapExtractor::new(request.headers()),
-        );
-        if parent.span().span_context().is_valid() {
-            let _ = span.set_parent(parent);
-        }
-        span
-    }
-}
-
-pub(crate) fn compute_driver_rpc_operation(path: &str) -> (&'static str, &'static str) {
-    match path.rsplit('/').next() {
-        Some("GetCapabilities") => ("driver.get_capabilities", "get_capabilities"),
-        Some("GetGatewayListenerRequirements") => (
-            "driver.get_gateway_listener_requirements",
-            "get_gateway_listener_requirements",
-        ),
-        Some("ValidateSandboxCreate") => {
-            ("driver.validate_sandbox_create", "validate_sandbox_create")
-        }
-        Some("CreateSandbox") => ("driver.create_sandbox", "create_sandbox"),
-        Some("GetSandbox") => ("driver.get_sandbox", "get_sandbox"),
-        Some("ListSandboxes") => ("driver.list_sandboxes", "list_sandboxes"),
-        Some("StopSandbox") => ("driver.stop_sandbox", "stop_sandbox"),
-        Some("StartSandbox") => ("driver.start_sandbox", "start_sandbox"),
-        Some("DeleteSandbox") => ("driver.delete_sandbox", "delete_sandbox"),
-        Some("WatchSandboxes") => ("driver.watch_sandboxes", "watch_sandboxes"),
-        Some("EnsureWorkspace") => ("driver.ensure_workspace", "ensure_workspace"),
-        Some("DeleteWorkspace") => ("driver.delete_workspace", "delete_workspace"),
-        _ => ("driver.unknown", "unknown"),
-    }
-}
-
+/// Build a tracer provider for the configured OTLP/gRPC endpoint and gateway.
 #[must_use]
-pub fn provider_for(endpoint: Option<&str>) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(endpoint.map(|endpoint| OtlpTraceConfig {
-        endpoint,
-        service_name: ServiceName::Fixed(SERVICE_NAME),
-        service_version: Some(openshell_core::VERSION),
-        resource_attributes: Vec::new(),
+pub fn provider_for(
+    endpoint: Option<&str>,
+    gateway_name: Option<&str>,
+) -> (Option<SdkTracerProvider>, Option<SetupError>) {
+    openshell_otel::provider_for(endpoint.map(|endpoint| {
+        OtlpTraceConfig {
+            endpoint,
+            service_name: ServiceName::Fixed(SERVICE_NAME),
+            service_version: Some(openshell_core::VERSION),
+            resource_attributes: gateway_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    vec![opentelemetry::KeyValue::new(
+                        "openshell.gateway.name",
+                        name.to_string(),
+                    )]
+                })
+                .unwrap_or_default(),
+        }
     }))
 }
 
@@ -191,16 +129,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn podman_driver_spans_reach_otlp_collector_with_distinct_service_name() {
+    async fn podman_driver_spans_reach_otlp_collector_with_resource_identity() {
         let _tracing_lock = super::test_lock().await;
         let collector = OtlpTestServer::start().await;
 
-        let (provider, error) = super::provider_for(Some(collector.endpoint()));
+        let (provider, error) =
+            super::provider_for(Some(collector.endpoint()), Some("production-us-west"));
         assert!(error.is_none());
         let provider = provider.expect("provider");
         let subscriber = tracing_subscriber::registry().with(super::layer(&provider));
         tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("podman.create_sandbox", sandbox.id = "sb-otlp");
+            let span = tracing::info_span!("podman.create", sandbox.id = "sb-otlp");
             drop(span.enter());
             drop(span);
         });
@@ -213,8 +152,9 @@ mod tests {
             received
                 .spans
                 .iter()
-                .any(|span| span.name == "podman.create_sandbox")
+                .any(|span| span.name == "podman.create")
         );
+        assert_eq!(received.gateway_names, ["production-us-west"]);
         assert!(
             received
                 .service_names

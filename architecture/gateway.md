@@ -16,8 +16,10 @@ workloads.
 - Coordinate supervisor relay sessions for connect, exec, file sync, and
   service forwarding.
 - Persist the canonical main-process instance ID and normalized exit code on
-  sandbox status. Any main process exit transitions the sandbox to `Error`,
-  including exit code zero.
+  sandbox status. Exit code zero transitions the sandbox to `Completed`;
+  nonzero results transition it to `Error/MainProcessFailed`. Infrastructure
+  failures also use `Error`, with a distinct reason and no fabricated command
+  result.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
@@ -26,7 +28,15 @@ identity.
 The live supervisor session is the readiness authority for its main-process
 instance. The supervisor reports its normalized result through the
 sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
-results from stale instance IDs.
+results from stale instance IDs. Foreground creation carries a one-shot
+attachment intent to the process supervisor. The supervisor durably reports the
+result immediately, accepts that declared SSH attachment even when the process
+has already exited, sends the retained output and exit status, and waits for the
+peer's channel close before finalizing the result for ephemeral cleanup.
+Detached commands carry no attachment intent, so they finalize and exit
+immediately without a grace period. Finalization is persisted separately from
+the exit result; the gateway deletes an ephemeral sandbox only after the
+finalized supervisor session disconnects.
 
 ## Protocol and Auth
 
@@ -673,6 +683,15 @@ Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
 
+Each installation has an operator-assigned gateway name. Configure it with
+`[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`.
+The built-in default is `openshell`; the Helm chart defaults it to the chart
+fullname so every replica in one installation reports the same identity.
+Operators must set a globally distinct name when one telemetry collector serves
+installations in multiple Kubernetes namespaces or clusters.
+The name identifies the gateway installation independently of client-side
+aliases, network names, and the sandbox JWT issuer.
+
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
@@ -721,12 +740,14 @@ between a trace and its log lines. Store and compute-driver spans become
 children of the request span. Reconciliation, provider refresh, and
 driver-watch loops create their own operation spans because they have no
 inbound request to provide a parent. gRPC status is recorded when response
-trailers arrive.
+trailers arrive. Gateway spans carry resource attributes for the gateway
+identity and configured compute driver.
 
-The gateway forwards OTLP configuration and W3C trace context to managed
-external drivers. Built-in drivers use dedicated in-process providers that
-preserve the same RPC trace boundary. Each driver exports to the configured
-collector under its own service name.
+The gateway forwards OTLP configuration, its configured gateway name, and W3C
+trace context to managed external drivers. Built-in drivers use dedicated
+in-process providers that preserve the same RPC trace boundary. Each driver
+exports to the configured collector under its own service name and carries the
+gateway name as a resource attribute.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

@@ -26,10 +26,14 @@ mise run helm:k3s:create
 ```
 
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
+When the named cluster already exists, the task starts any stopped containers and refreshes
+same-named kubeconfig entries so a recreated load balancer's current API port takes effect.
 Also applies the upstream agent-sandbox CRDs/controller (pinned via `AGENT_SANDBOX_VERSION`
 in `tasks/scripts/helm-k3s-local.sh`, fetched from `github.com/kubernetes-sigs/agent-sandbox`
-releases) and preloads the default community sandbox image into k3d so the first sandbox
-create does not wait on a large registry pull. Traefik is disabled at cluster creation time.
+releases), enables its OTLP tracing on v0.5 and later, installs an OTLP trace
+collector and UI in the `observability` namespace,
+and preloads the default community sandbox image into k3d so the first sandbox create
+does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
@@ -47,6 +51,9 @@ Override with env vars before running `helm:k3s:create`:
 - `HELM_K3S_LB_HOST_PORT` (default: `8080`)
 - `HELM_K3S_PRELOAD_SANDBOX_IMAGE` (default:
   `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`; set to an empty value to skip)
+- `HELM_K3S_COLLECTOR_IMAGE` (default:
+  `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
+- `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
 ### 2. Deploy OpenShell
 
@@ -79,19 +86,43 @@ must be at least `1000` and distinct from the workload UID. The
 sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
 `server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
 Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
-install. Envoy Gateway opt-in; see the Optional Add-ons section below.
+install. The default Skaffold values export gateway and Kubernetes-driver traces to
+the collector service installed by `helm:k3s:create`. Envoy Gateway opt-in; see the
+Optional Add-ons section below.
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or
-the local forwarding task:
+the unified local forwarding task:
 
 ```bash
 mise run helm:k3s:forward
 ```
 
-The task forwards the Kubernetes gateway to `http://127.0.0.1:8090`. A
-successful plaintext `helm:skaffold:run` or `helm:skaffold:run:sidecar`
-registers and selects the gateway under the worktree-specific k3d cluster name.
-Keep the forwarding task running while using the endpoint.
+The task forwards OTLP/gRPC to `http://127.0.0.1:4317` and the trace UI to
+`http://127.0.0.1:18888`. When Skaffold has deployed a Kubernetes gateway, it
+also forwards the gateway to `http://127.0.0.1:8090`; otherwise it continues
+with the collector ports only. A successful plaintext `helm:skaffold:run` or
+`helm:skaffold:run:sidecar` registers the gateway under the worktree-specific
+k3d cluster name and selects it as the active gateway. Keep the forwarding
+task running while using those endpoints.
+
+### Viewing local traces
+
+The gateway exports OTLP/gRPC to
+`http://openshell-collector.observability.svc.cluster.local:4317` through the
+default Skaffold values. Forward OTLP/gRPC and the trace UI to the host:
+
+```bash
+mise run helm:k3s:forward
+```
+
+Open `http://127.0.0.1:18888` and exercise the gateway to inspect gateway and
+Kubernetes compute-driver spans under their distinct service names, along with
+Agent Sandbox controller reconciliation spans linked through the Sandbox
+trace-context annotation. The same command exposes OTLP/gRPC on
+`http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
+`http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
+`gateway:vm` tasks detect the collector listener at startup and enable trace
+export only while it is reachable.
 
 **HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
