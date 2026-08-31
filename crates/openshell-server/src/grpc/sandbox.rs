@@ -3585,6 +3585,7 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 workspace: String::new(),
+                await_main_process_attachment: false,
             }),
         )
         .await
@@ -3641,6 +3642,7 @@ mod tests {
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    await_main_process_attachment: false,
                 }),
             )
             .await
@@ -3739,6 +3741,7 @@ mod tests {
                         labels: HashMap::new(),
                         annotations: HashMap::new(),
                         workspace: String::new(),
+                        await_main_process_attachment: false,
                     }),
                 )
                 .await;
@@ -3806,6 +3809,7 @@ mod tests {
                     labels: HashMap::new(),
                     annotations: HashMap::new(),
                     workspace: String::new(),
+                    await_main_process_attachment: false,
                 }),
             )
             .await
