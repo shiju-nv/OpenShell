@@ -2192,8 +2192,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 mod tests {
     use super::*;
 
+    use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
@@ -3910,6 +3911,10 @@ network_policies:
                             params,
                         }),
                     }],
+                    mcp: Some(McpOptions {
+                        versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {

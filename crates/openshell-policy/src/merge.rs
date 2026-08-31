@@ -3754,6 +3754,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "websocket".to_string(),
+                access: "read-write".to_string(),
                 websocket_credential_rewrite: true,
                 ..Default::default()
             }],
@@ -3799,6 +3800,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "rest".to_string(),
+                access: "read-write".to_string(),
                 request_body_credential_rewrite: true,
                 ..Default::default()
             }],
@@ -4595,6 +4597,7 @@ mod tests {
                 "protocol",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5047,6 +5050,7 @@ mod tests {
                 "protocol",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -5121,6 +5125,7 @@ mod tests {
             "existing",
             vec![NetworkEndpoint {
                 protocol: "rest".to_string(),
+                access: "read-write".to_string(),
                 ..endpoint("api.example.com", 443)
             }],
             &["/usr/bin/trusted"],
@@ -5129,6 +5134,7 @@ mod tests {
             "existing",
             vec![NetworkEndpoint {
                 protocol: "websocket".to_string(),
+                access: "read-write".to_string(),
                 ..endpoint("api.example.com", 443)
             }],
             &["/usr/bin/trusted", "/usr/bin/second"],
@@ -5918,6 +5924,12 @@ mod tests {
             vec![NetworkEndpoint {
                 path: "/graphql".to_string(),
                 protocol: "graphql".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        operation_type: "query".to_string(),
+                        ..Default::default()
+                    }),
+                }],
                 ..endpoint("api.github.com", 443)
             }],
             &["/usr/bin/only"],
