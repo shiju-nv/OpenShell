@@ -64,6 +64,7 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
+const SANDBOX_SERVICE_ROUTE_SUFFIX: &str = ".svc.openshell.internal";
 const FORWARD_ENCODED_SLASH_REJECTION_DETAIL: &str =
     "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
 #[cfg(target_os = "linux")]
@@ -1433,6 +1434,31 @@ fn build_forward_parse_error_ocsf_event(path: &str) -> openshell_ocsf::OcsfEvent
         .build()
 }
 
+fn build_forward_service_route_unavailable_ocsf_event(
+    method: &str,
+    scheme: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new(scheme, host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .message(format!(
+            "FORWARD denied: sandbox service route is not configured for {method} {host}:{port}{path}"
+        ))
+        .status_detail("service_route_unavailable")
+        .build()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_forward_l7_parse_rejection_ocsf_event(
     peer_addr: SocketAddr,
@@ -1800,6 +1826,26 @@ async fn handle_tcp_connection(
                 .build();
             ocsf_emit!(event);
         }
+        return Ok(());
+    }
+
+    // OpenShell owns the complete sandbox service-route suffix. A route miss
+    // must stop before policy or destination resolution can treat it as
+    // ordinary CONNECT egress through DNS or an upstream proxy.
+    if is_sandbox_service_route_host(&host_lc) {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .message("CONNECT denied: sandbox service route is not configured")
+            .status_detail("service_route_unavailable")
+            .build();
+        ocsf_emit!(event);
+        emit_activity(&activity_tx, true, "connect_policy");
+        respond(&mut client, &service_route_unavailable_response()).await?;
         return Ok(());
     }
 
@@ -4883,6 +4929,22 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
+    // Forward HTTP must enforce the same namespace ownership as CONNECT. A
+    // reserved route miss cannot enter policy evaluation, ambient DNS, or the
+    // ordinary upstream connection path.
+    if is_sandbox_service_route_host(&host_lc) {
+        ocsf_emit!(build_forward_service_route_unavailable_ocsf_event(
+            method,
+            &scheme,
+            &host_lc,
+            port,
+            &telemetry_path,
+        ));
+        emit_activity_simple(activity_tx, true, "forward_policy");
+        respond(client, &service_route_unavailable_response()).await?;
+        return Ok(());
+    }
+
     if scheme != "http" {
         let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Refuse)
@@ -6160,6 +6222,40 @@ fn normalize_host(raw_host: &str) -> &str {
     raw_host.strip_suffix('.').unwrap_or(raw_host)
 }
 
+/// Returns whether a hostname belongs to the sandbox service-route namespace.
+///
+/// The leading dot in the suffix enforces a DNS label boundary, while the
+/// nonempty prefix excludes the suffix apex. A single presentation trailing
+/// dot and ASCII case differences name the same reserved host.
+fn is_sandbox_service_route_host(host: &str) -> bool {
+    let normalized_host = normalize_host(host);
+    let Some(prefix_len) = normalized_host
+        .len()
+        .checked_sub(SANDBOX_SERVICE_ROUTE_SUFFIX.len())
+    else {
+        return false;
+    };
+
+    prefix_len > 0
+        && normalized_host
+            .get(prefix_len..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(SANDBOX_SERVICE_ROUTE_SUFFIX))
+}
+
+/// Builds the stable sandbox-facing response for a reserved route miss.
+///
+/// The message identifies the logical failure without exposing any configured
+/// upstream address or revealing whether a route exists outside the sandbox's
+/// workspace.
+fn service_route_unavailable_response() -> Vec<u8> {
+    build_json_error_response(
+        403,
+        "Forbidden",
+        "service_route_unavailable",
+        "sandbox service route is not configured",
+    )
+}
+
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
@@ -6497,7 +6593,10 @@ mod tests {
         }
     }
 
-    async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
+    async fn drive_raw_request_through_handler_with_activity(
+        raw: Vec<u8>,
+        activity_tx: Option<ActivitySender>,
+    ) -> Vec<u8> {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"
 network_middlewares:
@@ -6534,11 +6633,15 @@ network_policies: {}
             None,
             None,
             None,
-            None,
+            activity_tx,
         ))
         .await
         .expect("malformed request should be handled");
         client.await.unwrap()
+    }
+
+    async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
+        drive_raw_request_through_handler_with_activity(raw, None).await
     }
 
     #[tokio::test]
@@ -6821,6 +6924,105 @@ network_policies:
         }
     }
 
+    fn assert_service_route_unavailable(response: &[u8], target: &str) {
+        let response = std::str::from_utf8(response).expect("proxy response should be UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "reserved service route {target} must fail closed: {response:?}"
+        );
+        let body_start = response.find("\r\n\r\n").expect("proxy response body") + 4;
+        let body: serde_json::Value =
+            serde_json::from_str(&response[body_start..]).expect("JSON proxy response");
+        assert_eq!(body["error"], "service_route_unavailable");
+        assert_eq!(body["detail"], "sandbox service route is not configured");
+    }
+
+    fn assert_single_denied_activity(
+        mut activity_rx: mpsc::Receiver<openshell_core::activity::ActivityEvent>,
+        expected_group: &'static str,
+    ) {
+        let activity = activity_rx
+            .try_recv()
+            .expect("reserved route denial should emit one activity");
+        assert!(activity.denied);
+        assert_eq!(activity.deny_group, expected_group);
+        assert!(
+            activity_rx.try_recv().is_err(),
+            "reserved route denial should emit exactly one activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_service_route_forward_http_is_denied_before_egress() {
+        for host in [
+            "tools.svc.openshell.internal",
+            "TOOLS.SVC.OPENSHELL.INTERNAL.",
+        ] {
+            let raw =
+                format!("GET http://{host}/mcp HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes();
+            let (activity_tx, activity_rx) = mpsc::channel(2);
+
+            let response = Box::pin(drive_raw_request_through_handler_with_activity(
+                raw,
+                Some(activity_tx),
+            ))
+            .await;
+
+            assert_service_route_unavailable(&response, host);
+            assert_single_denied_activity(activity_rx, "forward_policy");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_service_route_connect_is_denied_before_egress() {
+        for host in [
+            "tools.svc.openshell.internal",
+            "TOOLS.SVC.OPENSHELL.INTERNAL.",
+        ] {
+            let raw =
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").into_bytes();
+            let (activity_tx, activity_rx) = mpsc::channel(2);
+
+            let response = Box::pin(drive_raw_request_through_handler_with_activity(
+                raw,
+                Some(activity_tx),
+            ))
+            .await;
+
+            assert_service_route_unavailable(&response, host);
+            assert_single_denied_activity(activity_rx, "connect_policy");
+        }
+    }
+
+    #[test]
+    fn service_route_namespace_requires_a_subdomain_label_boundary() {
+        for host in [
+            "tools.svc.openshell.internal",
+            "tools.svc.openshell.internal.",
+            "TOOLS.SVC.OPENSHELL.INTERNAL",
+            "nested.tools.svc.openshell.internal",
+        ] {
+            assert!(
+                is_sandbox_service_route_host(host),
+                "{host} must use the reserved service-route path"
+            );
+        }
+
+        for host in [
+            "svc.openshell.internal",
+            "tools.evilsvc.openshell.internal",
+            "tools.svc.openshell.internal.example.com",
+            "host.openshell.internal",
+            "policy.local",
+            "inference.local",
+        ] {
+            assert!(
+                !is_sandbox_service_route_host(host),
+                "{host} must retain its existing routing behavior"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unsupported_forward_scheme_is_rejected_before_policy_or_middleware_dispatch() {
         let raw = b"GET ftp://api.example.com/resource HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
@@ -6974,6 +7176,38 @@ network_policies:
 
         assert_eq!(body["error"], "policy_denied");
         assert!(body.get("reason").is_none());
+    }
+
+    #[test]
+    fn forward_service_route_unavailable_ocsf_uses_neutral_http_activity() {
+        let event = build_forward_service_route_unavailable_ocsf_event(
+            "GET",
+            "http",
+            "tools.svc.openshell.internal",
+            80,
+            "/mcp",
+        );
+        let json = event.to_json().expect("serialize OCSF event");
+
+        assert_eq!(json["class_name"], "HTTP Activity");
+        assert_eq!(json["activity_id"], 99);
+        assert_eq!(json["activity_name"], "Other");
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(json["disposition"], "Blocked");
+        assert_eq!(json["severity"], "Medium");
+        assert_eq!(json["status"], "Failure");
+        assert_eq!(json["status_detail"], "service_route_unavailable");
+        assert_eq!(json["http_request"]["http_method"], "GET");
+        assert_eq!(
+            json["http_request"]["url"]["hostname"],
+            "tools.svc.openshell.internal"
+        );
+        assert_eq!(json["http_request"]["url"]["path"], "/mcp");
+        assert_eq!(
+            json["dst_endpoint"]["domain"],
+            "tools.svc.openshell.internal"
+        );
+        assert_eq!(json["dst_endpoint"]["port"], 80);
     }
 
     #[test]

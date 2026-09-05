@@ -75,6 +75,7 @@ the shared raw byte relay after the existing adapter gates. Forward HTTP retains
 its guarded single-request relay while sharing authorization, request context,
 policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
+The explicit proxy reserves every hostname matching `*.svc.openshell.internal` for sandbox service routes. CONNECT and absolute-form forward HTTP requests without an activated route return a stable denial before ordinary policy or destination resolution, so a route miss cannot fall back to ambient DNS or an upstream proxy. This namespace does not redefine `host.openshell.internal`, `policy.local`, or `inference.local`.
 An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
 DNS and transparent TCP when the selected runtime advertises that substrate.
 Hostless `allowed_ips` and literal-IP selectors remain available only to the
