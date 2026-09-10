@@ -164,32 +164,76 @@ where
     Ok(())
 }
 
-/// Enforce MCP request-version policy and emit a transport or policy rejection.
-/// Non-MCP adapters share this entry point without changing their behavior.
+/// Return the selected revision's inspection for policy evaluation, or emit a
+/// rejection and return `None`. Non-MCP adapters retain their original inspection.
 pub(crate) async fn enforce_mcp_protocol_version<W>(
     config: &L7EndpointConfig,
     request: &crate::l7::provider::L7Request,
-    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+    mut info: crate::l7::jsonrpc::JsonRpcRequestInfo,
     client: &mut W,
     ctx: &L7EvalContext,
     redacted_target: &str,
-) -> Result<bool>
+) -> Result<Option<crate::l7::jsonrpc::JsonRpcRequestInfo>>
 where
     W: AsyncWrite + Unpin,
 {
     if config.protocol != L7Protocol::Mcp {
-        return Ok(true);
+        return Ok(Some(info));
     }
 
-    match crate::l7::mcp::select_request_protocol_version(request, info, &config.mcp_versions) {
-        Ok(crate::l7::mcp::McpRequestProtocolVersion::Initialization) => Ok(true),
+    match crate::l7::mcp::select_request_protocol_version(request, &info, &config.mcp_versions) {
+        Ok(crate::l7::mcp::McpRequestProtocolVersion::Initialization) => Ok(Some(info)),
         Ok(crate::l7::mcp::McpRequestProtocolVersion::Selected(version)) => {
             debug!(mcp_protocol_version = %version, "Selected MCP request protocol version");
-            Ok(true)
+            info = crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+                request,
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                    version,
+                    config.mcp_strict_tool_names,
+                ),
+            )?;
+            // A bodyless receive stream has nothing for the JSON-RPC parser to
+            // classify, but later middleware re-evaluation must still retain
+            // the exact transport-selected revision.
+            info.mcp_revision = Some(version);
+
+            if let Some(error) = info.error.as_ref() {
+                let reason = error.to_string();
+                let summary = l7_protocol_log_summary(None, Some(&info));
+                ocsf_emit!(build_l7_request_event(
+                    ctx,
+                    &request.action,
+                    redacted_target,
+                    "deny",
+                    "l7-mcp",
+                    &reason,
+                    summary.as_deref(),
+                ));
+                emit_activity(ctx, true, "l7_parse_rejection");
+                let body = serde_json::json!({
+                    "error": "invalid_mcp_request",
+                    "detail": reason,
+                    "policy": ctx.policy_name,
+                    "layer": "l7",
+                    "protocol": "mcp",
+                    "method": request.action,
+                    "path": redacted_target,
+                });
+                crate::l7::rest::send_json_response(
+                    &ctx.policy_name,
+                    body,
+                    client,
+                    "400 Bad Request",
+                )
+                .await?;
+                return Ok(None);
+            }
+
+            Ok(Some(info))
         }
         Err(error) => {
             let reason = error.to_string();
-            let summary = l7_protocol_log_summary(None, Some(info));
+            let summary = l7_protocol_log_summary(None, Some(&info));
             ocsf_emit!(build_l7_request_event(
                 ctx,
                 &request.action,
@@ -224,7 +268,7 @@ where
                 error.http_status(),
             )
             .await?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -248,7 +292,11 @@ where
         request,
         crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
     )?;
-    enforce_mcp_protocol_version(config, request, &info, client, ctx, redacted_target).await
+    Ok(
+        enforce_mcp_protocol_version(config, request, info, client, ctx, redacted_target)
+            .await?
+            .is_some(),
+    )
 }
 
 fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -718,7 +766,7 @@ where
         } else {
             None
         };
-        let jsonrpc_info = if config.protocol.is_jsonrpc_family() {
+        let mut jsonrpc_info = if config.protocol.is_jsonrpc_family() {
             if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&req) {
                 Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
             } else {
@@ -768,6 +816,15 @@ where
             }
         };
 
+        if let Some(info) = jsonrpc_info.take() {
+            let Some(inspected) =
+                enforce_mcp_protocol_version(config, &req, info, client, ctx, &redacted_target)
+                    .await?
+            else {
+                return Ok(());
+            };
+            jsonrpc_info = Some(inspected);
+        }
         let request_info = L7RequestInfo {
             action: req.action.clone(),
             target: redacted_target.clone(),
@@ -775,12 +832,6 @@ where
             graphql: graphql_info.clone(),
             jsonrpc: jsonrpc_info.clone(),
         };
-        if let Some(info) = jsonrpc_info.as_ref()
-            && !enforce_mcp_protocol_version(config, &req, info, client, ctx, &redacted_target)
-                .await?
-        {
-            return Ok(());
-        }
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
             crate::l7::rest::RestProvider::default()
@@ -1905,6 +1956,13 @@ where
             }
         };
 
+        let Some(jsonrpc_info) =
+            enforce_mcp_protocol_version(config, &req, jsonrpc_info, client, ctx, &redacted_target)
+                .await?
+        else {
+            return Ok(());
+        };
+
         let request_info = L7RequestInfo {
             action: req.action.clone(),
             target: redacted_target.clone(),
@@ -1912,11 +1970,6 @@ where
             graphql: None,
             jsonrpc: Some(jsonrpc_info.clone()),
         };
-        if !enforce_mcp_protocol_version(config, &req, &jsonrpc_info, client, ctx, &redacted_target)
-            .await?
-        {
-            return Ok(());
-        }
 
         let hard_deny_reason = l7_request_hard_deny_reason(config.protocol, &request_info);
         let force_deny = hard_deny_reason.is_some();
@@ -2523,6 +2576,7 @@ fn evaluate_jsonrpc_l7_request_for_log(
                 is_batch: true,
                 receive_stream: false,
                 has_response: false,
+                mcp_revision: jsonrpc.mcp_revision,
                 error: None,
             },
         });
@@ -2546,6 +2600,7 @@ fn jsonrpc_request_for_call(
         is_batch: false,
         receive_stream: false,
         has_response: false,
+        mcp_revision: request.jsonrpc.as_ref().and_then(|info| info.mcp_revision),
         error: None,
     });
     item_request
@@ -2581,10 +2636,20 @@ fn reevaluate_transformed_body(
         // unimplemented SQL relay.
         L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => return Ok(None),
         L7Protocol::JsonRpc | L7Protocol::Mcp => {
-            let info = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
-                body,
-                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
-            );
+            let mut inspection_options =
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
+            if let Some(revision) = request_info
+                .jsonrpc
+                .as_ref()
+                .and_then(|info| info.mcp_revision)
+            {
+                // Middleware may replace only the body. Reuse the revision
+                // already selected from the immutable request headers so the
+                // replacement cannot be validated against a different profile.
+                inspection_options = inspection_options.with_mcp_revision(revision);
+            }
+            let info =
+                crate::l7::jsonrpc::parse_jsonrpc_body_with_options(body, inspection_options);
             let mut transformed_info = request_info.clone();
             transformed_info.jsonrpc = Some(info);
             (jsonrpc_engine_type(config.protocol), transformed_info)
@@ -2685,6 +2750,8 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
         "method": call.map(|call| call.method.as_str()),
         "params": call.map(|call| &call.params),
         "tool": call.and_then(|call| call.tool.as_deref()),
+        "mcp_method_classification": call
+            .and_then(|call| call.mcp_classification),
         "receive_stream": info.receive_stream,
         "has_response": info.has_response,
         // Rust keeps the inspection failure kind typed. Rego's stable boundary is
@@ -6964,7 +7031,7 @@ network_policies:
     }
 
     #[test]
-    fn jsonrpc_inspection_error_opa_projection_remains_string_or_null() {
+    fn jsonrpc_inspection_opa_projection_uses_stable_values() {
         let invalid_json = crate::l7::jsonrpc::parse_jsonrpc_body(
             b"{",
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
@@ -6987,6 +7054,29 @@ network_policies:
             serde_json::json!("missing or non-string 'jsonrpc' field")
         );
         assert!(jsonrpc_policy_input(&accepted)["error"].is_null());
+
+        let available = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                true,
+            ),
+        );
+        let extension = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/vendor"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                true,
+            ),
+        );
+        assert_eq!(
+            jsonrpc_policy_input(&available)["mcp_method_classification"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            jsonrpc_policy_input(&extension)["mcp_method_classification"],
+            serde_json::json!("extension")
+        );
     }
 
     #[test]
@@ -7216,9 +7306,12 @@ network_policies:
             target: "/mcp".into(),
             query_params: std::collections::HashMap::new(),
             graphql: None,
-            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#,
-                crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                    openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                    true,
+                ),
             )),
         };
 
@@ -7236,9 +7329,12 @@ network_policies:
         assert!(allowed_message.contains("rule_methods=tools/call"));
         assert!(allowed_message.contains("tools=read_status"));
 
-        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"workspace/main"}}}"#,
-            crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                true,
+            ),
         ));
         let parsed = request.jsonrpc.as_ref().expect("parsed MCP request");
         assert!(
@@ -8736,9 +8832,10 @@ network_policies:
             .unwrap();
     }
 
-    async fn run_rejected_mcp_version_request(
+    async fn run_rejected_mcp_request(
         route_selected: bool,
         version_headers: &str,
+        body: &[u8],
     ) -> (String, Vec<u8>) {
         let (config, tunnel_engine, ctx) = mcp_test_relay_context();
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -8765,7 +8862,6 @@ network_policies:
             }
         });
 
-        let body = br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
         let request = format!(
             "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{version_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -8821,7 +8917,12 @@ network_policies:
             ),
             ("", "403 Forbidden", "mcp_protocol_version_not_allowed"),
         ] {
-            let (response, forwarded) = run_rejected_mcp_version_request(false, headers).await;
+            let (response, forwarded) = run_rejected_mcp_request(
+                false,
+                headers,
+                br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
+            )
+            .await;
             assert!(
                 response.starts_with(&format!("HTTP/1.1 {status}")),
                 "{response}"
@@ -8833,8 +8934,12 @@ network_policies:
 
     #[tokio::test]
     async fn route_selected_mcp_relay_enforces_request_version_before_forwarding() {
-        let (response, forwarded) =
-            run_rejected_mcp_version_request(true, "MCP-Protocol-Version: 2026-07-28\r\n").await;
+        let (response, forwarded) = run_rejected_mcp_request(
+            true,
+            "MCP-Protocol-Version: 2026-07-28\r\n",
+            br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
+        )
+        .await;
 
         assert!(
             response.starts_with("HTTP/1.1 400 Bad Request"),
@@ -8845,6 +8950,30 @@ network_policies:
             "{response}"
         );
         assert!(forwarded.is_empty(), "rejected request reached upstream");
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_rejects_body_outside_selected_profile_before_policy() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+        ]"#;
+        let (response, forwarded) =
+            run_rejected_mcp_request(false, "MCP-Protocol-Version: 2025-11-25\r\n", body).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains("invalid_mcp_request"), "{response}");
+        assert!(
+            response.contains("does not permit top-level JSON-RPC batches"),
+            "{response}"
+        );
+        assert!(
+            forwarded.is_empty(),
+            "profile-invalid request reached upstream"
+        );
     }
 
     #[tokio::test]

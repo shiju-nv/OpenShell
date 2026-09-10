@@ -4690,21 +4690,20 @@ async fn handle_forward_proxy(
                     crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
                 )
             };
-            // Forward HTTP shares the MCP transport gate with CONNECT before
-            // method authorization. Borrow the buffered request so checking
-            // the version does not copy the inspected body.
-            if !crate::l7::relay::enforce_mcp_protocol_version(
+            // Policy evaluation must use the selected revision's inspection,
+            // including method classification, just as the CONNECT relays do.
+            let Some(info) = crate::l7::relay::enforce_mcp_protocol_version(
                 &l7_config.config,
                 &jsonrpc_request,
-                &info,
+                info,
                 client,
                 &l7_ctx,
                 &telemetry_path,
             )
             .await?
-            {
+            else {
                 return Ok(());
-            }
+            };
             forward_request_bytes = jsonrpc_request.raw_header;
             Some(info)
         } else {
@@ -7029,6 +7028,7 @@ network_policies:
                 is_batch: false,
                 receive_stream: false,
                 has_response: true,
+                mcp_revision: None,
                 error: None,
             }),
         };
