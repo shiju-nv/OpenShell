@@ -12,7 +12,9 @@ use miette::WrapErr as _;
 use miette::{IntoDiagnostic as _, Result};
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BoundaryExec, BoundaryLoopbackConnector};
+use openshell_isolation_interface::contract::{
+    BoundaryExec, BoundaryLoopbackConnector, BoundarySignal,
+};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
     ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -41,21 +43,24 @@ pub async fn spawn_workload(
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
 ) -> Result<SpawnedAgent> {
+    // The boundary already runs as the verified workload identity. Selecting
+    // a workdir must not launch a process that needs broader workspace
+    // permissions; validate existing authority without preparing ownership.
+    #[cfg(target_os = "linux")]
+    if let Some(workdir) = workdir {
+        crate::process::validate_workload_workspace_as_effective_identity(std::path::Path::new(workdir))
+            .wrap_err_with(|| {
+                format!(
+                    "WorkspaceValidationFailed: WorkingDir '{workdir}' must already be writable by the workload identity"
+                )
+            })?;
+    }
+
     // Driver-selected workspaces are the sandbox identity's home. This keeps
     // canonical and later exec processes consistent for image WorkingDir and
     // the managed /sandbox fallback without consulting privileged account
     // setup inside the capability-free boundary.
     let workspace = ResolvedWorkspace::new(workdir.map(str::to_string), true);
-
-    #[cfg(target_os = "linux")]
-    if let Some(workspace_root) = workspace.root()
-        && workspace_root != openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT
-    {
-        crate::process::validate_oci_workspace_as_effective_identity(std::path::Path::new(
-            workspace_root,
-        ))
-        .wrap_err("image workspace validation failed")?;
-    }
 
     #[cfg(target_os = "linux")]
     {
@@ -116,7 +121,7 @@ pub async fn spawn_workload(
     let main_session = crate::main_session::MainSession::new(handle.take_io(), handle.pid());
     let (terminal, signal_lock) = handle.signaling_state();
     boundary_runtime
-        .register_process_group(handle.pid(), terminal.clone(), signal_lock.clone())
+        .register_process_group(handle.pid(), terminal.clone(), signal_lock)
         .map_err(|error| miette::miette!(error.to_string()))?;
 
     ocsf_emit!(
@@ -136,7 +141,6 @@ pub async fn spawn_workload(
         handle,
         timeout_secs,
         terminal,
-        signal_lock,
         main_session,
         boundary_exec,
         loopback_connector,
@@ -149,7 +153,6 @@ pub struct SpawnedAgent {
     handle: ProcessHandle,
     timeout_secs: u64,
     terminal: Arc<AtomicBool>,
-    signal_lock: Arc<std::sync::Mutex<()>>,
     main_session: Arc<crate::main_session::MainSession>,
     boundary_exec: Arc<dyn BoundaryExec>,
     loopback_connector: Arc<dyn BoundaryLoopbackConnector>,
@@ -162,7 +165,7 @@ impl SpawnedAgent {
         AgentSignaler {
             pid: self.handle.pid(),
             terminal: self.terminal.clone(),
-            signal_lock: self.signal_lock.clone(),
+            boundary_runtime: self.boundary_runtime.clone(),
         }
     }
 
@@ -183,23 +186,13 @@ impl SpawnedAgent {
     }
 
     /// Wait for the canonical process to exit, enforcing its admitted
-    /// wall-clock timeout. Completion does not end the boundary: exec and
-    /// loopback forwarding remain available until the boundary owner tears
-    /// down the retained runtime.
+    /// wall-clock timeout. A timeout that expires while activation holds the
+    /// process queues its termination signals until release. Completion does
+    /// not end the boundary: exec and loopback forwarding remain available
+    /// until the boundary owner tears down the retained runtime.
     pub async fn wait(&mut self) -> Result<ProcessStatus> {
         let signaler = self.signaler();
-        let status = if self.timeout_secs == 0 {
-            self.handle.wait().await.into_diagnostic()?
-        } else if let Ok(status) =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs), self.handle.wait()).await
-        {
-            status.into_diagnostic()?
-        } else {
-            let _ = signaler.term();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = signaler.kill();
-            self.handle.wait().await.into_diagnostic()?
-        };
+        let status = wait_with_timeout(self.handle.wait(), self.timeout_secs, &signaler).await?;
         self.boundary_runtime
             .unregister_process_group(self.handle.pid(), &self.terminal);
         let _ = self.main_session.finish(status.code(), false).await;
@@ -208,41 +201,66 @@ impl SpawnedAgent {
     }
 }
 
-/// Lock-free process-group signal handle used while another task owns `wait`.
+/// Enforce the admitted deadline without canceling the owned child wait.
+/// A hold can outlive this deadline; signal delivery waits for explicit release.
+async fn wait_with_timeout(
+    wait: impl Future<Output = std::io::Result<ProcessStatus>>,
+    timeout_secs: u64,
+    signaler: &AgentSignaler,
+) -> Result<ProcessStatus> {
+    tokio::pin!(wait);
+    if timeout_secs == 0 {
+        return wait.await.into_diagnostic();
+    }
+    if let Ok(status) = tokio::time::timeout(Duration::from_secs(timeout_secs), &mut wait).await {
+        return status.into_diagnostic();
+    }
+    let _ = signaler.term();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = signaler.kill();
+    wait.await.into_diagnostic()
+}
+
+/// Process-group signal handle that respects the boundary's activation hold.
 #[derive(Clone)]
 pub struct AgentSignaler {
     pid: u32,
     terminal: Arc<AtomicBool>,
-    signal_lock: Arc<std::sync::Mutex<()>>,
+    boundary_runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
 }
 
 #[cfg(unix)]
 impl AgentSignaler {
-    fn deliver(&self, signal: nix::sys::signal::Signal) -> Result<()> {
-        let _guard = self
-            .signal_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.terminal.load(Ordering::Acquire) {
-            return Err(miette::miette!("agent has exited"));
-        }
-        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
-        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), signal).into_diagnostic()
+    fn deliver(&self, signal: BoundarySignal) -> Result<()> {
+        self.boundary_runtime
+            .signal_process_group(self.pid, &self.terminal, signal)
+            .map_err(|error| miette::miette!(error.to_string()))
     }
 
+    /// Request graceful termination, deferring delivery while activation holds.
     pub fn term(&self) -> Result<()> {
-        self.deliver(nix::sys::signal::Signal::SIGTERM)
+        self.deliver(BoundarySignal::Term)
     }
 
+    /// Request forced termination, deferring delivery while activation holds.
     pub fn kill(&self) -> Result<()> {
-        self.deliver(nix::sys::signal::Signal::SIGKILL)
+        self.deliver(BoundarySignal::Kill)
     }
 
+    /// Request interruption, deferring delivery while activation holds.
     pub fn interrupt(&self) -> Result<()> {
-        self.deliver(nix::sys::signal::Signal::SIGINT)
+        self.deliver(BoundarySignal::Int)
     }
 
+    /// Request hangup, deferring delivery while activation holds.
     pub fn hangup(&self) -> Result<()> {
-        self.deliver(nix::sys::signal::Signal::SIGHUP)
+        self.deliver(BoundarySignal::Hup)
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    include!("delegated_hold_tests.rs");
 }

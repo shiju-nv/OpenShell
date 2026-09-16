@@ -189,6 +189,8 @@ fn revision_scoped_dynamic_credentials(
 const CLOUD_METADATA_IPS: &[IpAddr] = &[
     // AWS / GCP / Azure instance metadata service
     IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+    // AWS IPv6 instance metadata service
+    IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
 ];
 
 pub struct ProxyHandle {
@@ -3642,12 +3644,11 @@ pub(crate) fn is_host_gateway_alias(host: &str) -> bool {
 /// to their embedded IPv4 representation before comparison, so the invariant
 /// holds regardless of how the address is represented.
 fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(_) => CLOUD_METADATA_IPS.contains(&ip),
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .is_some_and(|v4| CLOUD_METADATA_IPS.contains(&IpAddr::V4(v4))),
-    }
+    let normalized = match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+    };
+    CLOUD_METADATA_IPS.contains(&normalized)
 }
 
 /// Read the proxy's own `/etc/hosts` at startup and return the IP mapped to
@@ -9438,6 +9439,11 @@ network_policies:
         assert!(is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
             169, 254, 169, 254
         ))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_ipv6_metadata() {
+        assert!(is_cloud_metadata_ip("fd00:ec2::254".parse().unwrap()));
     }
 
     #[test]

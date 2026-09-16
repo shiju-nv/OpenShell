@@ -1,9 +1,6 @@
 # Security Policy
 
-OpenShell policy defines what a sandboxed agent can access. The policy is
-enforced inside each sandbox by kernel controls, process setup, and the local
-policy proxy. The gateway stores and delivers policy, but it does not make
-per-request egress decisions.
+OpenShell policy defines what a sandboxed agent can access. The workload boundary enforces kernel and process controls; the isolated supervisor enforces network policy and credential bindings. The gateway stores and delivers configuration, but it does not make per-request egress decisions.
 
 For the field-by-field YAML reference, use
 [Policy Schema Reference](../docs/reference/policy-schema.mdx).
@@ -13,13 +10,12 @@ For the field-by-field YAML reference, use
 | Area | Enforcement |
 |---|---|
 | Filesystem | Landlock restricts read-only and read-write paths. |
-| Process | The supervisor launches the agent as an unprivileged user with reduced capabilities. |
+| Process | The boundary launches the agent with the admitted non-root identity and zero capabilities. |
 | Network | The proxy evaluates destination, port, calling binary, and optional L7 rules. |
 | Provider access | Attached provider profiles contribute endpoint and binary rules; credentials remain bound to profile-authorized endpoints. |
 | Runtime settings | Typed settings are delivered with policy and can be global or sandbox scoped. |
 
-Filesystem and process policy are startup-time controls. Network policy is
-dynamic and can be hot-reloaded when the new policy validates successfully.
+Filesystem and process policy are startup controls. A rejected initial configuration may be repaired only while durable state proves that no workload release has been authorized. The first release authorization locks static policy before the workload may run. Network policy remains dynamic and is installed with the matching provider state.
 
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
@@ -184,12 +180,7 @@ high-severity detection finding at startup naming the inactive controls.
 
 ## Live Updates
 
-The gateway stores sandbox-authored policy revisions separately from derived
-effective sandbox configuration. Effective configuration can include
-gateway-global policy overrides and provider-profile policy layers. The
-supervisor polls for config revisions and attempts to load new dynamic policy
-into the in-process OPA engine; CLI reads of the latest sandbox policy use the
-same effective configuration path.
+The gateway stores sandbox-authored policy revisions separately from effective configuration, which can include gateway-global overrides and provider-profile layers. An authenticated control poll issues an immutable delivered snapshot of the selected policy, settings, and provider revision. Later changes become desired at the next poll. Observer reads show desired policy and do not prove that the runtime installed it.
 
 The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
 
@@ -210,20 +201,9 @@ ambiguity atomically, without creating an invalid revision or partially
 activating an update. Supervisor validation remains the defense-in-depth
 boundary for startup, concurrent changes, and sources outside those mutations.
 
-The `[openshell.gateway] policy_validation_failure_mode` configuration controls
-candidates rejected by supervisor runtime validation. Gateway preflight
-rejections never become generations and leave the active policy unchanged. The
-runtime mode defaults to `fail_closed`, which publishes a quarantine generation,
-denies new egress, invalidates existing relays, and leaves the previous policy
-inactive. Operators may explicitly select
-`retain_last_valid`, which keeps the previous generation active. With no
-previous valid generation, the effective mode remains `fail_closed` regardless
-of the configured mode. The gateway distributes this startup configuration to
-sandbox supervisors with each effective policy snapshot. OCSF configuration and finding events state the
-candidate version, validation rationale, configured and effective modes, active
-generation, and whether the previous policy is active. Static controls,
-such as filesystem allowlists and process identity, require a new sandbox
-because they are applied before the child process starts.
+The supervisor prepares policy, middleware and matching provider credentials before publication. It stages the boundary environment while the workload is frozen and new exec is blocked, publishes the matching control generation, and commits the boundary installation without resuming execution. Gateway acceptance authorizes release; only an exact release response and final activation report restore readiness and mark the policy loaded. Provider-only updates use the same path. Confirmation or reconnection alone cannot release a workload.
+
+The `[openshell.gateway] policy_validation_failure_mode` setting controls rejected runtime candidates. Gateway preflight rejections leave the active configuration unchanged. The default `fail_closed` holds the workload and readiness, denies new egress, and invalidates old relays until a valid configuration activates. `retain_last_valid` can keep or restore only a previously accepted configuration whose installation is still known for the same boundary. It never authorizes mixed policy and credentials, uncertain commits, or an initial startup fallback. The gateway distributes this posture with effective snapshots; configuration and finding events identify the rejection and effective posture. After first release authorization, static controls require a new sandbox.
 
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.

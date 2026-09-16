@@ -180,7 +180,8 @@ pub struct Networking {
 ///
 /// Returns an error if proxy mode is requested but the proxy configuration,
 /// OPA engine, or identity cache is missing, or if the proxy server fails to
-/// start.
+/// start, or if the supervisor's fallback host-gateway mapping is unsafe or
+/// ambiguous.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_networking(
     policy: &SandboxPolicy,
@@ -204,6 +205,15 @@ pub async fn run_networking(
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
 ) -> Result<Networking> {
+    // Remote workloads resolve through mediated DNS instead of the control
+    // container's hosts file. Pin its driver-injected host alias once, before
+    // tasks start, and give DNS and TCP the same destination identity.
+    let host_gateway_ip = if network_mediation_source.is_some() {
+        crate::host_gateway::resolve(host_gateway_ip)?
+    } else {
+        host_gateway_ip
+    };
+
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.

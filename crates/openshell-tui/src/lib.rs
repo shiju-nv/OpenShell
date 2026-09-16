@@ -879,7 +879,10 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     // Step 2: Fetch the current live policy (includes updates since creation).
     if let Some(id) = sandbox_id {
-        let policy_req = openshell_core::proto::GetSandboxConfigRequest { sandbox_id: id };
+        let policy_req = openshell_core::proto::GetSandboxConfigRequest {
+            sandbox_id: id,
+            ..Default::default()
+        };
 
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -2795,7 +2798,10 @@ async fn refresh_sandbox_policy(app: &mut App) {
         None => return,
     };
 
-    let policy_req = openshell_core::proto::GetSandboxConfigRequest { sandbox_id };
+    let policy_req = openshell_core::proto::GetSandboxConfigRequest {
+        sandbox_id,
+        ..Default::default()
+    };
 
     match tokio::time::timeout(
         Duration::from_secs(5),

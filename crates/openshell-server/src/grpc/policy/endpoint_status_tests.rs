@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::tests::{mcp_policy_with_versions, test_sandbox, with_sandbox};
-use super::super::{handle_get_sandbox_config, handle_report_policy_status, handle_update_config};
+use super::super::tests::{
+    CONFIGURATION_TEST_GATEWAY_TOKEN_ID, configuration_activation_poll,
+    configuration_activation_report, mcp_policy_with_versions, test_sandbox, with_sandbox,
+};
+use super::super::{
+    decode_policy_from_global_settings, deterministic_policy_hash,
+    handle_report_sandbox_configuration, handle_update_config, load_global_settings,
+};
 use super::*;
 use crate::grpc::test_support::{authed_request, test_server_state};
+use crate::policy_store::PolicyStoreExt;
 use openshell_core::endpoint_status::endpoint_id;
 use openshell_core::proto::{
-    EndpointObservation, GetSandboxConfigRequest, GetSandboxRequest, NetworkEndpoint,
-    NetworkPolicyRule, PolicyStatus, ReportPolicyStatusRequest, SandboxCondition, SandboxPhase,
-    UpdateConfigRequest, workspace_selector,
+    ConfigurationAdmissionState, EndpointObservation, GetSandboxConfigResponse, GetSandboxRequest,
+    NetworkEndpoint, NetworkPolicyRule, SandboxCondition, SandboxConfigurationAdmission,
+    SandboxPhase, UpdateConfigRequest, workspace_selector,
 };
 use tonic::Code;
 
@@ -31,6 +38,14 @@ fn ready_condition() -> SandboxCondition {
         reason: "SupervisorReady".to_string(),
         ..Default::default()
     }
+}
+
+fn assert_same_conditions(actual: &[SandboxCondition], expected: &[SandboxCondition]) {
+    let mut actual = actual.to_vec();
+    let mut expected = expected.to_vec();
+    actual.sort_by(|left, right| left.r#type.cmp(&right.r#type));
+    expected.sort_by(|left, right| left.r#type.cmp(&right.r#type));
+    assert_eq!(actual, expected);
 }
 
 fn register_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
@@ -70,28 +85,147 @@ async fn public_status(state: &Arc<ServerState>, sandbox_id: &str) -> SandboxSta
     .expect("status remains present")
 }
 
-async fn acknowledge_loaded_policy(state: &Arc<ServerState>, sandbox_id: &str, version: u32) {
-    handle_report_policy_status(
+async fn endpoint_server_state() -> Arc<ServerState> {
+    let mut state = test_server_state().await;
+    let key = openshell_bootstrap::jwt::generate_jwt_key().expect("generate launch signing key");
+    Arc::get_mut(&mut state)
+        .expect("uniquely owned test state")
+        .sandbox_session_jwt_authority = Some(Arc::new(
+        crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+            key.signing_key_pem.as_bytes(),
+            key.public_key_pem.as_bytes(),
+            key.kid,
+            "test-gateway",
+            std::time::Duration::from_hours(1),
+        )
+        .expect("launch authority"),
+    ));
+    state
+}
+
+async fn register_configuration_runtime(state: &Arc<ServerState>, sandbox_id: &str) {
+    let mut sandbox = stored_sandbox(state, sandbox_id).await;
+    let identity = crate::auth::sandbox_session::PersistedSandboxIdentity {
+        runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+            "activation-generation",
+        )
+        .expect("runtime generation"),
+        auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("credential epoch"),
+        gateway_token_id: CONFIGURATION_TEST_GATEWAY_TOKEN_ID,
+        refresh_replay: None,
+    };
+    identity.write(
+        &mut sandbox
+            .metadata
+            .as_mut()
+            .expect("sandbox metadata")
+            .annotations,
+    );
+    let admission = SandboxConfigurationAdmission {
+        instance_id: uuid::Uuid::new_v4().to_string(),
+        runtime_generation: "activation-generation".to_string(),
+        boundary_instance_id: uuid::Uuid::new_v4().to_string(),
+        boundary_session_id: uuid::Uuid::new_v4().to_string(),
+        state: ConfigurationAdmissionState::Pending.into(),
+        ..Default::default()
+    };
+    let status = sandbox.status.get_or_insert_with(Default::default);
+    status.phase = SandboxPhase::Provisioning.into();
+    status
+        .main_process_instance_id
+        .clone_from(&admission.instance_id);
+    status.configuration_activation_authorized = Some(false);
+    status.conditions = vec![SandboxCondition {
+        r#type: "ComputeReady".to_string(),
+        ..ready_condition()
+    }];
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store runtime identity");
+    let registration = handle_report_sandbox_configuration(
         state,
-        with_sandbox(
-            Request::new(ReportPolicyStatusRequest {
-                sandbox_id: sandbox_id.to_string(),
-                version,
-                status: PolicyStatus::Loaded as i32,
-                load_error: String::new(),
-            }),
-            sandbox_id,
-        ),
+        configuration_activation_report(sandbox_id, admission, "", ""),
     )
     .await
-    .expect("acknowledge loaded policy");
+    .expect("register control and boundary")
+    .into_inner();
+    assert!(!registration.control_registration_grant.is_empty());
+}
+
+async fn issue_configuration(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> (SandboxConfigurationAdmission, GetSandboxConfigResponse) {
+    let sandbox = stored_sandbox(state, sandbox_id).await;
+    let mut admission = sandbox
+        .status
+        .expect("sandbox status")
+        .configuration_admission
+        .expect("registered runtime");
+    let config = configuration_activation_poll(state, sandbox_id, &admission.instance_id).await;
+    assert!(
+        config.configuration_admitted,
+        "{}",
+        config.configuration_error
+    );
+    admission.registration_revision = config.configuration_registration_revision;
+    admission.delivery_revision = config.configuration_delivery_revision;
+    admission
+        .configuration_snapshot
+        .clone_from(&config.configuration_snapshot);
+    admission.policy_version = config.version;
+    admission.policy_hash.clone_from(&config.policy_hash);
+    admission.policy_source = config.policy_source;
+    admission.config_revision = config.config_revision;
+    admission.provider_env_revision = config.provider_env_revision;
+    admission.activation_confirmed = false;
+    // Endpoint authority belongs to the gateway-issued snapshot, not the report.
+    admission.endpoint_configuration = None;
+    (admission, config)
+}
+
+async fn accept_held_configuration(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    admission: &mut SandboxConfigurationAdmission,
+) {
+    admission.state = ConfigurationAdmissionState::Accepted.into();
+    admission.activation_confirmed = false;
+    handle_report_sandbox_configuration(
+        state,
+        configuration_activation_report(sandbox_id, admission.clone(), "", ""),
+    )
+    .await
+    .expect("accept exact installed configuration while held");
+}
+
+async fn confirm_configuration(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    mut admission: SandboxConfigurationAdmission,
+) {
+    accept_held_configuration(state, sandbox_id, &mut admission).await;
+    admission.activation_confirmed = true;
+    handle_report_sandbox_configuration(
+        state,
+        configuration_activation_report(sandbox_id, admission, "", ""),
+    )
+    .await
+    .expect("confirm exact released configuration");
+}
+
+async fn activate_policy_configuration(state: &Arc<ServerState>, sandbox_id: &str, version: u32) {
+    let (admission, _) = issue_configuration(state, sandbox_id).await;
+    assert_eq!(admission.policy_version, version);
+    confirm_configuration(state, sandbox_id, admission).await;
 }
 
 async fn sandbox_with_accepted_endpoint_result(
     sandbox_id: &str,
-    acknowledge_before_observation: bool,
 ) -> (Arc<ServerState>, ReportEndpointStatusRequest) {
-    let state = test_server_state().await;
+    let state = endpoint_server_state().await;
     let mut policy = mcp_policy_with_versions(&["2025-11-25"]);
     let endpoint = &mut policy
         .network_policies
@@ -124,9 +258,8 @@ async fn sandbox_with_accepted_endpoint_result(
         )
         .await
         .expect("store policy revision");
-    if acknowledge_before_observation {
-        acknowledge_loaded_policy(&state, sandbox_id, 1).await;
-    }
+    register_configuration_runtime(&state, sandbox_id).await;
+    activate_policy_configuration(&state, sandbox_id, 1).await;
 
     register_session(&state, sandbox_id, "session-a");
     reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-a")
@@ -138,9 +271,7 @@ async fn sandbox_with_accepted_endpoint_result(
             .initialize_endpoint_status_authority(sandbox_id, "session-a")
     );
     let sandbox = stored_sandbox(&state, sandbox_id).await;
-    let context = active_endpoint_context(&state, &sandbox)
-        .await
-        .expect("active endpoint configuration");
+    let context = active_endpoint_context(&sandbox);
     let endpoint_id = context
         .endpoints
         .keys()
@@ -168,7 +299,7 @@ async fn sandbox_with_accepted_endpoint_result(
     (state, report)
 }
 
-async fn assert_loaded_ack_preserves_endpoint_evidence(
+async fn assert_confirmation_preserves_endpoint_evidence(
     state: &Arc<ServerState>,
     report: ReportEndpointStatusRequest,
     version: u32,
@@ -184,13 +315,13 @@ async fn assert_loaded_ack_preserves_endpoint_evidence(
         .supervisor_sessions
         .endpoint_report_cursor(&report.sandbox_id, &report.supervisor_session_id);
 
-    acknowledge_loaded_policy(state, &report.sandbox_id, version).await;
+    activate_policy_configuration(state, &report.sandbox_id, version).await;
 
     let after = public_status(state, &report.sandbox_id).await;
     assert_eq!(after.current_policy_version, version);
     assert_eq!(after.endpoint_statuses, before.endpoint_statuses);
     assert_eq!(after.phase, before.phase);
-    assert_eq!(after.conditions, before.conditions);
+    assert_same_conditions(&after.conditions, &before.conditions);
     assert_eq!(
         state
             .supervisor_sessions
@@ -199,7 +330,7 @@ async fn assert_loaded_ack_preserves_endpoint_evidence(
     );
 
     // The endpoint RPC may have committed before its acknowledgement was lost.
-    // A later policy acknowledgement cannot invalidate that immutable retry.
+    // A later configuration confirmation cannot invalidate that immutable retry.
     let committed = stored_sandbox(state, &report.sandbox_id).await;
     handle_report_endpoint_status(
         state,
@@ -211,17 +342,16 @@ async fn assert_loaded_ack_preserves_endpoint_evidence(
 }
 
 #[tokio::test]
-async fn loaded_policy_retry_preserves_endpoint_evidence() {
-    let (state, report) =
-        sandbox_with_accepted_endpoint_result("endpoint-loaded-retry", true).await;
+async fn configuration_confirmation_retry_preserves_endpoint_evidence() {
+    let (state, report) = sandbox_with_accepted_endpoint_result("endpoint-loaded-retry").await;
 
-    assert_loaded_ack_preserves_endpoint_evidence(&state, report, 1).await;
+    assert_confirmation_preserves_endpoint_evidence(&state, report, 1).await;
 }
 
 #[tokio::test]
 async fn unchanged_policy_revision_preserves_endpoint_evidence() {
     let sandbox_id = "endpoint-unchanged-revision";
-    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id).await;
     let sandbox = stored_sandbox(&state, sandbox_id).await;
     let revision = handle_update_config(
         &state,
@@ -239,31 +369,90 @@ async fn unchanged_policy_revision_preserves_endpoint_evidence() {
     assert_eq!(revision.version, 2);
     assert_eq!(revision.policy_hash, report.policy_hash);
 
-    assert_loaded_ack_preserves_endpoint_evidence(&state, report, 2).await;
+    assert_confirmation_preserves_endpoint_evidence(&state, report, 2).await;
 }
 
 #[tokio::test]
-async fn initial_loaded_policy_ack_preserves_endpoint_evidence() {
-    let (state, report) =
-        sandbox_with_accepted_endpoint_result("endpoint-initial-ack", false).await;
-    assert_eq!(
-        stored_sandbox(&state, &report.sandbox_id)
-            .await
-            .current_policy_version(),
-        0
+async fn endpoint_observation_requires_confirmed_configuration() {
+    let state = endpoint_server_state().await;
+    let sandbox_id = "endpoint-initial-confirmation";
+    let policy = mcp_policy_with_versions(&["2025-11-25"]);
+    let endpoint_id = endpoint_id(&policy.network_policies["mcp"].endpoints[0]);
+    state
+        .store
+        .put_message(&test_sandbox(sandbox_id, sandbox_id, policy, Vec::new()))
+        .await
+        .expect("store sandbox");
+    register_configuration_runtime(&state, sandbox_id).await;
+    let (mut admission, _) = issue_configuration(&state, sandbox_id).await;
+    register_session(&state, sandbox_id, "session-a");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-a")
+        .await
+        .expect("reset unconfirmed session");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-a")
     );
+    let report = ReportEndpointStatusRequest {
+        sandbox_id: sandbox_id.to_string(),
+        policy_hash: admission.policy_hash.clone(),
+        provider_env_revision: admission.provider_env_revision,
+        observations: vec![EndpointObservation {
+            endpoint_id: endpoint_id.clone(),
+            result: EndpointResult::HttpResponseReceived.into(),
+        }],
+        observed_endpoint_ids: vec![endpoint_id],
+        supervisor_session_id: "session-a".to_string(),
+        report_sequence: 1,
+    };
 
-    // Policy and endpoint reports use independent tasks, so the first exchange
-    // may reach the gateway before the initial loaded-policy acknowledgement.
-    assert_loaded_ack_preserves_endpoint_evidence(&state, report, 1).await;
+    // Neither a delivered ticket nor an accepted-but-held runtime may publish
+    // observations before the boundary confirms release of that configuration.
+    for held in [false, true] {
+        if held {
+            accept_held_configuration(&state, sandbox_id, &mut admission).await;
+        }
+        let before = stored_sandbox(&state, sandbox_id).await;
+        let error = handle_report_endpoint_status(
+            &state,
+            with_sandbox(Request::new(report.clone()), sandbox_id),
+        )
+        .await
+        .expect_err("unconfirmed endpoint observation is rejected");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+        assert!(
+            public_status(&state, sandbox_id)
+                .await
+                .endpoint_statuses
+                .is_empty()
+        );
+        assert!(
+            state
+                .supervisor_sessions
+                .endpoint_report_cursor(sandbox_id, "session-a")
+                .is_none()
+        );
+    }
+
+    confirm_configuration(&state, sandbox_id, admission).await;
+    handle_report_endpoint_status(&state, with_sandbox(Request::new(report), sandbox_id))
+        .await
+        .expect("confirmed runtime accepts its first observation");
+    let status = public_status(&state, sandbox_id).await;
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
 }
 
 #[tokio::test]
-async fn loaded_policy_comparison_uses_one_provider_profile_snapshot() {
+async fn configuration_confirmation_does_not_read_mutable_provider_catalog() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let sandbox_id = "endpoint-policy-catalog-snapshot";
-    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id).await;
     let policy = stored_sandbox(&state, sandbox_id)
         .await
         .spec
@@ -303,21 +492,25 @@ async fn loaded_policy_comparison_uses_one_provider_profile_snapshot() {
         );
     let state = Arc::new(state);
     let before = public_status(&state, sandbox_id).await;
+    let (admission, _) = issue_configuration(&state, sandbox_id).await;
+    assert_eq!(admission.policy_version, 2);
+    let issued_fetch_count = fetch_count.load(Ordering::SeqCst);
+    assert_eq!(issued_fetch_count, 1);
 
-    acknowledge_loaded_policy(&state, sandbox_id, 2).await;
+    confirm_configuration(&state, sandbox_id, admission).await;
 
-    assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fetch_count.load(Ordering::SeqCst), issued_fetch_count);
     let after = public_status(&state, sandbox_id).await;
     assert_eq!(after.current_policy_version, 2);
     assert_eq!(after.endpoint_statuses, before.endpoint_statuses);
     assert_eq!(after.phase, before.phase);
-    assert_eq!(after.conditions, before.conditions);
+    assert_same_conditions(&after.conditions, &before.conditions);
 }
 
 #[tokio::test]
 async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
     let sandbox_id = "endpoint-policy-hash-cycle";
-    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id).await;
     let sandbox = stored_sandbox(&state, sandbox_id).await;
     let original_policy = sandbox
         .spec
@@ -358,7 +551,7 @@ async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
         } else {
             assert_eq!(revision.policy_hash, report.policy_hash);
         }
-        acknowledge_loaded_policy(&state, sandbox_id, version).await;
+        activate_policy_configuration(&state, sandbox_id, version).await;
         let status = public_status(&state, sandbox_id).await;
         assert_eq!(status.current_policy_version, version);
         assert_eq!(status.endpoint_statuses.len(), 1);
@@ -501,7 +694,7 @@ fn expected_endpoint_statuses_canonicalize_identity_and_distinguish_paths() {
 
 #[tokio::test]
 async fn report_endpoint_status_rejects_stale_configuration_epoch() {
-    let state = test_server_state().await;
+    let state = endpoint_server_state().await;
     let sandbox_id = "endpoint-stale";
     state
         .store
@@ -513,18 +706,10 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
         ))
         .await
         .expect("store sandbox");
-    let config = handle_get_sandbox_config(
-        &state,
-        with_sandbox(
-            Request::new(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
-            }),
-            sandbox_id,
-        ),
-    )
-    .await
-    .expect("get sandbox config")
-    .into_inner();
+    register_configuration_runtime(&state, sandbox_id).await;
+    let (admission, config) = issue_configuration(&state, sandbox_id).await;
+    confirm_configuration(&state, sandbox_id, admission).await;
+    let before = stored_sandbox(&state, sandbox_id).await;
     let endpoint = &config
         .policy
         .as_ref()
@@ -576,17 +761,12 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
         assert_eq!(error.code(), Code::FailedPrecondition);
     }
 
-    let stored = state
-        .store
-        .get_message::<Sandbox>(sandbox_id)
-        .await
-        .expect("load sandbox")
-        .expect("sandbox remains present");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
     assert!(
-        stored
-            .status
-            .as_ref()
-            .is_none_or(|status| status.endpoint_statuses.is_empty())
+        state
+            .supervisor_sessions
+            .endpoint_report_cursor(sandbox_id, "session-current")
+            .is_none()
     );
 }
 
@@ -835,7 +1015,7 @@ async fn startup_reconciliation_invalidates_status_from_previous_sessions() {
 
 #[tokio::test]
 async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
-    let state = test_server_state().await;
+    let state = endpoint_server_state().await;
     let sandbox_id = "endpoint-session";
     let mut policy = mcp_policy_with_versions(&["2025-11-25"]);
     let endpoints = &mut policy
@@ -859,18 +1039,10 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         .put_message(&sandbox)
         .await
         .expect("store sandbox");
-    let config = handle_get_sandbox_config(
-        &state,
-        with_sandbox(
-            Request::new(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
-            }),
-            sandbox_id,
-        ),
-    )
-    .await
-    .expect("sandbox config")
-    .into_inner();
+    register_configuration_runtime(&state, sandbox_id).await;
+    let (admission, config) = issue_configuration(&state, sandbox_id).await;
+    confirm_configuration(&state, sandbox_id, admission).await;
+    let confirmed_conditions = public_status(&state, sandbox_id).await.conditions;
     let endpoints = &config.policy.as_ref().expect("policy").network_policies["mcp"].endpoints;
     let observed_id = endpoint_id(&endpoints[0]);
     let unobserved_id = endpoint_id(&endpoints[1]);
@@ -892,7 +1064,7 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
     );
     let initial_status = public_status(&state, sandbox_id).await;
     assert_eq!(initial_status.endpoint_statuses, initial);
-    assert_eq!(initial_status.conditions, vec![ready_condition()]);
+    assert_eq!(initial_status.conditions, confirmed_conditions);
 
     let report = ReportEndpointStatusRequest {
         sandbox_id: sandbox_id.to_string(),
@@ -921,7 +1093,7 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
     let first = stored_sandbox(&state, sandbox_id).await;
     let public = public_status(&state, sandbox_id).await;
     assert_eq!(public.phase, SandboxPhase::Ready as i32);
-    assert_eq!(public.conditions, vec![ready_condition()]);
+    assert_eq!(public.conditions, confirmed_conditions);
     let mut expected = initial.clone();
     let observed = expected
         .iter_mut()
@@ -968,7 +1140,7 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
     let newest = stored_sandbox(&state, sandbox_id).await;
     let recovered = public_status(&state, sandbox_id).await;
     assert_eq!(recovered.phase, SandboxPhase::Ready as i32);
-    assert_eq!(recovered.conditions, vec![ready_condition()]);
+    assert_eq!(recovered.conditions, confirmed_conditions);
     assert_eq!(
         recovered
             .endpoint_statuses
@@ -1001,7 +1173,7 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
         .expect("disconnect reset");
     let disconnected = public_status(&state, sandbox_id).await;
     assert_eq!(disconnected.endpoint_statuses, initial);
-    assert_eq!(disconnected.conditions, vec![ready_condition()]);
+    assert_eq!(disconnected.conditions, confirmed_conditions);
     register_session(&state, sandbox_id, "session-b");
     reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-b")
         .await
@@ -1023,8 +1195,8 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
 }
 
 #[tokio::test]
-async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
-    let state = test_server_state().await;
+async fn confirmed_configuration_and_endpoint_inventory_commit_atomically() {
+    let state = endpoint_server_state().await;
     let sandbox_id = "endpoint-policy-activation";
     let mut old_policy = mcp_policy_with_versions(&["2025-11-25"]);
     old_policy
@@ -1037,7 +1209,6 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
     let mut sandbox = test_sandbox(sandbox_id, sandbox_id, old_policy, Vec::new());
     sandbox.status = Some(SandboxStatus {
         sandbox_name: sandbox_id.to_string(),
-        current_policy_version: 0,
         endpoint_statuses: vec![EndpointStatus {
             last_result: EndpointResult::HttpResponseReceived as i32,
             last_reported_at: "2026-09-05T01:00:00.000Z".to_string(),
@@ -1050,6 +1221,7 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         .put_message(&sandbox)
         .await
         .expect("store sandbox");
+    register_configuration_runtime(&state, sandbox_id).await;
     let active_policy = mcp_policy_with_versions(&["2025-11-25"]);
     let policy_hash = deterministic_policy_hash(&active_policy);
     let initial_active =
@@ -1066,6 +1238,9 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         )
         .await
         .expect("store active revision");
+    let (active_admission, _) = issue_configuration(&state, sandbox_id).await;
+    assert_eq!(active_admission.policy_version, 1);
+
     let mut pending_policy = active_policy;
     pending_policy
         .network_policies
@@ -1088,32 +1263,18 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         .await
         .expect("store pending revision");
 
-    handle_report_policy_status(
-        &state,
-        with_sandbox(
-            Request::new(ReportPolicyStatusRequest {
-                sandbox_id: sandbox_id.to_string(),
-                version: 1,
-                status: PolicyStatus::Loaded as i32,
-                load_error: String::new(),
-            }),
-            sandbox_id,
-        ),
-    )
-    .await
-    .expect("activate acknowledged policy");
+    // Confirmation commits the inventory in the issued receipt, even when a
+    // newer policy row exists but has not been delivered to this runtime.
+    confirm_configuration(&state, sandbox_id, active_admission).await;
     let stored = stored_sandbox(&state, sandbox_id).await;
     assert_eq!(stored.current_policy_version(), 1);
-    let context = active_endpoint_context(&state, &stored)
-        .await
-        .expect("active endpoint context");
+    let context = active_endpoint_context(&stored);
     assert_eq!(context.policy_hash, policy_hash);
     assert_eq!(
         context.endpoints.keys().cloned().collect::<Vec<_>>(),
         vec![initial_active.endpoint_id.clone()]
     );
     let status = stored.status.expect("status");
-    assert_eq!(status.current_policy_version, 1);
     assert_eq!(status.endpoint_statuses, vec![initial_active.clone()]);
 
     register_session(&state, sandbox_id, "active-session");
@@ -1126,11 +1287,7 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
             .initialize_endpoint_status_authority(sandbox_id, "active-session")
     );
     assert_eq!(
-        stored_sandbox(&state, sandbox_id)
-            .await
-            .status
-            .expect("reset status")
-            .endpoint_statuses,
+        public_status(&state, sandbox_id).await.endpoint_statuses,
         vec![initial_active.clone()]
     );
     handle_report_endpoint_status(
@@ -1152,11 +1309,8 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         ),
     )
     .await
-    .expect("active revision accepts reports while next policy is pending");
-    let reported = stored_sandbox(&state, sandbox_id)
-        .await
-        .status
-        .expect("reported status");
+    .expect("accepted inventory remains authoritative while the next policy is pending");
+    let reported = public_status(&state, sandbox_id).await;
     assert_eq!(reported.endpoint_statuses.len(), 1);
     let endpoint = &reported.endpoint_statuses[0];
     assert!(!endpoint.last_reported_at.is_empty());
@@ -1169,26 +1323,18 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         }
     );
 
-    // Only a load acknowledgement advances the active version and endpoint
-    // inventory; storing a pending policy cannot change either.
-    handle_report_policy_status(
-        &state,
-        with_sandbox(
-            Request::new(ReportPolicyStatusRequest {
-                sandbox_id: sandbox_id.to_string(),
-                version: 2,
-                status: PolicyStatus::Loaded as i32,
-                load_error: String::new(),
-            }),
-            sandbox_id,
-        ),
-    )
-    .await
-    .expect("activate pending policy");
-    let replaced = stored_sandbox(&state, sandbox_id)
-        .await
-        .status
-        .expect("replacement status");
+    let (mut pending_admission, _) = issue_configuration(&state, sandbox_id).await;
+    assert_eq!(pending_admission.policy_version, 2);
+    assert_eq!(
+        public_status(&state, sandbox_id).await.endpoint_statuses,
+        reported.endpoint_statuses
+    );
+    accept_held_configuration(&state, sandbox_id, &mut pending_admission).await;
+    let held = public_status(&state, sandbox_id).await;
+    assert_eq!(held.current_policy_version, 1);
+    assert_eq!(held.endpoint_statuses, reported.endpoint_statuses);
+    confirm_configuration(&state, sandbox_id, pending_admission).await;
+    let replaced = public_status(&state, sandbox_id).await;
     assert_eq!(replaced.current_policy_version, 2);
     assert_eq!(replaced.endpoint_statuses, vec![initial_pending]);
 
@@ -1206,24 +1352,8 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
         )
         .await
         .expect("store empty inventory policy");
-    handle_report_policy_status(
-        &state,
-        with_sandbox(
-            Request::new(ReportPolicyStatusRequest {
-                sandbox_id: sandbox_id.to_string(),
-                version: 3,
-                status: PolicyStatus::Loaded as i32,
-                load_error: String::new(),
-            }),
-            sandbox_id,
-        ),
-    )
-    .await
-    .expect("activate empty inventory");
-    let cleared = stored_sandbox(&state, sandbox_id)
-        .await
-        .status
-        .expect("cleared status");
+    activate_policy_configuration(&state, sandbox_id, 3).await;
+    let cleared = public_status(&state, sandbox_id).await;
     assert_eq!(cleared.current_policy_version, 3);
     assert!(cleared.endpoint_statuses.is_empty());
     assert_eq!(cleared.conditions, replaced.conditions);

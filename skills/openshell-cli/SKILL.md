@@ -322,6 +322,33 @@ openshell sandbox get my-sandbox
 
 Most commands with an optional sandbox name use the last-used sandbox. Pass an explicit name in automation.
 
+### Inspect and repair a rejected configuration
+
+A sandbox can remain `Starting` because its policy and attached providers cannot be activated together. Inspect the configuration error before retrying creation:
+
+```fish
+openshell sandbox get my-sandbox
+openshell sandbox get my-sandbox --output json
+openshell policy get my-sandbox --base > repair-policy.yaml
+openshell sandbox provider list my-sandbox
+```
+
+The JSON fields `configuration_desired` and `configuration_admission` distinguish the latest delivered candidate from runtime installation status. `configuration_desired.admitted` means the candidate passed gateway validation. An admission with `state: accepted` can still be awaiting activation. Require `activation_confirmed: true` and sandbox readiness before reporting that the workload is available. A rejected desired candidate can coexist with an earlier accepted configuration under `retain_last_valid`; inspect the desired error even when an accepted record exists. The `policy_source` value is `sandbox` or `global`, describing the gateway policy scope. It does not distinguish an image policy from a default policy.
+
+Correct the reported policy or provider problem through the normal commands. For example, after editing the base policy or repairing the local credentials for an attached provider:
+
+```fish
+openshell provider update my-github --from-existing
+openshell policy set my-sandbox --policy repair-policy.yaml --wait
+openshell sandbox get my-sandbox --output json
+```
+
+Choose the repair that matches the diagnostic. Provider profile coverage and credential bindings must agree with the requested endpoints; use `sandbox provider attach` or `detach` when the attachment itself is wrong. If `policy_source` is `global`, inspect the governing global policy and its scope before changing it. Successful repair lets the waiting runtime launch its initial workload once; repeated polls or acknowledgements do not launch another copy.
+
+Static policy repair is allowed only while the gateway positively records that initial workload release has never been authorized and configuration admission is pending or rejected. In JSON, `configuration_activation_authorized: false` is that durable evidence. The gateway sets it to `true` when it first authorizes release, before the workload may run. A missing field, lost acknowledgement, failed launch, or control restart does not reopen static repair. After release authorization, changes to `filesystem_policy`, `landlock`, or `process` require a new sandbox.
+
+During control recovery, authentication and isolation confirmation (`Confirm`) leave execution held. A replacement supervisor needs a fresh gateway-signed registration grant and must install and activate the matching configuration before readiness returns. Recovery reuses a surviving main process. If destruction of the boundary ends that process, the old runtime generation remains terminal; another launch requires a new driver-authorized runtime generation through the sandbox lifecycle.
+
 ### Connect to a running sandbox
 
 ```bash
@@ -434,7 +461,7 @@ the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+**Key concept**: Policies have static fields (`filesystem_policy`, `landlock`, `process`) that become immutable at the first authorization to release the workload, and two dynamic fields: `network_policies` and `network_middlewares`. A rejected initial configuration can be repaired as described above while the gateway still records that release has never been authorized. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Runtime acceptance covers the effective policy and matching provider configuration together.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -504,7 +531,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision. After initial release authorization, changes to `filesystem_policy`, `landlock`, or `process` require a new sandbox. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
 
@@ -524,7 +551,8 @@ does not have an attached AWS profile whose credential boundary covers the
 endpoint, or an explicit binding to an endpointless AWS profile. Fix the
 conflicting endpoint selectors or credential source and submit again.
 
-The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
+The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). For the control/boundary runtime, `loaded` follows the final activation report matching the delivered policy and provider revisions and the current runtime instances. Saving a policy revision or accepting a held installation does not complete that report. Exit codes:
+
 - **0**: Policy loaded successfully
 - **1**: Policy load failed
 - **124**: Timeout (default 60 seconds)
@@ -535,7 +563,9 @@ The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls 
 openshell policy list dev
 ```
 
-Check that the latest revision shows status `loaded`. If `failed`, check the error column for details.
+Check that the latest revision shows status `loaded`. If `failed`, check the error column and `openshell sandbox get dev` for the configuration diagnostic. Also verify current readiness and `configuration_admission.activation_confirmed`; a historical loaded revision does not prove that a replacement runtime is ready.
+
+Updates briefly hold the workload and new exec while policy and provider state activate together. The gateway's default `policy_validation_failure_mode = "fail_closed"` keeps the workload and readiness held when activation fails. `retain_last_valid` permits a verified previous accepted configuration to remain active; it cannot release an uncertain mixture or a sandbox without a previously accepted configuration. Repair the desired configuration through policy or provider commands, then verify activation again.
 
 ### Step 7: Repeat
 

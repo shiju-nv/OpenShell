@@ -721,44 +721,43 @@ impl OpaEngine {
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
     ) -> Result<()> {
-        // Build a complete new engine through the same validated pipeline.
-        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
-        let new_engine = new
-            .engine
-            .into_inner()
-            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let mut engine = self
-            .engine
-            .lock()
-            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        *engine = new_engine;
-        *self
-            .fail_closed_reason
-            .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, None, || {})
     }
 
     /// Reload the policy and middleware registry as one runtime generation.
-    ///
-    /// Both replacements are prepared before the live locks are acquired. The
-    /// engine and runner are then swapped while holding both locks, followed by
-    /// a single generation increment. A preparation or lock failure leaves the
-    /// live pair and generation untouched.
     pub fn reload_policy_and_middleware_from_proto_with_pid(
         &self,
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
         registry: MiddlewareRegistry,
     ) -> Result<()> {
-        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, Some(registry), || {})
+    }
+
+    /// Validate a complete candidate before publishing policy, middleware, and
+    /// prepared credentials together. A validation or lock failure leaves the
+    /// active configuration untouched and never invokes `commit_credentials`.
+    ///
+    /// The callback must be infallible and must not call back into this engine.
+    /// Existing policy guards become stale before credentials change; new
+    /// policy readers remain blocked until the complete configuration is live.
+    pub fn reload_configuration_from_proto_with_pid(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        registry: Option<MiddlewareRegistry>,
+        commit_credentials: impl FnOnce(),
+    ) -> Result<()> {
+        let new = Self::from_proto_with_pid_and_binary_identity_required(
+            proto,
+            entrypoint_pid,
+            self.binary_identity_required,
+        )?;
         let new_engine = new
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        // Match clone_engine_for_tunnel's lock order (engine, then runner) so
-        // readers can observe only the old pair or the new pair.
+        // Match clone_engine_for_tunnel's lock order (engine, then runner).
         let mut engine = self
             .engine
             .lock()
@@ -767,14 +766,18 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        let new_runner = runner.with_replacement_registry(registry);
-        *engine = new_engine;
-        *runner = new_runner;
-        *self
+        let mut fail_closed_reason = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
+        let new_runner = registry.map(|registry| runner.with_replacement_registry(registry));
         self.advance_generation();
+        commit_credentials();
+        *engine = new_engine;
+        if let Some(new_runner) = new_runner {
+            *runner = new_runner;
+        }
+        *fail_closed_reason = None;
         Ok(())
     }
 
@@ -9270,6 +9273,124 @@ network_policies:
             .await
             .expect("describe chain");
         assert!(described[0].is_resolved());
+    }
+
+    #[test]
+    fn configuration_activation_rejection_preserves_policy_and_credentials() {
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        use std::collections::HashMap;
+
+        let mut proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let accepted = live.snapshot();
+        let prepared = ProviderCredentialState::from_environment(
+            2,
+            HashMap::from([("API_KEY".to_string(), "new-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        proto.network_middlewares.insert(
+            String::new(),
+            NetworkMiddlewareConfig {
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                ..Default::default()
+            },
+        );
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                live.install_prepared(&prepared);
+            })
+            .expect_err("invalid candidate");
+        assert_eq!(engine.current_generation(), 0);
+        assert_eq!(live.snapshot().revision, accepted.revision);
+        assert_eq!(live.snapshot().child_env, accepted.child_env);
+        assert_eq!(
+            live.resolver()
+                .unwrap()
+                .resolve_placeholder(&accepted.child_env["API_KEY"]),
+            Some("old-secret")
+        );
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&input).unwrap().allowed);
+    }
+
+    #[test]
+    fn configuration_activation_invalidates_guards_before_credentials_change() {
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        use std::collections::HashMap;
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        let old = engine.clone_engine_for_tunnel(0).unwrap();
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let prepared = ProviderCredentialState::from_environment(
+            2,
+            HashMap::from([("API_KEY".to_string(), "new-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        // Even a provider-only update must revoke old policy guards while
+        // preventing new readers from capturing half of the configuration.
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                assert!(old.generation_guard().is_stale());
+                assert!(engine.engine.try_lock().is_err());
+                assert!(engine.middleware_runner.try_read().is_err());
+                assert_eq!(live.snapshot().revision, 1);
+                live.install_prepared(&prepared);
+            })
+            .unwrap();
+        assert_eq!(engine.current_generation(), 1);
+        assert_eq!(live.snapshot().revision, 2);
+        assert_eq!(
+            live.resolver()
+                .unwrap()
+                .resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            Some("new-secret")
+        );
+        assert!(engine.clone_engine_for_tunnel(0).is_err());
+        assert!(engine.clone_engine_for_tunnel(1).is_ok());
+    }
+
+    #[test]
+    fn configuration_activation_repairs_fail_closed_and_keeps_identity_mode() {
+        let proto = test_proto();
+        let engine =
+            OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false).unwrap();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {})
+            .unwrap();
+        assert!(engine.fail_closed_reason().is_none());
+        assert!(!engine.binary_identity_required());
+        assert!(engine.clone_engine_for_tunnel(2).is_ok());
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::new(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&input).unwrap().allowed);
     }
 
     #[tokio::test]

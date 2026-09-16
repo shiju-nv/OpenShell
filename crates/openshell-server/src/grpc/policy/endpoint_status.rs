@@ -3,24 +3,18 @@
 
 //! Passive network results for configured tool server endpoints.
 
-use super::{
-    apply_effective_policy_context, canonical_policy_record_identity,
-    compute_provider_env_revision_with_catalog_and_policy_bindings,
-    current_effective_policy_for_sandbox, decode_policy_from_global_settings,
-    deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
-};
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectName, ObjectWorkspace};
-use crate::policy_store::PolicyStoreExt;
-use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
+use crate::persistence::{ObjectId, ObjectName};
 use crate::supervisor_session::EndpointReportCursor;
 use chrono::{SecondsFormat, Utc};
 use openshell_core::GetResourceVersion;
 use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::{
-    EndpointResult, EndpointStatus, PolicySource, ReportEndpointStatusRequest,
-    ReportEndpointStatusResponse, Sandbox, SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
+    ConfigurationAdmissionState, EndpointResult, EndpointStatus, ReportEndpointStatusRequest,
+    ReportEndpointStatusResponse, Sandbox, SandboxConfigurationAdmission,
+    SandboxConfigurationSnapshot, SandboxEndpointConfiguration,
+    SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -95,7 +89,7 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
+    let context = active_endpoint_context(&sandbox);
     if req.policy_hash != context.policy_hash
         || req.provider_env_revision != context.provider_env_revision
     {
@@ -171,137 +165,81 @@ pub(in crate::grpc) async fn handle_report_endpoint_status(
     Ok(Response::new(ReportEndpointStatusResponse {}))
 }
 
-async fn current_endpoint_context(
-    state: &ServerState,
-    sandbox: &Sandbox,
-) -> Result<EndpointContext, Status> {
-    let workspace = sandbox.object_workspace();
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), workspace)
-        .await?;
-    let policy = current_effective_policy_for_sandbox(
-        state,
-        &catalog,
-        workspace,
-        sandbox,
-        sandbox.object_id(),
-    )
-    .await?;
-    derive_endpoint_context(state, sandbox, &catalog, policy).await
-}
-
-async fn active_endpoint_context(
-    state: &ServerState,
-    sandbox: &Sandbox,
-) -> Result<EndpointContext, Status> {
-    let version = sandbox.current_policy_version();
-    if version == 0 {
-        // Before the first load acknowledgement there is no active revision.
-        // The effective policy is the candidate sent to the supervisor, so it
-        // is the only configuration against which the initial session can be
-        // reset and subsequently report.
-        return current_endpoint_context(state, sandbox).await;
+/// Capture endpoint identity from the same effective policy delivered for admission.
+pub(super) fn configuration_endpoint_inventory(
+    policy: &ProtoSandboxPolicy,
+) -> SandboxEndpointConfiguration {
+    let endpoints = expected_endpoint_statuses(policy);
+    SandboxEndpointConfiguration {
+        credentialed_endpoint_ids: endpoints
+            .iter()
+            .filter(|(_, endpoint)| endpoint.provider_credentialed)
+            .map(|(id, _)| id.clone())
+            .collect(),
+        endpoints: endpoints
+            .into_values()
+            .map(|endpoint| endpoint.status)
+            .collect(),
     }
-
-    // A newer stored policy may still be pending while the supervisor runs the
-    // acknowledged revision. Endpoint observations belong to that active runtime
-    // configuration until another load acknowledgement commits the transition.
-    endpoint_context_for_loaded_policy(state, sandbox, i64::from(version)).await
 }
 
-async fn endpoint_context_for_loaded_policy(
-    state: &ServerState,
-    sandbox: &Sandbox,
-    version: i64,
-) -> Result<EndpointContext, Status> {
-    let workspace = sandbox.object_workspace();
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), workspace)
-        .await?;
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let global_policy = decode_policy_from_global_settings(&global_settings)?;
-    endpoint_context_for_loaded_policy_with_inputs(
-        state,
-        sandbox,
-        version,
-        &catalog,
-        global_policy.as_ref(),
-    )
-    .await
-}
-
-async fn endpoint_context_for_loaded_policy_with_inputs(
-    state: &ServerState,
-    sandbox: &Sandbox,
-    version: i64,
-    catalog: &EffectiveProviderProfileCatalog,
-    global_policy: Option<&ProtoSandboxPolicy>,
-) -> Result<EndpointContext, Status> {
-    let workspace = sandbox.object_workspace();
-    let provider_names = sandbox
-        .spec
+fn active_endpoint_context(sandbox: &Sandbox) -> EndpointContext {
+    let accepted = sandbox
+        .status
         .as_ref()
-        .map(|spec| spec.providers.clone())
-        .unwrap_or_default();
-    let policy = if let Some(global_policy) = global_policy {
-        apply_effective_policy_context(
-            state,
-            catalog,
-            workspace,
-            &provider_names,
-            global_policy.clone(),
-            PolicySource::Global,
-        )
-        .await?
-    } else {
-        let record = state
-            .store
-            .get_policy_by_version(sandbox.object_id(), version)
-            .await
-            .map_err(|error| Status::internal(format!("fetch policy revision failed: {error}")))?
-            .ok_or_else(|| Status::not_found("policy revision not found"))?;
-        let policy = canonical_policy_record_identity(&record)?.0;
-        apply_effective_policy_context(
-            state,
-            catalog,
-            workspace,
-            &provider_names,
-            policy,
-            PolicySource::Sandbox,
-        )
-        .await?
+        .and_then(|status| status.configuration_admission.as_ref())
+        .filter(|admission| {
+            admission.state == i32::from(ConfigurationAdmissionState::Accepted)
+                && admission.activation_confirmed
+        });
+    let Some((admission, inventory)) = accepted.and_then(|admission| {
+        admission
+            .endpoint_configuration
+            .as_ref()
+            .map(|inventory| (admission, inventory))
+    }) else {
+        // Registration and reconnect must work before admission. An empty
+        // inventory clears stale observations and cannot authorize any report.
+        return EndpointContext {
+            policy_hash: String::new(),
+            provider_env_revision: 0,
+            endpoints: BTreeMap::new(),
+        };
     };
-    derive_endpoint_context(state, sandbox, catalog, policy).await
+    let credentialed = inventory
+        .credentialed_endpoint_ids
+        .iter()
+        .collect::<HashSet<_>>();
+    EndpointContext {
+        policy_hash: admission.policy_hash.clone(),
+        provider_env_revision: admission.provider_env_revision,
+        endpoints: inventory
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.endpoint_id.clone(),
+                    ExpectedEndpoint {
+                        provider_credentialed: credentialed.contains(&endpoint.endpoint_id),
+                        status: endpoint.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
 }
 
-async fn derive_endpoint_context(
-    state: &ServerState,
-    sandbox: &Sandbox,
-    catalog: &EffectiveProviderProfileCatalog,
-    policy: ProtoSandboxPolicy,
-) -> Result<EndpointContext, Status> {
-    let workspace = sandbox.object_workspace();
-    let provider_names = sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.providers.clone())
-        .unwrap_or_default();
-    let bindings = policy_static_credential_endpoint_bindings(Some(&policy))?;
-    let provider_env_revision = compute_provider_env_revision_with_catalog_and_policy_bindings(
-        state.store.as_ref(),
-        catalog,
-        workspace,
-        &provider_names,
-        &bindings,
-    )
-    .await?;
-
-    Ok(EndpointContext {
-        policy_hash: deterministic_policy_hash(&policy),
-        provider_env_revision,
-        endpoints: expected_endpoint_statuses(&policy),
+/// Compare accepted endpoint inputs without rereading mutable policy or provider rows.
+pub(super) fn endpoint_configuration_matches(
+    current: Option<&SandboxConfigurationAdmission>,
+    desired: &SandboxConfigurationSnapshot,
+) -> bool {
+    current.is_some_and(|current| {
+        current.state == i32::from(ConfigurationAdmissionState::Accepted)
+            && current.policy_hash == desired.policy_hash
+            && current.provider_env_revision == desired.provider_env_revision
+            && current.endpoint_configuration.is_some()
+            && current.endpoint_configuration == desired.endpoint_configuration
     })
 }
 
@@ -343,7 +281,7 @@ pub async fn reset_endpoint_status_for_supervisor_session(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
+    let context = active_endpoint_context(&sandbox);
     let reports = unknown_endpoint_reports(&context.endpoints);
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let expected_resource_version = sandbox.get_resource_version();
@@ -386,7 +324,7 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
+    let context = active_endpoint_context(&sandbox);
     let reports = unknown_endpoint_reports(&context.endpoints);
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let expected_resource_version = sandbox.get_resource_version();
@@ -637,65 +575,26 @@ fn validate_endpoint_observation_markers(
     Ok(())
 }
 
-/// Build an endpoint reset only when the acknowledged policy changes observations' configuration.
-/// The caller commits any reset and the active policy version in one CAS.
-pub(super) async fn endpoint_status_reset_for_loaded_policy(
-    state: &ServerState,
-    sandbox: &Sandbox,
-    version: i64,
-) -> Result<Option<BTreeMap<String, EndpointStatus>>, Status> {
-    // Both policy versions must use one provider/profile and global-policy view;
-    // an external catalog can change between independent snapshot requests.
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), sandbox.object_workspace())
-        .await?;
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let global_policy = decode_policy_from_global_settings(&global_settings)?;
-    let context = endpoint_context_for_loaded_policy_with_inputs(
-        state,
-        sandbox,
-        version,
-        &catalog,
-        global_policy.as_ref(),
+/// Clear observations only when confirmation activates different endpoint inputs.
+pub(super) fn endpoint_status_reset_for_configuration(
+    current: Option<&SandboxConfigurationAdmission>,
+    desired: &SandboxConfigurationSnapshot,
+) -> Option<BTreeMap<String, EndpointStatus>> {
+    if endpoint_configuration_matches(current, desired) {
+        return None;
+    }
+    Some(
+        desired
+            .endpoint_configuration
+            .as_ref()
+            .map_or_else(BTreeMap::new, |inventory| {
+                inventory
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| (endpoint.endpoint_id.clone(), endpoint.clone()))
+                    .collect()
+            }),
     )
-    .await?;
-    let current_version = i64::from(sandbox.current_policy_version());
-    let same_configuration = if current_version == version {
-        // An acknowledgement can be retried after endpoint reports have already
-        // committed. Repeating activation must not erase their accepted evidence.
-        true
-    } else if current_version != 0 {
-        // Metadata-only revisions do not reinstall the runtime policy. Compare
-        // the active policy, not the report cursor: a cursor can outlive an
-        // intervening policy reset and cannot prove an A -> B -> A transition.
-        let current = endpoint_context_for_loaded_policy_with_inputs(
-            state,
-            sandbox,
-            current_version,
-            &catalog,
-            global_policy.as_ref(),
-        )
-        .await?;
-        current.policy_hash == context.policy_hash
-    } else {
-        // The first endpoint report and load acknowledgement travel independently.
-        // Only the current session's accepted report proves which configuration
-        // produced evidence before any loaded policy version has been recorded.
-        state
-            .supervisor_sessions
-            .current_session_id(sandbox.object_id())
-            .and_then(|session_id| {
-                state
-                    .supervisor_sessions
-                    .endpoint_report_cursor(sandbox.object_id(), &session_id)
-            })
-            .is_some_and(|cursor| {
-                cursor.policy_hash == context.policy_hash
-                    && cursor.provider_env_revision == context.provider_env_revision
-            })
-    };
-    Ok((!same_configuration).then(|| unknown_endpoint_reports(&context.endpoints)))
 }
 
 /// Replace the endpoint inventory and evidence without changing lifecycle state.

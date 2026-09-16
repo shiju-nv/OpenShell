@@ -120,6 +120,81 @@ type SandboxStatus struct {
 	// EndpointStatuses describes configured external tool endpoints and their
 	// last accepted network results, independently of sandbox readiness.
 	EndpointStatuses []EndpointStatus
+	// ConfigurationAdmission describes validation and activation of the reported configuration.
+	ConfigurationAdmission *SandboxConfigurationAdmission
+	// ConfigurationDesired identifies the latest complete configuration delivered to control.
+	ConfigurationDesired *SandboxConfigurationSnapshot
+	// ConfigurationActivationAuthorized records whether workload release has ever been authorized.
+	// Nil means the gateway has no recorded authorization state; false permits initial repair.
+	ConfigurationActivationAuthorized *bool
+}
+
+// ConfigurationAdmissionState describes validation of an effective configuration.
+type ConfigurationAdmissionState string
+
+// Configuration admission states reported by the gateway.
+const (
+	ConfigurationAdmissionUnknown  ConfigurationAdmissionState = "unknown"
+	ConfigurationAdmissionPending  ConfigurationAdmissionState = "pending"
+	ConfigurationAdmissionAccepted ConfigurationAdmissionState = "accepted"
+	ConfigurationAdmissionRejected ConfigurationAdmissionState = "rejected"
+)
+
+// SandboxConfigurationAdmission identifies a validated or rejected configuration.
+// Accepted validation only confirms runtime activation when ActivationConfirmed is true.
+type SandboxConfigurationAdmission struct {
+	State                 ConfigurationAdmissionState
+	InstanceID            string
+	RuntimeGeneration     string
+	BoundaryInstanceID    string
+	BoundarySessionID     string
+	PolicyVersion         uint32
+	PolicyHash            string
+	ConfigRevision        uint64
+	ProviderEnvRevision   uint64
+	PolicySource          PolicySource
+	ConfigurationSnapshot string
+	RegistrationRevision  uint64
+	DeliveryRevision      uint64
+	ActivationConfirmed   bool
+	Error                 string
+	// EndpointConfiguration is the gateway-authored inventory of the accepted generation.
+	EndpointConfiguration *SandboxEndpointConfiguration
+}
+
+// SandboxConfigurationSnapshot identifies an immutable gateway configuration delivery.
+// Admitted describes gateway validation; runtime activation is reported separately.
+type SandboxConfigurationSnapshot struct {
+	SnapshotID           string
+	InstanceID           string
+	RuntimeGeneration    string
+	BoundaryInstanceID   string
+	BoundarySessionID    string
+	PolicyVersion        uint32
+	PolicyHash           string
+	ConfigRevision       uint64
+	ProviderEnvRevision  uint64
+	PolicySource         PolicySource
+	RegistrationRevision uint64
+	DeliveryRevision     uint64
+	Admitted             bool
+	Error                string
+	// PolicyValidationFailureMode is the failure posture bound to this delivery.
+	PolicyValidationFailureMode string
+	// GatewayConfigurationFingerprint identifies the gateway services and auth configuration.
+	// It contains only their one-way hash, not credentials or registration grants.
+	GatewayConfigurationFingerprint string
+	// EndpointConfiguration is the initial inventory of this exact delivered generation.
+	EndpointConfiguration *SandboxEndpointConfiguration
+}
+
+// SandboxEndpointConfiguration is the gateway-derived initial endpoint inventory
+// of one configuration generation. It contains no traffic observations or credential values.
+type SandboxEndpointConfiguration struct {
+	// Endpoints contain policy selectors with NoObservedExchange results and no report times.
+	Endpoints []EndpointStatus
+	// CredentialedEndpointIDs identifies endpoints requiring managed credentials.
+	CredentialedEndpointIDs []string
 }
 
 // EndpointStatus holds a configured tool endpoint and its last accepted network result.

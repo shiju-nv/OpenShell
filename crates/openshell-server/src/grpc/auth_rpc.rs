@@ -126,7 +126,7 @@ pub async fn handle_refresh_sandbox_token(
 
     // Only callers already holding a gateway-minted JWT may refresh; the
     // K8s bootstrap path must use `IssueSandboxToken`.
-    let SandboxIdentitySource::BootstrapJwt { .. } = &sandbox.source else {
+    let SandboxIdentitySource::LaunchSession { .. } = &sandbox.source else {
         debug!(
             sandbox_id = %sandbox.sandbox_id,
             "RefreshSandboxToken rejected: non-gateway-JWT principal source"
@@ -214,6 +214,7 @@ pub async fn handle_refresh_sandbox_token(
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
             sandbox_id: sandbox.sandbox_id.clone(),
+            ..Default::default()
         });
         config_request
             .extensions_mut()
@@ -472,8 +473,13 @@ mod tests {
         use crate::auth::principal::SandboxIdentitySource;
         Principal::Sandbox(SandboxPrincipal {
             sandbox_id: sandbox_id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test-gateway".to_string(),
+            source: SandboxIdentitySource::LaunchSession {
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .unwrap(),
+                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+                token_id: uuid::Uuid::from_u128(1),
             },
             trust_domain: Some("openshell".to_string()),
         })

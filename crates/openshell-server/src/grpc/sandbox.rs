@@ -172,7 +172,7 @@ pub(super) async fn handle_create_sandbox(
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
     let create_request = request.get_ref().clone();
-    let result = handle_create_sandbox_inner(state, request).await;
+    let result = Box::pin(handle_create_sandbox_inner(state, request)).await;
     let created_sandbox = result
         .as_ref()
         .ok()
@@ -475,6 +475,19 @@ async fn handle_create_sandbox_inner(
         created_from_workload_template,
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
+    sandbox
+        .status
+        .get_or_insert_with(Default::default)
+        .configuration_admission = Some(openshell_core::proto::SandboxConfigurationAdmission {
+        state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
+        ..Default::default()
+    });
+    sandbox
+        .status
+        .as_mut()
+        .expect("status initialized")
+        .configuration_activation_authorized = Some(false);
+    crate::compute::apply_configuration_readiness(&mut sandbox);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
@@ -502,6 +515,11 @@ async fn handle_create_sandbox_inner(
     let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
     if let Some(metadata) = sandbox.metadata.as_mut() {
+        // Registration retirement is gateway-owned authority, so user-supplied
+        // create annotations cannot clear or pre-populate its tombstones.
+        metadata
+            .annotations
+            .remove(super::policy::CONFIGURATION_REGISTRATION_HISTORY);
         runtime_identity.write(&mut metadata.annotations);
     }
     let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
@@ -4638,7 +4656,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_persists_long_metadata_annotations() {
+    async fn configuration_activation_create_preserves_user_annotations_but_discards_forged_history()
+     {
         let state = test_server_state().await;
         let annotation_key = "openshell.nvidia.com/policy-signature".to_string();
         let annotation_value = "x".repeat(512);
@@ -4649,7 +4668,13 @@ mod tests {
                 name: "annotated".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
-                annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
+                annotations: HashMap::from([
+                    (annotation_key.clone(), annotation_value.clone()),
+                    (
+                        super::super::policy::CONFIGURATION_REGISTRATION_HISTORY.to_string(),
+                        "forged-retirement-history".to_string(),
+                    ),
+                ]),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
@@ -4660,6 +4685,14 @@ mod tests {
         .into_inner();
 
         let created = response.sandbox.expect("created sandbox");
+        assert!(
+            !created
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .contains_key(super::super::policy::CONFIGURATION_REGISTRATION_HISTORY)
+        );
         assert_eq!(
             created
                 .metadata

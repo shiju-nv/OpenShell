@@ -90,6 +90,138 @@ func TestSandbox_Create_NoAnnotations(t *testing.T) {
 	assert.Nil(t, sb.Annotations)
 }
 
+func TestSandboxConfigurationStatusIsCopiedAtStoreBoundaries(t *testing.T) {
+	client := NewClient()
+	authorized := true
+	endpointInventory := func(id string, port uint32) *types.SandboxEndpointConfiguration {
+		return &types.SandboxEndpointConfiguration{
+			Endpoints: []types.EndpointStatus{{
+				EndpointID: id, Host: id + ".example.test", Ports: []uint32{port},
+			}},
+			CredentialedEndpointIDs: []string{id},
+		}
+	}
+	input := &types.Sandbox{
+		Name: "configured", Workspace: "default",
+		Status: types.SandboxStatus{
+			ConfigurationAdmission: &types.SandboxConfigurationAdmission{
+				State: types.ConfigurationAdmissionAccepted, ActivationConfirmed: true,
+				EndpointConfiguration: endpointInventory("accepted-endpoint", 443),
+			},
+			ConfigurationDesired: &types.SandboxConfigurationSnapshot{
+				SnapshotID: "snapshot-1", EndpointConfiguration: endpointInventory("desired-endpoint", 8443),
+			},
+			ConfigurationActivationAuthorized: &authorized,
+		},
+	}
+	client.AddSandbox("default", input)
+	input.Status.ConfigurationAdmission.ActivationConfirmed = false
+	input.Status.ConfigurationDesired.SnapshotID = "input-mutation"
+	for _, inventory := range []*types.SandboxEndpointConfiguration{
+		input.Status.ConfigurationAdmission.EndpointConfiguration,
+		input.Status.ConfigurationDesired.EndpointConfiguration,
+	} {
+		inventory.Endpoints[0].Host = "input-mutation.example.test"
+		inventory.Endpoints[0].Ports[0] = 80
+		inventory.CredentialedEndpointIDs[0] = "input-mutation"
+	}
+	authorized = false
+
+	first, err := client.Sandboxes().Get(context.Background(), "default", "configured")
+	require.NoError(t, err)
+	assert.True(t, first.Status.ConfigurationAdmission.ActivationConfirmed)
+	assert.Equal(t, "snapshot-1", first.Status.ConfigurationDesired.SnapshotID)
+	assert.True(t, *first.Status.ConfigurationActivationAuthorized)
+	require.Equal(t, endpointInventory("accepted-endpoint", 443), first.Status.ConfigurationAdmission.EndpointConfiguration)
+	require.Equal(t, endpointInventory("desired-endpoint", 8443), first.Status.ConfigurationDesired.EndpointConfiguration)
+	first.Status.ConfigurationAdmission.ActivationConfirmed = false
+	first.Status.ConfigurationDesired.SnapshotID = "returned-mutation"
+	*first.Status.ConfigurationActivationAuthorized = false
+	for _, inventory := range []*types.SandboxEndpointConfiguration{
+		first.Status.ConfigurationAdmission.EndpointConfiguration,
+		first.Status.ConfigurationDesired.EndpointConfiguration,
+	} {
+		inventory.Endpoints[0].Host = "returned-mutation.example.test"
+		inventory.Endpoints[0].Ports[0] = 8080
+		inventory.CredentialedEndpointIDs[0] = "returned-mutation"
+	}
+
+	second, err := client.Sandboxes().Get(context.Background(), "default", "configured")
+	require.NoError(t, err)
+	assert.True(t, second.Status.ConfigurationAdmission.ActivationConfirmed)
+	assert.Equal(t, "snapshot-1", second.Status.ConfigurationDesired.SnapshotID)
+	assert.True(t, *second.Status.ConfigurationActivationAuthorized)
+	assert.Equal(t, endpointInventory("accepted-endpoint", 443), second.Status.ConfigurationAdmission.EndpointConfiguration)
+	assert.Equal(t, endpointInventory("desired-endpoint", 8443), second.Status.ConfigurationDesired.EndpointConfiguration)
+}
+
+func TestSandboxEndpointConfigurationPresenceIsCopiedAtStoreBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		accepted *types.SandboxEndpointConfiguration
+		desired  *types.SandboxEndpointConfiguration
+	}{
+		{name: "absent inventories"},
+		{name: "accepted inventory only", accepted: &types.SandboxEndpointConfiguration{}},
+		{name: "desired inventory only", desired: &types.SandboxEndpointConfiguration{}},
+		{
+			name: "present empty slices",
+			accepted: &types.SandboxEndpointConfiguration{
+				Endpoints: []types.EndpointStatus{}, CredentialedEndpointIDs: []string{},
+			},
+			desired: &types.SandboxEndpointConfiguration{
+				Endpoints: []types.EndpointStatus{}, CredentialedEndpointIDs: []string{},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Empty slice headers suffice for expectations because mutations below replace the slices.
+			wantAccepted, wantDesired := tc.accepted, tc.desired
+			if tc.accepted != nil {
+				accepted := *tc.accepted
+				wantAccepted = &accepted
+			}
+			if tc.desired != nil {
+				desired := *tc.desired
+				wantDesired = &desired
+			}
+			client := NewClient()
+			client.AddSandbox("default", &types.Sandbox{
+				Name: "configured", Workspace: "default",
+				Status: types.SandboxStatus{
+					ConfigurationAdmission: &types.SandboxConfigurationAdmission{EndpointConfiguration: tc.accepted},
+					ConfigurationDesired:   &types.SandboxConfigurationSnapshot{EndpointConfiguration: tc.desired},
+				},
+			})
+			for _, inventory := range []*types.SandboxEndpointConfiguration{tc.accepted, tc.desired} {
+				if inventory != nil {
+					inventory.Endpoints = []types.EndpointStatus{{EndpointID: "input-mutation"}}
+					inventory.CredentialedEndpointIDs = []string{"input-mutation"}
+				}
+			}
+			first, err := client.Sandboxes().Get(context.Background(), "default", "configured")
+			require.NoError(t, err)
+			require.Equal(t, wantAccepted, first.Status.ConfigurationAdmission.EndpointConfiguration)
+			require.Equal(t, wantDesired, first.Status.ConfigurationDesired.EndpointConfiguration)
+
+			// Replacing a returned empty inventory must not change stored presence or contents.
+			for _, inventory := range []*types.SandboxEndpointConfiguration{
+				first.Status.ConfigurationAdmission.EndpointConfiguration,
+				first.Status.ConfigurationDesired.EndpointConfiguration,
+			} {
+				if inventory != nil {
+					inventory.Endpoints = []types.EndpointStatus{{EndpointID: "returned-mutation"}}
+					inventory.CredentialedEndpointIDs = []string{"returned-mutation"}
+				}
+			}
+			second, err := client.Sandboxes().Get(context.Background(), "default", "configured")
+			require.NoError(t, err)
+			assert.Equal(t, wantAccepted, second.Status.ConfigurationAdmission.EndpointConfiguration)
+			assert.Equal(t, wantDesired, second.Status.ConfigurationDesired.EndpointConfiguration)
+		})
+	}
+}
+
 func TestCopyAnyMap(t *testing.T) {
 	t.Run("nil", func(t *testing.T) {
 		assert.Nil(t, copyAnyMap(nil))

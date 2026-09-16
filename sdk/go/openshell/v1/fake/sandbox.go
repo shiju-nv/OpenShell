@@ -238,7 +238,37 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 	for i := range s.EndpointStatuses {
 		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
 	}
+	// Returned snapshots must not let callers mutate the fake store's activation state.
+	if s.ConfigurationAdmission != nil {
+		admission := *s.ConfigurationAdmission
+		admission.EndpointConfiguration = copySandboxEndpointConfiguration(admission.EndpointConfiguration)
+		s.ConfigurationAdmission = &admission
+	}
+	if s.ConfigurationDesired != nil {
+		desired := *s.ConfigurationDesired
+		desired.EndpointConfiguration = copySandboxEndpointConfiguration(desired.EndpointConfiguration)
+		s.ConfigurationDesired = &desired
+	}
+	if s.ConfigurationActivationAuthorized != nil {
+		authorized := *s.ConfigurationActivationAuthorized
+		s.ConfigurationActivationAuthorized = &authorized
+	}
 	return s
+}
+
+// copySandboxEndpointConfiguration preserves inventory presence while isolating
+// endpoint, port, and credential-binding slices from callers of the fake store.
+func copySandboxEndpointConfiguration(configuration *types.SandboxEndpointConfiguration) *types.SandboxEndpointConfiguration {
+	if configuration == nil {
+		return nil
+	}
+	copied := *configuration
+	copied.Endpoints = slices.Clone(configuration.Endpoints)
+	for i := range copied.Endpoints {
+		copied.Endpoints[i].Ports = slices.Clone(copied.Endpoints[i].Ports)
+	}
+	copied.CredentialedEndpointIDs = slices.Clone(configuration.CredentialedEndpointIDs)
+	return &copied
 }
 
 // copyStringMap returns a shallow copy of a string-to-string map.

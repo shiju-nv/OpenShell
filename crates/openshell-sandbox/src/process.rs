@@ -1422,10 +1422,31 @@ fn validate_workspace_component(
 }
 
 #[cfg(target_os = "linux")]
+/// Validate an existing image workspace using the current effective identity.
+///
+/// The path must be normalized, absolute, and distinct from the managed
+/// fallback. Validation never changes existing permissions or ownership.
 pub fn validate_oci_workspace_as_effective_identity(root: &Path) -> Result<()> {
+    validate_workspace_components_as_effective_identity(validated_workspace_components(
+        root, false,
+    )?)
+}
+
+#[cfg(target_os = "linux")]
+/// Validate the existing driver-selected workspace before workload launch.
+///
+/// Managed and image workspaces must already be traversable and writable by
+/// the current effective identity; validation never prepares their authority.
+pub(crate) fn validate_workload_workspace_as_effective_identity(root: &Path) -> Result<()> {
+    validate_workspace_components_as_effective_identity(validated_workspace_components(root, true)?)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_workspace_components_as_effective_identity(
+    components: Vec<std::ffi::OsString>,
+) -> Result<()> {
     use rustix::fs::{Access, AtFlags, FileType, Mode, OFlags};
 
-    let components = validated_workspace_components(root, false)?;
     let open_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut current_path = PathBuf::from("/");
     let mut current_fd = rustix::fs::open("/", open_flags, Mode::empty()).into_diagnostic()?;

@@ -41,6 +41,15 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::{debug, info, warn};
 
+/// Preserve the gRPC status as a source so callers can classify retryable errors.
+/// `IntoDiagnostic` alone hides the wrapped error's concrete type.
+pub fn grpc_status_error(status: Status) -> miette::Report {
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("{0}")]
+    struct GrpcStatusError(#[source] Status);
+    GrpcStatusError(status).into()
+}
+
 /// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
 /// generated client type signatures stay readable.
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
@@ -835,9 +844,10 @@ async fn fetch_settings_snapshot_with_client(
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
+            ..Default::default()
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     Ok(settings_poll_result(response.into_inner()))
 }
@@ -874,7 +884,7 @@ async fn sync_policy_with_client(
             ..Default::default()
         })
         .await
-        .into_diagnostic()
+        .map_err(grpc_status_error)
         .wrap_err("failed to sync policy to server")?;
 
     Ok(())
@@ -939,6 +949,50 @@ pub async fn sync_policy_and_fetch_snapshot(
     fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
 }
 
+/// Fetch and durably issue a complete configuration to the registered control instance.
+///
+/// Observer reads do not issue snapshots. The returned ticket must be retained
+/// with its policy and provider revisions until installation is acknowledged.
+pub async fn fetch_configuration_snapshot(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+) -> Result<SettingsPollResult> {
+    let mut client = connect(endpoint).await?;
+    let response = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.to_string(),
+            configuration_instance_id: instance_id.to_string(),
+        })
+        .await
+        .map_err(grpc_status_error)?;
+    Ok(settings_poll_result(response.into_inner()))
+}
+
+/// Register a control instance or report installation of its exact issued snapshot.
+///
+/// Pending registration compares both previously observed process identities.
+/// Retain those fences across retries so an old process cannot reclaim registration.
+pub async fn report_sandbox_configuration(
+    endpoint: &str,
+    sandbox_id: &str,
+    admission: &crate::proto::SandboxConfigurationAdmission,
+    expected_instance_id: &str,
+    expected_boundary_instance_id: &str,
+) -> Result<crate::proto::ReportSandboxConfigurationResponse> {
+    let mut client = connect(endpoint).await?;
+    let response = client
+        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+            sandbox_id: sandbox_id.to_string(),
+            expected_instance_id: expected_instance_id.to_string(),
+            expected_boundary_instance_id: expected_boundary_instance_id.to_string(),
+            admission: Some(admission.clone()),
+        })
+        .await
+        .map_err(grpc_status_error)?;
+    Ok(response.into_inner())
+}
+
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
 /// Returns a map of environment variable names to values derived from provider
@@ -958,7 +1012,7 @@ pub async fn fetch_provider_environment(
             supports_static_credential_bindings: true,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     let inner = response.into_inner();
     Ok(ProviderEnvironmentResult {
@@ -1037,6 +1091,22 @@ pub struct CachedOpenShellClient {
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    /// Control process currently registered for activation reports.
+    pub configuration_instance_id: String,
+    /// Whether the complete policy and provider composition passed admission.
+    pub configuration_admitted: bool,
+    /// Gateway-authored, credential-free rejection diagnostic.
+    pub configuration_error: String,
+    /// Existing authenticated launch generation associated with this snapshot.
+    pub runtime_generation: String,
+    /// Boundary process currently registered with the control process.
+    pub configuration_boundary_instance_id: String,
+    /// Server-issued activation ticket; empty for observer reads.
+    pub configuration_snapshot: String,
+    /// Monotonic fence for the registered control and boundary process pair.
+    pub configuration_registration_revision: u64,
+    /// Monotonic fence for configurations delivered within this registration.
+    pub configuration_delivery_revision: u64,
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
@@ -1058,6 +1128,14 @@ pub struct SettingsPollResult {
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        configuration_instance_id: inner.configuration_instance_id,
+        configuration_admitted: inner.configuration_admitted,
+        configuration_error: inner.configuration_error,
+        runtime_generation: inner.runtime_generation,
+        configuration_boundary_instance_id: inner.configuration_boundary_instance_id,
+        configuration_snapshot: inner.configuration_snapshot,
+        configuration_registration_revision: inner.configuration_registration_revision,
+        configuration_delivery_revision: inner.configuration_delivery_revision,
         policy: inner.policy,
         version: inner.version,
         policy_hash: inner.policy_hash,
@@ -1171,10 +1249,31 @@ impl CachedOpenShellClient {
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
                 sandbox_id: sandbox_id.to_string(),
+                ..Default::default()
             })
             .await
             .into_diagnostic()?;
 
+        let result = settings_poll_result(response.into_inner());
+        let _ = self.workspace.set(result.workspace.clone());
+        Ok(result)
+    }
+
+    /// Poll and issue a complete configuration for the registered control process.
+    pub async fn poll_configuration_settings(
+        &self,
+        sandbox_id: &str,
+        instance_id: &str,
+    ) -> Result<SettingsPollResult> {
+        let response = self
+            .client
+            .clone()
+            .get_sandbox_config(GetSandboxConfigRequest {
+                sandbox_id: sandbox_id.to_string(),
+                configuration_instance_id: instance_id.to_string(),
+            })
+            .await
+            .map_err(grpc_status_error)?;
         let result = settings_poll_result(response.into_inner());
         let _ = self.workspace.set(result.workspace.clone());
         Ok(result)

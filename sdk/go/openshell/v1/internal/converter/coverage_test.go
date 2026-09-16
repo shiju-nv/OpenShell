@@ -110,24 +110,107 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
-		"sandbox_name":           true,
-		"agent_pod":              true,
-		"agent_fd":               true,
-		"sandbox_fd":             true,
-		"phase":                  true,
-		"conditions":             true,
-		"endpoint_statuses":      true,
-		"current_policy_version": true,
-		"exit_code":              true,
+		"sandbox_name":                        true,
+		"agent_pod":                           true,
+		"agent_fd":                            true,
+		"sandbox_fd":                          true,
+		"phase":                               true,
+		"conditions":                          true,
+		"endpoint_statuses":                   true,
+		"current_policy_version":              true,
+		"exit_code":                           true,
+		"configuration_admission":             true,
+		"configuration_desired":               true,
+		"configuration_activation_authorized": true,
 	}
-	// These fields coordinate internal gateway/supervisor lifecycle fencing
-	// and idempotent status reconciliation. They remain available only through
-	// the raw protobuf API.
-	skipped := fieldSet{
-		"main_process_instance_id": true,
-	}
+	// The instance ID coordinates internal gateway/supervisor lifecycle
+	// exit-report fencing. It is exposed only through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
+}
+
+func TestConverterCoversAllProtoFields_SandboxConfigurationAdmission(t *testing.T) {
+	handled := fieldSet{
+		"state":                  true,
+		"instance_id":            true,
+		"runtime_generation":     true,
+		"boundary_instance_id":   true,
+		"boundary_session_id":    true,
+		"policy_version":         true,
+		"policy_hash":            true,
+		"config_revision":        true,
+		"provider_env_revision":  true,
+		"policy_source":          true,
+		"configuration_snapshot": true,
+		"registration_revision":  true,
+		"delivery_revision":      true,
+		"activation_confirmed":   true,
+		"error":                  true,
+		"endpoint_configuration": true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxConfigurationAdmission{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxConfigurationSnapshot(t *testing.T) {
+	handled := fieldSet{
+		"snapshot_id":                       true,
+		"instance_id":                       true,
+		"runtime_generation":                true,
+		"boundary_instance_id":              true,
+		"boundary_session_id":               true,
+		"policy_version":                    true,
+		"policy_hash":                       true,
+		"config_revision":                   true,
+		"provider_env_revision":             true,
+		"policy_source":                     true,
+		"registration_revision":             true,
+		"delivery_revision":                 true,
+		"admitted":                          true,
+		"error":                             true,
+		"policy_validation_failure_mode":    true,
+		"gateway_configuration_fingerprint": true,
+		"endpoint_configuration":            true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxConfigurationSnapshot{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_SandboxEndpointConfiguration(t *testing.T) {
+	handled := fieldSet{
+		"endpoints":                 true,
+		"credentialed_endpoint_ids": true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxEndpointConfiguration{}).ProtoReflect().Descriptor(), handled, nil)
+}
+
+func TestConverterCoversAllProtoFields_GetSandboxConfigResponse(t *testing.T) {
+	handled := fieldSet{
+		"policy":                              true,
+		"version":                             true,
+		"policy_hash":                         true,
+		"settings":                            true,
+		"config_revision":                     true,
+		"policy_source":                       true,
+		"global_policy_version":               true,
+		"provider_env_revision":               true,
+		"policy_validation_failure_mode":      true,
+		"configuration_admitted":              true,
+		"configuration_error":                 true,
+		"configuration_instance_id":           true,
+		"runtime_generation":                  true,
+		"configuration_boundary_instance_id":  true,
+		"configuration_snapshot":              true,
+		"configuration_registration_revision": true,
+		"configuration_delivery_revision":     true,
+	}
+	// Middleware connection details, workspace discovery, and extension auth capability
+	// configure runtime control rather than the SDK's observed configuration view.
+	skipped := fieldSet{
+		"supervisor_middleware_services":   true,
+		"workspace":                        true,
+		"extension_authentication_enabled": true,
+	}
+	assertAllFieldsCovered(t, (&sandboxpb.GetSandboxConfigResponse{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxCondition(t *testing.T) {

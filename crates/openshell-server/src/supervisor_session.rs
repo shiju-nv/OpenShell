@@ -604,6 +604,7 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
     });
 }
 
+#[cfg(test)]
 async fn require_persisted_sandbox(
     store: &Arc<crate::persistence::Store>,
     sandbox_id: &str,
@@ -841,6 +842,43 @@ fn expected_transport_close_during_session_state(
 // ConnectSupervisor gRPC handler
 // ---------------------------------------------------------------------------
 
+async fn register_configuration_transport(
+    state: &Arc<ServerState>,
+    principal: &Principal,
+    hello: &openshell_core::proto::SupervisorHello,
+    session_id: String,
+    tx: mpsc::Sender<GatewayMessage>,
+    shutdown_tx: oneshot::Sender<()>,
+) -> Result<bool, Status> {
+    // Control registration and transport replacement share this guard. A stale
+    // hello must be rejected before it can evict the current transport, even
+    // when the later readiness transition would also reject that hello.
+    let _guard = state.compute.sandbox_sync_guard().await;
+    crate::auth::guard::ensure_sandbox_principal_scope(principal, &hello.sandbox_id)?;
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&hello.sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("load control registration failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::grpc::policy::authorize_configuration_identity(principal, &sandbox)?;
+    if sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .is_none_or(|admission| {
+            admission.instance_id != hello.instance_id || admission.instance_id.is_empty()
+        })
+    {
+        return Err(Status::failed_precondition(
+            "supervisor hello does not match the registered control instance",
+        ));
+    }
+    Ok(state
+        .supervisor_sessions
+        .register(hello.sandbox_id.clone(), session_id, tx, shutdown_tx))
+}
+
 pub async fn handle_connect_supervisor(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<SupervisorMessage>>,
@@ -866,10 +904,8 @@ pub async fn handle_connect_supervisor(
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    if let Some(principal) = principal.as_ref() {
-        crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
-    }
-    require_persisted_sandbox(&state.store, &sandbox_id).await?;
+    let principal = principal
+        .ok_or_else(|| Status::unauthenticated("supervisor session requires a launch identity"))?;
 
     let session_id = Uuid::new_v4().to_string();
     info!(
@@ -882,12 +918,15 @@ pub async fn handle_connect_supervisor(
     // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let superseded = state.supervisor_sessions.register(
-        sandbox_id.clone(),
+    let superseded = register_configuration_transport(
+        state,
+        &principal,
+        &hello,
         session_id.clone(),
         tx.clone(),
         shutdown_tx,
-    );
+    )
+    .await?;
     if superseded {
         info!(
             sandbox_id = %sandbox_id,
@@ -1422,6 +1461,287 @@ mod tests {
             "new session must still be registered"
         );
         assert_eq!(sessions.get("sbx").unwrap().session_id, "s-new");
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_stale_hello_cannot_evict_current_transport() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity {
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "current-generation",
+            )
+            .unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_token_id: Uuid::new_v4(),
+            refresh_replay: None,
+        };
+        let mut metadata = openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "registered-sandbox".to_string(),
+            name: "registered".to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        };
+        identity.write(&mut metadata.annotations);
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(metadata),
+                status: Some(openshell_core::proto::SandboxStatus {
+                    phase: SandboxPhase::Provisioning.into(),
+                    configuration_admission: Some(
+                        openshell_core::proto::SandboxConfigurationAdmission {
+                            instance_id: "current-control".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "registered-sandbox".to_string(),
+            source: SandboxIdentitySource::LaunchSession {
+                runtime_generation: identity.runtime_generation,
+                auth_epoch: identity.auth_epoch,
+                token_id: identity.gateway_token_id,
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let (current_tx, _current_rx) = mpsc::channel(1);
+        let (current_shutdown, mut current_shutdown_rx) = oneshot::channel();
+        state.supervisor_sessions.register(
+            "registered-sandbox".to_string(),
+            "current-transport".to_string(),
+            current_tx,
+            current_shutdown,
+        );
+        for stale_token in [false, true] {
+            let mut stale_principal = principal.clone();
+            if stale_token {
+                let Principal::Sandbox(sandbox) = &mut stale_principal else {
+                    unreachable!("sandbox fixture")
+                };
+                let SandboxIdentitySource::LaunchSession { token_id, .. } = &mut sandbox.source
+                else {
+                    unreachable!("launch session fixture")
+                };
+                *token_id = Uuid::new_v4();
+            }
+            let (stale_tx, _stale_rx) = mpsc::channel(1);
+            let error = register_configuration_transport(
+                &state,
+                &stale_principal,
+                &openshell_core::proto::SupervisorHello {
+                    sandbox_id: "registered-sandbox".to_string(),
+                    instance_id: if stale_token {
+                        "current-control"
+                    } else {
+                        "stale-control"
+                    }
+                    .to_string(),
+                },
+                "stale-transport".to_string(),
+                stale_tx,
+                make_shutdown(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.code(),
+                if stale_token {
+                    tonic::Code::Unauthenticated
+                } else {
+                    tonic::Code::FailedPrecondition
+                }
+            );
+            assert!(
+                state
+                    .supervisor_sessions
+                    .is_current_session("registered-sandbox", "current-transport")
+            );
+            assert!(matches!(
+                current_shutdown_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_terminal_reconnect_preserves_phase_and_current_identity() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState, SandboxConfigurationAdmission, SandboxStatus,
+        };
+        let state = crate::grpc::test_support::test_server_state().await;
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity {
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "terminal-generation",
+            )
+            .unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_token_id: Uuid::new_v4(),
+            refresh_replay: None,
+        };
+        let control = Uuid::new_v4().to_string();
+        let mut metadata = openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "terminal-sandbox".to_string(),
+            name: "terminal".to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        };
+        identity.write(&mut metadata.annotations);
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "terminal-sandbox".to_string(),
+            source: SandboxIdentitySource::LaunchSession {
+                runtime_generation: identity.runtime_generation.clone(),
+                auth_epoch: identity.auth_epoch,
+                token_id: identity.gateway_token_id,
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let hello = openshell_core::proto::SupervisorHello {
+            sandbox_id: "terminal-sandbox".to_string(),
+            instance_id: control.clone(),
+        };
+        for (phase, exit_code) in [(SandboxPhase::Completed, 0), (SandboxPhase::Error, 7)] {
+            let sandbox = Sandbox {
+                metadata: Some(metadata.clone()),
+                status: Some(SandboxStatus {
+                    phase: phase.into(),
+                    exit_code: Some(exit_code),
+                    main_process_instance_id: control.clone(),
+                    configuration_activation_authorized: Some(true),
+                    configuration_admission: Some(SandboxConfigurationAdmission {
+                        instance_id: control.clone(),
+                        runtime_generation: identity.runtime_generation.to_string(),
+                        boundary_instance_id: Uuid::new_v4().to_string(),
+                        boundary_session_id: Uuid::new_v4().to_string(),
+                        registration_revision: 2,
+                        state: ConfigurationAdmissionState::Rejected.into(),
+                        error: "configuration held for repair".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+            let (tx, _rx) = mpsc::channel(1);
+            let (shutdown, mut shutdown_rx) = oneshot::channel();
+            register_configuration_transport(
+                &state,
+                &principal,
+                &hello,
+                "retained-transport".to_string(),
+                tx,
+                shutdown,
+            )
+            .await
+            .unwrap();
+            state
+                .compute
+                .supervisor_session_connected(&hello.sandbox_id, &control)
+                .await
+                .unwrap();
+            let retained = state
+                .store
+                .get_message::<Sandbox>(&hello.sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.phase(), i32::from(phase));
+            assert_eq!(retained.status.as_ref().unwrap().exit_code, Some(exit_code));
+
+            for invalid in [
+                "control",
+                "never-authorized",
+                "no-exit",
+                "main",
+                "runtime",
+                "epoch",
+                "token",
+            ] {
+                let mut candidate = retained.clone();
+                let mut stale_hello = hello.clone();
+                let mut stale_principal = principal.clone();
+                match invalid {
+                    "control" => stale_hello.instance_id = Uuid::new_v4().to_string(),
+                    "never-authorized" => {
+                        candidate
+                            .status
+                            .as_mut()
+                            .unwrap()
+                            .configuration_activation_authorized = Some(false);
+                    }
+                    "no-exit" => candidate.status.as_mut().unwrap().exit_code = None,
+                    "main" => {
+                        candidate.status.as_mut().unwrap().main_process_instance_id =
+                            Uuid::new_v4().to_string();
+                    }
+                    "runtime" | "epoch" | "token" => {
+                        let Principal::Sandbox(sandbox) = &mut stale_principal else {
+                            unreachable!("sandbox fixture")
+                        };
+                        sandbox.source = SandboxIdentitySource::LaunchSession {
+                            runtime_generation: if invalid == "runtime" {
+                                openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                                    "old-generation",
+                                )
+                                .unwrap()
+                            } else {
+                                identity.runtime_generation.clone()
+                            },
+                            auth_epoch: openshell_core::jwt::CredentialEpoch::new(
+                                if invalid == "epoch" { 2 } else { 1 },
+                            )
+                            .unwrap(),
+                            token_id: if invalid == "token" {
+                                Uuid::new_v4()
+                            } else {
+                                identity.gateway_token_id
+                            },
+                        };
+                    }
+                    _ => unreachable!("fixed negative identity fixture"),
+                }
+                state.store.put_message(&candidate).await.unwrap();
+                let (tx, _rx) = mpsc::channel(1);
+                let error = register_configuration_transport(
+                    &state,
+                    &stale_principal,
+                    &stale_hello,
+                    "stale-transport".to_string(),
+                    tx,
+                    make_shutdown(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.code(),
+                    if invalid == "control" {
+                        tonic::Code::FailedPrecondition
+                    } else {
+                        tonic::Code::Unauthenticated
+                    },
+                    "{invalid}"
+                );
+                assert!(
+                    state
+                        .supervisor_sessions
+                        .is_current_session(&hello.sandbox_id, "retained-transport"),
+                    "{invalid}"
+                );
+                assert!(
+                    matches!(
+                        shutdown_rx.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ),
+                    "{invalid}"
+                );
+                state.store.put_message(&retained).await.unwrap();
+            }
+        }
     }
 
     #[test]

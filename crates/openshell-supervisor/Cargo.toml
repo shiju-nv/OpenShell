@@ -29,7 +29,6 @@ openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 clap = { workspace = true }
 miette = { workspace = true }
 nix = { workspace = true }
-prost = { workspace = true }
 prost-types = { workspace = true }
 rustls = { workspace = true }
 rustix = { workspace = true }
@@ -41,7 +40,6 @@ tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
-uuid = { workspace = true }
 
 [features]
 default = ["telemetry", "bundled-ca-roots"]
@@ -52,6 +50,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 futures = { workspace = true }
+rcgen = { workspace = true }
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 

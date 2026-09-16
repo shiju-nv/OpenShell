@@ -4518,6 +4518,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4697,8 +4698,8 @@ dependencies = [
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
- "prost",
  "prost-types",
+ "rcgen",
  "rustix 1.1.4",
  "rustls",
  "serde",
@@ -4711,7 +4712,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

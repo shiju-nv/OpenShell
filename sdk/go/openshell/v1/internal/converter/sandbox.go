@@ -114,8 +114,79 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			LastTransitionTime: c.GetLastTransitionTime(),
 		})
 	}
-	for _, endpoint := range status.GetEndpointStatuses() {
-		result.EndpointStatuses = append(result.EndpointStatuses, types.EndpointStatus{
+	result.EndpointStatuses = endpointStatusesFromProto(status.GetEndpointStatuses())
+	result.ExitCode = CopyInt32Ptr(status.ExitCode)
+	result.ConfigurationActivationAuthorized = CopyBoolPtr(status.ConfigurationActivationAuthorized)
+	if admission := status.GetConfigurationAdmission(); admission != nil {
+		state := types.ConfigurationAdmissionUnknown
+		switch admission.GetState() {
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING:
+			state = types.ConfigurationAdmissionPending
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED:
+			state = types.ConfigurationAdmissionAccepted
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED:
+			state = types.ConfigurationAdmissionRejected
+		}
+		result.ConfigurationAdmission = &types.SandboxConfigurationAdmission{
+			State:                 state,
+			InstanceID:            admission.GetInstanceId(),
+			RuntimeGeneration:     admission.GetRuntimeGeneration(),
+			BoundaryInstanceID:    admission.GetBoundaryInstanceId(),
+			BoundarySessionID:     admission.GetBoundarySessionId(),
+			PolicyVersion:         admission.GetPolicyVersion(),
+			PolicyHash:            admission.GetPolicyHash(),
+			ConfigRevision:        admission.GetConfigRevision(),
+			ProviderEnvRevision:   admission.GetProviderEnvRevision(),
+			PolicySource:          PolicySourceFromProto(admission.GetPolicySource()),
+			ConfigurationSnapshot: admission.GetConfigurationSnapshot(),
+			RegistrationRevision:  admission.GetRegistrationRevision(),
+			DeliveryRevision:      admission.GetDeliveryRevision(),
+			ActivationConfirmed:   admission.GetActivationConfirmed(),
+			Error:                 admission.GetError(),
+			EndpointConfiguration: endpointConfigurationFromProto(admission.GetEndpointConfiguration()),
+		}
+	}
+	if desired := status.GetConfigurationDesired(); desired != nil {
+		result.ConfigurationDesired = &types.SandboxConfigurationSnapshot{
+			SnapshotID:                      desired.GetSnapshotId(),
+			InstanceID:                      desired.GetInstanceId(),
+			RuntimeGeneration:               desired.GetRuntimeGeneration(),
+			BoundaryInstanceID:              desired.GetBoundaryInstanceId(),
+			BoundarySessionID:               desired.GetBoundarySessionId(),
+			PolicyVersion:                   desired.GetPolicyVersion(),
+			PolicyHash:                      desired.GetPolicyHash(),
+			ConfigRevision:                  desired.GetConfigRevision(),
+			ProviderEnvRevision:             desired.GetProviderEnvRevision(),
+			PolicySource:                    PolicySourceFromProto(desired.GetPolicySource()),
+			RegistrationRevision:            desired.GetRegistrationRevision(),
+			DeliveryRevision:                desired.GetDeliveryRevision(),
+			Admitted:                        desired.GetAdmitted(),
+			Error:                           desired.GetError(),
+			PolicyValidationFailureMode:     desired.GetPolicyValidationFailureMode(),
+			GatewayConfigurationFingerprint: desired.GetGatewayConfigurationFingerprint(),
+			EndpointConfiguration:           endpointConfigurationFromProto(desired.GetEndpointConfiguration()),
+		}
+	}
+
+	return result
+}
+
+func endpointConfigurationFromProto(configuration *pb.SandboxEndpointConfiguration) *types.SandboxEndpointConfiguration {
+	if configuration == nil {
+		return nil
+	}
+	// Each inventory owns its slices so callers cannot mutate the wire message
+	// or another generation that was populated from the same message.
+	return &types.SandboxEndpointConfiguration{
+		Endpoints:               endpointStatusesFromProto(configuration.GetEndpoints()),
+		CredentialedEndpointIDs: slices.Clone(configuration.GetCredentialedEndpointIds()),
+	}
+}
+
+func endpointStatusesFromProto(endpoints []*pb.EndpointStatus) []types.EndpointStatus {
+	var result []types.EndpointStatus
+	for _, endpoint := range endpoints {
+		result = append(result, types.EndpointStatus{
 			EndpointID:     endpoint.GetEndpointId(),
 			Host:           endpoint.GetHost(),
 			Ports:          slices.Clone(endpoint.GetPorts()),
@@ -124,8 +195,6 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			LastReportedAt: endpoint.GetLastReportedAt(),
 		})
 	}
-	result.ExitCode = CopyInt32Ptr(status.ExitCode)
-
 	return result
 }
 

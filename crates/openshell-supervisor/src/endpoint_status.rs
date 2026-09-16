@@ -18,7 +18,29 @@ use openshell_core::proto::SandboxPolicy;
 use tokio::time::timeout;
 use tracing::warn;
 
-use crate::{PolicyGatewayClient, is_retryable_error};
+use crate::is_retryable_error;
+
+/// Gateway sink for endpoint evidence, independent of configuration reconciliation.
+#[tonic::async_trait]
+pub trait EndpointStatusClient: Clone + Send + Sync + 'static {
+    /// Submit a complete snapshot fenced by its accepted supervisor session.
+    async fn report_endpoint_status(
+        &self,
+        sandbox_id: &str,
+        snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
+    ) -> miette::Result<()>;
+}
+
+#[tonic::async_trait]
+impl EndpointStatusClient for openshell_core::grpc_client::CachedOpenShellClient {
+    async fn report_endpoint_status(
+        &self,
+        sandbox_id: &str,
+        snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
+    ) -> miette::Result<()> {
+        self.report_endpoint_status(sandbox_id, snapshot).await
+    }
+}
 
 /// Deliver complete tool server endpoint snapshots independently from network traffic.
 ///
@@ -26,7 +48,7 @@ use crate::{PolicyGatewayClient, is_retryable_error};
 /// inventory or supervisor session. Retries retain an immutable snapshot until
 /// an inventory reset supersedes it; each frozen snapshot reserves a distinct
 /// session sequence so cancellation cannot reuse an ambiguously accepted body.
-pub async fn run_reporter<C: PolicyGatewayClient>(
+pub async fn run_reporter<C: EndpointStatusClient>(
     client: C,
     sandbox_id: String,
     mut commands: EndpointStatusReceiver,
@@ -424,26 +446,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl PolicyGatewayClient for EndpointStatusGateway {
-        async fn poll_settings(
-            &self,
-            _sandbox_id: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            Err(miette::miette!(
-                "endpoint-status test does not poll settings"
-            ))
-        }
-
-        async fn report_policy_status(
-            &self,
-            _sandbox_id: &str,
-            _version: u32,
-            _loaded: bool,
-            _error: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-
+    impl EndpointStatusClient for EndpointStatusGateway {
         async fn report_endpoint_status(
             &self,
             _sandbox_id: &str,
@@ -452,10 +455,6 @@ mod tests {
             self.reports
                 .send(snapshot.clone())
                 .map_err(|_| miette::miette!("endpoint-status report receiver closed"))
-        }
-
-        fn workspace(&self) -> String {
-            String::new()
         }
     }
 
@@ -466,26 +465,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl PolicyGatewayClient for RetryEndpointStatusGateway {
-        async fn poll_settings(
-            &self,
-            _sandbox_id: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            Err(miette::miette!(
-                "endpoint-status test does not poll settings"
-            ))
-        }
-
-        async fn report_policy_status(
-            &self,
-            _sandbox_id: &str,
-            _version: u32,
-            _loaded: bool,
-            _error: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-
+    impl EndpointStatusClient for RetryEndpointStatusGateway {
         async fn report_endpoint_status(
             &self,
             _sandbox_id: &str,
@@ -499,10 +479,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-
-        fn workspace(&self) -> String {
-            String::new()
         }
     }
 
@@ -863,26 +839,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl PolicyGatewayClient for ControlledEndpointStatusGateway {
-        async fn poll_settings(
-            &self,
-            _sandbox_id: &str,
-        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-            Err(miette::miette!(
-                "endpoint-status test does not poll settings"
-            ))
-        }
-
-        async fn report_policy_status(
-            &self,
-            _sandbox_id: &str,
-            _version: u32,
-            _loaded: bool,
-            _error: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-
+    impl EndpointStatusClient for ControlledEndpointStatusGateway {
         async fn report_endpoint_status(
             &self,
             _sandbox_id: &str,
@@ -898,10 +855,6 @@ mod tests {
             result
                 .await
                 .map_err(|_| miette::miette!("endpoint-status response cancelled"))?
-        }
-
-        fn workspace(&self) -> String {
-            String::new()
         }
     }
 

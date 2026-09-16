@@ -482,6 +482,67 @@ mod tests {
         assert_eq!(denial.kind, DestinationDenialKind::TrustedGateway);
     }
 
+    fn backend_gateway_plan(ip: IpAddr) -> DestinationValidationPlan {
+        build_validation_plan(
+            "host.openshell.internal",
+            "host.openshell.internal",
+            Some(ip),
+            None,
+            &[],
+            true,
+        )
+        .expect("backend pin selects the trusted destination mode")
+    }
+
+    #[tokio::test]
+    async fn backend_pinned_gateway_rejects_metadata_destinations() {
+        for address in ["fd00:ec2::254", "169.254.169.254", "::ffff:169.254.169.254"] {
+            let plan = backend_gateway_plan(address.parse().unwrap());
+            // Validation returns an unopened connector, so this exercises the
+            // TCP destination gate without contacting a metadata service.
+            let denial = validate_destination(request("host.openshell.internal", &plan))
+                .await
+                .err()
+                .expect("metadata must not become a backend-pinned TCP destination");
+
+            assert_eq!(denial.kind, DestinationDenialKind::TrustedGateway);
+            assert!(denial.reason.contains("cloud metadata"), "{address}");
+        }
+    }
+
+    #[test]
+    fn backend_pinned_gateway_filters_metadata_answers() {
+        for address in ["fd00:ec2::254", "169.254.169.254", "::ffff:169.254.169.254"] {
+            let ip = address.parse().unwrap();
+            let plan = backend_gateway_plan(ip);
+            let denial = filter_resolved_addresses(&plan, "host.openshell.internal", 80, &[ip])
+                .expect_err("metadata must not become a backend-pinned DNS answer");
+
+            assert_eq!(denial.kind, DestinationDenialKind::TrustedGateway);
+            assert!(denial.reason.contains("cloud metadata"), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_pinned_gateway_preserves_private_and_loopback_destinations() {
+        for address in ["fd00::254", "192.168.65.254", "::1", "127.0.0.1"] {
+            let ip = address.parse().unwrap();
+            let plan = backend_gateway_plan(ip);
+            // Explicit backend pins intentionally allow private and loopback
+            // gateways. Metadata rejection must not widen that restriction.
+            let connector = validate_destination(request("host.openshell.internal", &plan))
+                .await
+                .expect("ordinary backend pins remain valid without resolution or dialing");
+
+            assert_eq!(connector.addrs(), &[SocketAddr::new(ip, 80)]);
+            assert_eq!(
+                filter_resolved_addresses(&plan, "host.openshell.internal", 80, &[ip])
+                    .expect("ordinary backend pins remain valid DNS answers"),
+                vec![ip],
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pinned_addresses_construct_connector_without_resolving_host() {
         let pinned_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));

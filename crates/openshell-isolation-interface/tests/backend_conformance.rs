@@ -9,7 +9,7 @@
 //! backends behind `dyn` with no enum over concrete state, and that one driver
 //! runs both unchanged.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -220,9 +220,13 @@ impl BoundaryLoopbackConnector for MockLoopbackConnector {
 
 struct MockBound<K> {
     source: Arc<MockSource<K>>,
+    configuration: Arc<MockConfiguration>,
+    policy: SandboxPolicy,
 }
 struct MockReady<K> {
     _k: PhantomData<K>,
+    configuration: Arc<MockConfiguration>,
+    policy: SandboxPolicy,
 }
 struct MockRunning<K> {
     process: Arc<MockProcess>,
@@ -233,12 +237,19 @@ struct MockRunning<K> {
 
 #[async_trait]
 impl<K: MockKind> BoundBoundary for MockBound<K> {
+    fn configuration(&self) -> Arc<dyn BoundaryConfiguration> {
+        self.configuration.clone()
+    }
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
         self.source.clone()
     }
     async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         ConfirmedBoundary::try_new(
-            Box::new(MockReady::<K> { _k: PhantomData }),
+            Box::new(MockReady::<K> {
+                _k: PhantomData,
+                configuration: self.configuration,
+                policy: self.policy,
+            }),
             confirmation_evidence(),
             &workload_identity(),
         )
@@ -247,7 +258,27 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
 
 #[async_trait]
 impl<K: MockKind> ReadyBoundary for MockReady<K> {
+    fn configuration(&self) -> Arc<dyn BoundaryConfiguration> {
+        self.configuration.clone()
+    }
+    async fn update_startup_policy(&mut self, policy: SandboxPolicy) -> Result<(), BackendError> {
+        if *self.configuration.ready.borrow() {
+            return Err(BackendError::Denied(
+                "startup policy cannot change after configuration release".to_string(),
+            ));
+        }
+        // A changed launch policy requires a fresh configuration preparation;
+        // an earlier receipt cannot authorize the replacement policy.
+        *self.configuration.prepared.lock().unwrap() = None;
+        self.policy = policy;
+        Ok(())
+    }
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError> {
+        if !*self.configuration.ready.borrow() {
+            return Err(BackendError::Configuration(
+                "configuration is held".to_string(),
+            ));
+        }
         Ok(Box::new(MockRunning::<K> {
             process: MockProcess::new(),
             exec: Arc::new(MockExec),
@@ -295,6 +326,17 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
     fn backend_name(&self) -> &'static str {
         K::BACKEND_ID
     }
+    async fn discover(
+        &self,
+        _descriptor: &VerifiedBackendDescriptor,
+    ) -> Result<BoundaryBootstrap, BackendError> {
+        Ok(BoundaryBootstrap {
+            identity: activation_identity(),
+            workload_identity: workload_identity(),
+            image_policy: ImagePolicyDiscovery::Missing,
+            filesystem_baseline: BoundaryFilesystemBaseline::default(),
+        })
+    }
     async fn attach(
         &self,
         descriptor: VerifiedBackendDescriptor,
@@ -309,6 +351,8 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
         }
         Ok(Box::new(MockBound::<K> {
             source: Arc::new(MockSource(PhantomData)),
+            configuration: MockConfiguration::new(),
+            policy: sandbox.policy,
         }))
     }
 }
@@ -316,6 +360,158 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
+
+struct MockConfiguration {
+    ready: tokio::sync::watch::Sender<bool>,
+    installed: Mutex<Option<ConfigurationRevision>>,
+    prepared: Mutex<Option<PreparedBoundaryConfiguration>>,
+}
+
+impl MockConfiguration {
+    fn new() -> Arc<Self> {
+        let (ready, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            ready,
+            installed: Mutex::new(None),
+            prepared: Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait]
+impl BoundaryConfiguration for MockConfiguration {
+    fn identity(&self) -> ConfigurationActivationIdentity {
+        activation_identity()
+    }
+    fn readiness(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.ready.subscribe()
+    }
+    async fn snapshot(&self) -> Result<BoundaryConfigurationSnapshot, BackendError> {
+        Ok(BoundaryConfigurationSnapshot {
+            identity: self.identity(),
+            installed: self.installed.lock().unwrap().clone(),
+            active: *self.ready.borrow(),
+        })
+    }
+    async fn prepare(
+        &self,
+        expected: Option<ConfigurationRevision>,
+        candidate: ConfigurationRevision,
+        _child_env: HashMap<String, String>,
+    ) -> Result<PreparedBoundaryConfiguration, BackendError> {
+        if *self.installed.lock().unwrap() != expected {
+            return Err(BackendError::Configuration(
+                "installed revision changed".to_string(),
+            ));
+        }
+        self.ready.send_replace(false);
+        let prepared = PreparedBoundaryConfiguration {
+            identity: self.identity(),
+            transition_id: format!("mock-transition-{}", candidate.config_revision),
+            expected,
+            configuration: candidate,
+        };
+        *self.prepared.lock().unwrap() = Some(prepared.clone());
+        Ok(prepared)
+    }
+    async fn commit(
+        &self,
+        prepared: &PreparedBoundaryConfiguration,
+    ) -> Result<InstalledBoundaryConfiguration, BackendError> {
+        if self.prepared.lock().unwrap().as_ref() != Some(prepared) {
+            return Err(BackendError::Configuration(
+                "unknown preparation".to_string(),
+            ));
+        }
+        *self.installed.lock().unwrap() = Some(prepared.configuration.clone());
+        Ok(InstalledBoundaryConfiguration {
+            identity: prepared.identity.clone(),
+            transition_id: prepared.transition_id.clone(),
+            configuration: prepared.configuration.clone(),
+        })
+    }
+    async fn release(
+        &self,
+        installed: &InstalledBoundaryConfiguration,
+    ) -> Result<ActivatedBoundaryConfiguration, BackendError> {
+        let prepared = self.prepared.lock().unwrap();
+        if installed.identity != self.identity()
+            || self.installed.lock().unwrap().as_ref() != Some(&installed.configuration)
+            || prepared
+                .as_ref()
+                .is_none_or(|p| p.transition_id != installed.transition_id)
+        {
+            return Err(BackendError::Configuration(
+                "unknown installation".to_string(),
+            ));
+        }
+        self.ready.send_replace(true);
+        Ok(ActivatedBoundaryConfiguration {
+            identity: installed.identity.clone(),
+            transition_id: installed.transition_id.clone(),
+            configuration: installed.configuration.clone(),
+        })
+    }
+    async fn abort(&self, prepared: &PreparedBoundaryConfiguration) -> Result<(), BackendError> {
+        if self.prepared.lock().unwrap().as_ref() == Some(prepared) {
+            *self.prepared.lock().unwrap() = None;
+        }
+        self.ready.send_replace(false);
+        Ok(())
+    }
+    async fn quiesce(&self) -> Result<(), BackendError> {
+        self.ready.send_replace(false);
+        *self.prepared.lock().unwrap() = None;
+        Ok(())
+    }
+    async fn refresh_registration(
+        &self,
+        _grant: openshell_core::jwt::SecretJwt,
+        registration_revision: u64,
+    ) -> Result<(), BackendError> {
+        if registration_revision != self.identity().registration_revision {
+            return Err(BackendError::Configuration(
+                "registration changed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn activation_identity() -> ConfigurationActivationIdentity {
+    ConfigurationActivationIdentity {
+        runtime_generation: "generation-1".to_string(),
+        boundary_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        supervisor_instance_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        boundary_instance_id: "33333333-3333-4333-8333-333333333333".to_string(),
+        registration_revision: 1,
+    }
+}
+
+async fn release_configuration(
+    configuration: Arc<dyn BoundaryConfiguration>,
+) -> Result<(), BackendError> {
+    let prepared = configuration
+        .prepare(
+            None,
+            ConfigurationRevision {
+                config_revision: 1,
+                policy_version: 1,
+                policy_hash: "mock-policy".to_string(),
+                policy_source: 1,
+                provider_env_revision: 0,
+            },
+            HashMap::new(),
+        )
+        .await?;
+    let installed = configuration.commit(&prepared).await?;
+    assert!(
+        !*configuration.readiness().borrow(),
+        "installation alone does not release the workload"
+    );
+    configuration.release(&installed).await?;
+    Ok(())
+}
 
 fn registry() -> BackendRegistry {
     let mut reg = BackendRegistry::new();
@@ -354,6 +550,9 @@ fn sandbox_ctx() -> SandboxContext {
             interactive: false,
         },
         identity: workload_identity(),
+        registration_grant: openshell_core::jwt::SecretJwt::parse("mock-registration")
+            .expect("mock grant"),
+        registration_revision: 1,
     }
 }
 
@@ -452,6 +651,8 @@ async fn drive(
     admitted: &str,
 ) -> Result<Box<dyn RunningBoundary>, BackendError> {
     let (backend, verified) = reg.resolve(descriptor, admitted)?;
+    let discovered = backend.discover(&verified).await?;
+    assert_eq!(discovered.workload_identity, workload_identity());
     let bound = backend.attach(verified, sandbox_ctx()).await?;
     // The mediation source is retained before consuming `Bound` and stays
     // usable across the confirm/start transitions.
@@ -459,7 +660,9 @@ async fn drive(
     assert_eq!(bound.host_gateway_ip(), None);
     let confirmed = bound.confirm().await?;
     confirmed.evidence().validate(&sandbox_ctx().identity)?;
-    confirmed.into_boundary().start_agent().await
+    let ready = confirmed.into_boundary();
+    release_configuration(ready.configuration()).await?;
+    ready.start_agent().await
 }
 
 // ---------------------------------------------------------------------------
@@ -535,12 +738,134 @@ async fn one_driver_runs_both_backends() {
     );
 }
 
+#[tokio::test]
+async fn configuration_activation_confirmation_and_installation_keep_workload_held() {
+    let registry = registry();
+    let (backend, verified) = registry
+        .resolve(descriptor("mock-primary"), "mock-primary")
+        .expect("resolve");
+    let bound = backend
+        .attach(verified, sandbox_ctx())
+        .await
+        .expect("attach");
+    let configuration = bound.configuration();
+    let confirmed = bound.confirm().await.expect("confirm isolation");
+    assert!(!configuration.snapshot().await.expect("snapshot").active);
+    let prepared = configuration
+        .prepare(
+            None,
+            ConfigurationRevision {
+                config_revision: 1,
+                policy_version: 1,
+                policy_hash: "mock-policy".to_string(),
+                policy_source: 1,
+                provider_env_revision: 0,
+            },
+            HashMap::new(),
+        )
+        .await
+        .expect("prepare");
+    let installed = configuration
+        .commit(&prepared)
+        .await
+        .expect("install while held");
+    let result = confirmed.into_boundary().start_agent().await;
+    assert!(
+        matches!(result, Err(BackendError::Configuration(_))),
+        "posture and installation alone cannot start work"
+    );
+    configuration
+        .release(&installed)
+        .await
+        .expect("explicit release");
+    assert!(
+        configuration
+            .snapshot()
+            .await
+            .expect("released snapshot")
+            .active
+    );
+    configuration.quiesce().await.expect("hold on reconnect");
+    assert!(
+        configuration.release(&installed).await.is_err(),
+        "old installation receipt cannot release after hold"
+    );
+}
+
+#[tokio::test]
+async fn configuration_activation_startup_policy_repair_requires_fresh_held_admission() {
+    for name in ["mock-primary", "mock-secondary"] {
+        let registry = registry();
+        let (backend, verified) = registry.resolve(descriptor(name), name).expect("resolve");
+        let bound = backend
+            .attach(verified, sandbox_ctx())
+            .await
+            .expect("attach");
+        let configuration = bound.configuration();
+        let mut ready = bound.confirm().await.expect("confirm").into_boundary();
+        let original = ConfigurationRevision {
+            config_revision: 1,
+            policy_version: 1,
+            policy_hash: "original-policy".to_string(),
+            policy_source: 1,
+            provider_env_revision: 0,
+        };
+        let prepared = configuration
+            .prepare(None, original.clone(), HashMap::new())
+            .await
+            .expect("prepare original");
+        let installed = configuration.commit(&prepared).await.expect("commit held");
+        let mut repaired = sandbox_ctx().policy;
+        repaired.filesystem.read_only.push("/repaired".into());
+        ready
+            .update_startup_policy(repaired.clone())
+            .await
+            .expect("replace held startup policy");
+        assert!(!configuration.snapshot().await.expect("snapshot").active);
+        assert!(
+            configuration.release(&installed).await.is_err(),
+            "old admission cannot release a replacement startup policy"
+        );
+        let replacement = configuration
+            .prepare(
+                Some(original),
+                ConfigurationRevision {
+                    config_revision: 2,
+                    policy_version: 2,
+                    policy_hash: "repaired-policy".to_string(),
+                    policy_source: 1,
+                    provider_env_revision: 0,
+                },
+                HashMap::new(),
+            )
+            .await
+            .expect("prepare repaired policy");
+        let installed = configuration
+            .commit(&replacement)
+            .await
+            .expect("commit replacement");
+        configuration
+            .release(&installed)
+            .await
+            .expect("release repaired admission");
+        assert!(matches!(
+            ready.update_startup_policy(repaired).await,
+            Err(BackendError::Denied(_))
+        ));
+        ready.start_agent().await.expect("start admitted workload");
+    }
+}
+
 #[test]
 fn confirmation_constructor_rejects_incomplete_evidence() {
     let mut evidence = confirmation_evidence();
     evidence.seccomp.cancellation = false;
     let result = ConfirmedBoundary::try_new(
-        Box::new(MockReady::<Primary> { _k: PhantomData }),
+        Box::new(MockReady::<Primary> {
+            _k: PhantomData,
+            configuration: MockConfiguration::new(),
+            policy: sandbox_ctx().policy,
+        }),
         evidence,
         &workload_identity(),
     );
@@ -558,7 +883,11 @@ fn confirmation_constructor_rejects_another_workload_identity() {
     )
     .unwrap();
     let result = ConfirmedBoundary::try_new(
-        Box::new(MockReady::<Primary> { _k: PhantomData }),
+        Box::new(MockReady::<Primary> {
+            _k: PhantomData,
+            configuration: MockConfiguration::new(),
+            policy: sandbox_ctx().policy,
+        }),
         confirmation_evidence(),
         &expected,
     );
@@ -618,11 +947,11 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
     // The retained Arc must remain usable afterward.
     let source = bound.network_mediation_source();
     let confirmed = bound.confirm().await.expect("confirm");
-    let _running = confirmed
-        .into_boundary()
-        .start_agent()
+    let ready = confirmed.into_boundary();
+    release_configuration(ready.configuration())
         .await
-        .expect("start");
+        .expect("release configuration");
+    let _running = ready.start_agent().await.expect("start");
 
     let conn = source.accept_tcp().await.expect("accept after consumption");
     let identity = conn.binary_identity.expect("identity resolves");

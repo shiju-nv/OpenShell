@@ -18,6 +18,184 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
+	for _, tc := range []struct {
+		wire pb.ConfigurationAdmissionState
+		want v1.ConfigurationAdmissionState
+	}{
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING, v1.ConfigurationAdmissionPending},
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED, v1.ConfigurationAdmissionAccepted},
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED, v1.ConfigurationAdmissionRejected},
+		{pb.ConfigurationAdmissionState(99), v1.ConfigurationAdmissionUnknown},
+	} {
+		t.Run(string(tc.want), func(t *testing.T) {
+			wire := &pb.SandboxStatus{ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
+				State: tc.wire, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				ProviderEnvRevision: 6, Error: "invalid endpoint",
+				InstanceId: "control-1", RuntimeGeneration: "runtime-1",
+				BoundaryInstanceId: "boundary-1", BoundarySessionId: "session-1",
+				PolicySource:          sandboxpb.PolicySource_POLICY_SOURCE_SANDBOX,
+				ConfigurationSnapshot: "snapshot-1", RegistrationRevision: 8, DeliveryRevision: 9,
+				ActivationConfirmed: tc.want == v1.ConfigurationAdmissionAccepted,
+			}}
+			got := sandboxStatusFromProto(wire)
+			assert.Equal(t, &v1.SandboxConfigurationAdmission{
+				State: tc.want, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				ProviderEnvRevision: 6, Error: "invalid endpoint",
+				InstanceID: "control-1", RuntimeGeneration: "runtime-1",
+				BoundaryInstanceID: "boundary-1", BoundarySessionID: "session-1",
+				PolicySource:          v1.PolicySourceSandbox,
+				ConfigurationSnapshot: "snapshot-1", RegistrationRevision: 8, DeliveryRevision: 9,
+				ActivationConfirmed: tc.want == v1.ConfigurationAdmissionAccepted,
+			}, got.ConfigurationAdmission)
+			wire.ConfigurationAdmission.Error = "changed"
+			assert.Equal(t, "invalid endpoint", got.ConfigurationAdmission.Error)
+		})
+	}
+	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).ConfigurationAdmission)
+}
+
+func TestSandboxConfigurationStatusPreservesDesiredAndActivatedGenerations(t *testing.T) {
+	authorized := true
+	wire := &pb.SandboxStatus{
+		CurrentPolicyVersion:              4,
+		ConfigurationActivationAuthorized: &authorized,
+		ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
+			State:         pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED,
+			PolicyVersion: 4, PolicyHash: "accepted-hash", ConfigRevision: 5, ProviderEnvRevision: 6,
+			ConfigurationSnapshot: "accepted-snapshot", ActivationConfirmed: true,
+		},
+		ConfigurationDesired: &pb.SandboxConfigurationSnapshot{
+			SnapshotId: "desired-snapshot", InstanceId: "control-1", RuntimeGeneration: "runtime-1",
+			BoundaryInstanceId: "boundary-1", BoundarySessionId: "session-1",
+			PolicyVersion: 7, PolicyHash: "desired-hash", ConfigRevision: 8, ProviderEnvRevision: 9,
+			PolicySource: sandboxpb.PolicySource_POLICY_SOURCE_GLOBAL, RegistrationRevision: 10,
+			DeliveryRevision: 11, Admitted: false, Error: "invalid provider binding",
+			PolicyValidationFailureMode:     "retain_last_valid",
+			GatewayConfigurationFingerprint: "gateway-fingerprint-1",
+		},
+	}
+	got := sandboxStatusFromProto(wire)
+	assert.Equal(t, &v1.SandboxConfigurationSnapshot{
+		SnapshotID: "desired-snapshot", InstanceID: "control-1", RuntimeGeneration: "runtime-1",
+		BoundaryInstanceID: "boundary-1", BoundarySessionID: "session-1",
+		PolicyVersion: 7, PolicyHash: "desired-hash", ConfigRevision: 8, ProviderEnvRevision: 9,
+		PolicySource: v1.PolicySourceGlobal, RegistrationRevision: 10,
+		DeliveryRevision: 11, Admitted: false, Error: "invalid provider binding",
+		PolicyValidationFailureMode:     "retain_last_valid",
+		GatewayConfigurationFingerprint: "gateway-fingerprint-1",
+	}, got.ConfigurationDesired)
+	assert.Equal(t, uint32(4), got.CurrentPolicyVersion)
+	require.NotNil(t, got.ConfigurationAdmission)
+	assert.Equal(t, uint32(4), got.ConfigurationAdmission.PolicyVersion)
+	assert.True(t, got.ConfigurationAdmission.ActivationConfirmed)
+	require.NotNil(t, got.ConfigurationActivationAuthorized)
+	assert.True(t, *got.ConfigurationActivationAuthorized)
+
+	// Updating the received status must not mutate a previously returned SDK value.
+	authorized = false
+	wire.ConfigurationDesired.Error = "changed"
+	wire.ConfigurationDesired.PolicyValidationFailureMode = "fail_closed"
+	wire.ConfigurationDesired.GatewayConfigurationFingerprint = "gateway-fingerprint-2"
+	wire.ConfigurationAdmission.ActivationConfirmed = false
+	assert.True(t, *got.ConfigurationActivationAuthorized)
+	assert.True(t, got.ConfigurationAdmission.ActivationConfirmed)
+	assert.Equal(t, "invalid provider binding", got.ConfigurationDesired.Error)
+	assert.Equal(t, "retain_last_valid", got.ConfigurationDesired.PolicyValidationFailureMode)
+	assert.Equal(t, "gateway-fingerprint-1", got.ConfigurationDesired.GatewayConfigurationFingerprint)
+}
+
+func TestSandboxConfigurationEndpointInventoriesAreIndependent(t *testing.T) {
+	makeInventory := func(id, host string) *pb.SandboxEndpointConfiguration {
+		return &pb.SandboxEndpointConfiguration{
+			Endpoints: []*pb.EndpointStatus{{
+				EndpointId: id, Host: host, Ports: []uint32{443}, Path: "/mcp",
+				LastResult: pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE,
+			}},
+			CredentialedEndpointIds: []string{id},
+		}
+	}
+	wire := &pb.SandboxStatus{
+		ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
+			EndpointConfiguration: makeInventory("accepted-endpoint", "accepted.example.test"),
+		},
+		ConfigurationDesired: &pb.SandboxConfigurationSnapshot{
+			EndpointConfiguration: makeInventory("desired-endpoint", "desired.example.test"),
+		},
+	}
+	got := sandboxStatusFromProto(wire)
+	for _, tc := range []struct {
+		name string
+		wire *pb.SandboxEndpointConfiguration
+		got  *v1.SandboxEndpointConfiguration
+	}{
+		{"accepted", wire.ConfigurationAdmission.EndpointConfiguration, got.ConfigurationAdmission.EndpointConfiguration},
+		{"desired", wire.ConfigurationDesired.EndpointConfiguration, got.ConfigurationDesired.EndpointConfiguration},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NotNil(t, tc.got)
+			assert.Equal(t, &v1.SandboxEndpointConfiguration{
+				Endpoints: []v1.EndpointStatus{{
+					EndpointID: tc.name + "-endpoint", Host: tc.name + ".example.test",
+					Ports: []uint32{443}, Path: "/mcp", LastResult: v1.EndpointNoObservedExchange,
+				}},
+				CredentialedEndpointIDs: []string{tc.name + "-endpoint"},
+			}, tc.got)
+
+			// Neither caller can rewrite the other side's inventory or nested ports.
+			tc.wire.Endpoints[0].Host = "wire-mutation.example.test"
+			tc.wire.Endpoints[0].Ports[0] = 80
+			tc.wire.CredentialedEndpointIds[0] = "wire-mutation"
+			assert.Equal(t, tc.name+".example.test", tc.got.Endpoints[0].Host)
+			assert.Equal(t, uint32(443), tc.got.Endpoints[0].Ports[0])
+			assert.Equal(t, tc.name+"-endpoint", tc.got.CredentialedEndpointIDs[0])
+			tc.got.Endpoints[0].Host = "sdk-mutation.example.test"
+			tc.got.Endpoints[0].Ports[0] = 8443
+			tc.got.CredentialedEndpointIDs[0] = "sdk-mutation"
+			assert.Equal(t, "wire-mutation.example.test", tc.wire.Endpoints[0].Host)
+			assert.Equal(t, uint32(80), tc.wire.Endpoints[0].Ports[0])
+			assert.Equal(t, "wire-mutation", tc.wire.CredentialedEndpointIds[0])
+		})
+	}
+}
+
+func TestSandboxConfigurationEndpointInventoryPresence(t *testing.T) {
+	wire := &pb.SandboxStatus{
+		ConfigurationAdmission: &pb.SandboxConfigurationAdmission{},
+		ConfigurationDesired:   &pb.SandboxConfigurationSnapshot{},
+	}
+	got := sandboxStatusFromProto(wire)
+	assert.Nil(t, got.ConfigurationAdmission.EndpointConfiguration)
+	assert.Nil(t, got.ConfigurationDesired.EndpointConfiguration)
+
+	// An empty inventory records a configuration with no endpoints; it differs
+	// from an absent inventory whose configuration has not been recorded.
+	wire.ConfigurationAdmission.EndpointConfiguration = &pb.SandboxEndpointConfiguration{}
+	wire.ConfigurationDesired.EndpointConfiguration = &pb.SandboxEndpointConfiguration{}
+	got = sandboxStatusFromProto(wire)
+	assert.Equal(t, &v1.SandboxEndpointConfiguration{}, got.ConfigurationAdmission.EndpointConfiguration)
+	assert.Equal(t, &v1.SandboxEndpointConfiguration{}, got.ConfigurationDesired.EndpointConfiguration)
+}
+
+func TestSandboxConfigurationAdmissionDoesNotImplyActivation(t *testing.T) {
+	authorized := false
+	got := sandboxStatusFromProto(&pb.SandboxStatus{
+		ConfigurationActivationAuthorized: &authorized,
+		ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
+			State: pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED,
+		},
+	})
+	require.NotNil(t, got.ConfigurationAdmission)
+	assert.Equal(t, v1.ConfigurationAdmissionAccepted, got.ConfigurationAdmission.State)
+	assert.False(t, got.ConfigurationAdmission.ActivationConfirmed)
+	require.NotNil(t, got.ConfigurationActivationAuthorized)
+	assert.False(t, *got.ConfigurationActivationAuthorized)
+
+	unknown := sandboxStatusFromProto(&pb.SandboxStatus{})
+	assert.Nil(t, unknown.ConfigurationDesired)
+	assert.Nil(t, unknown.ConfigurationActivationAuthorized)
+}
+
 func TestSandboxFromProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(2)

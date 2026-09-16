@@ -5,7 +5,6 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(test)]
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
@@ -21,12 +20,14 @@ use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundBoundary, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
-    BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess, BoundarySignal,
-    BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec, IsolationBackend, LoopbackTarget,
-    MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen, ProcessAttachment,
-    ReadyBoundary, RunningBoundary, SandboxContext, TcpOpenDecision, TcpOpenDenial,
-    VerifiedBackendDescriptor,
+    ActivatedBoundaryConfiguration, BackendError, BoundBoundary, BoundaryBootstrap,
+    BoundaryConfiguration, BoundaryConfigurationSnapshot, BoundaryDuplexStream, BoundaryExec,
+    BoundaryExitStatus, BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess,
+    BoundarySignal, BoundaryTerminal, ConfigurationActivationIdentity, ConfigurationRevision,
+    ConfirmedBoundary, ExecSession, ExecSpec, InstalledBoundaryConfiguration, IsolationBackend,
+    LoopbackTarget, MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen,
+    PreparedBoundaryConfiguration, ProcessAttachment, ReadyBoundary, RunningBoundary,
+    SandboxContext, TcpOpenDecision, TcpOpenDenial, VerifiedBackendDescriptor,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -65,18 +66,24 @@ pub struct OpenShellRuntimeBackend {
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
+    bootstrap: std::sync::Mutex<Option<BoundaryBootstrap>>,
 }
 
 impl OpenShellRuntimeBackend {
+    /// Bind discovery, attachment, and activation to the caller's one control process identity.
     pub fn new(
         ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
         provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     ) -> Self {
         Self {
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
+            supervisor_instance_id,
+            bootstrap: std::sync::Mutex::new(None),
         }
     }
 }
@@ -85,6 +92,51 @@ impl OpenShellRuntimeBackend {
 impl IsolationBackend for OpenShellRuntimeBackend {
     fn backend_name(&self) -> &str {
         crate::BACKEND_NAME
+    }
+
+    async fn discover(
+        &self,
+        descriptor: &VerifiedBackendDescriptor,
+    ) -> Result<BoundaryBootstrap, BackendError> {
+        let runtime_descriptor: SandboxRuntimeDescriptor =
+            serde_json::from_slice(descriptor.payload()).map_err(|error| {
+                BackendError::Descriptor(format!("decode runtime descriptor: {error}"))
+            })?;
+        validate_transport_descriptor(&runtime_descriptor)?;
+        let client = BoundaryClient::new(
+            runtime_descriptor,
+            self.sandbox_bearer.clone(),
+            self.supervisor_instance_id,
+        );
+        let response = client
+            .call_idempotent(Request::DescribeWorkload {
+                supervisor_instance_id: self.supervisor_instance_id,
+                resource_claims: client.runtime_descriptor.resource_claims.clone(),
+            })
+            .await?;
+        let Response::WorkloadDescribed { bootstrap } = response else {
+            return Err(unexpected_response("workload_described", &response));
+        };
+        client.validate_identity(&bootstrap.identity, false)?;
+        if bootstrap.workload_identity != client.runtime_descriptor.workload_identity {
+            return Err(BackendError::Descriptor(
+                "discovered workload identity does not match runtime descriptor".to_string(),
+            ));
+        }
+        let mut previous = self
+            .bootstrap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if previous
+            .as_ref()
+            .is_some_and(|previous| !previous.identity.same_incarnation(&bootstrap.identity))
+        {
+            return Err(BackendError::Terminated(
+                "boundary incarnation changed during discovery".to_string(),
+            ));
+        }
+        *previous = Some((*bootstrap).clone());
+        Ok(*bootstrap)
     }
 
     async fn attach(
@@ -105,10 +157,33 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         let client = Arc::new(BoundaryClient::new(
             runtime_descriptor,
             self.sandbox_bearer.clone(),
+            self.supervisor_instance_id,
         ));
+        let bootstrap = self
+            .bootstrap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                BackendError::Attach("workload discovery must precede attachment".to_string())
+            })?;
+        if bootstrap.workload_identity != sandbox.identity {
+            return Err(BackendError::Descriptor(
+                "admitted workload identity does not match discovery".to_string(),
+            ));
+        }
+        if sandbox.registration_revision == 0
+            || sandbox.registration_grant.expose_secret().is_empty()
+        {
+            return Err(BackendError::Attach(
+                "attachment requires an issued control registration".to_string(),
+            ));
+        }
         let response = client
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
+                registration_grant: sandbox.registration_grant.expose_secret().to_string(),
+                registration_revision: sandbox.registration_revision,
                 policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
                 resource_claims: resource_claims.clone(),
             })
@@ -116,11 +191,20 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         let Response::Attached { snapshot } = response else {
             return Err(unexpected_response("attached", &response));
         };
-        if snapshot.generation != generation {
-            return Err(BackendError::Confirm(
-                "sandbox session snapshot generation does not match runtime descriptor".to_string(),
+        client.validate_attached(&snapshot, sandbox.registration_revision)?;
+        if !bootstrap
+            .identity
+            .same_incarnation(&snapshot.configuration.identity)
+        {
+            return Err(BackendError::Terminated(
+                "boundary incarnation changed after discovery".to_string(),
             ));
         }
+        client
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .identity = Some(snapshot.configuration.identity);
         Ok(Box::new(RemoteBound {
             client: client.clone(),
             agent: sandbox.agent,
@@ -149,11 +233,6 @@ fn validate_runtime_descriptor(
             runtime_descriptor.boundary_id, sandbox.sandbox_id
         )));
     }
-    if runtime_descriptor.generation.is_empty() {
-        return Err(BackendError::Descriptor(
-            "boundary generation must not be empty".to_string(),
-        ));
-    }
     if runtime_descriptor.session_id != sandbox.session_id {
         return Err(BackendError::Descriptor(
             "runtime descriptor session ID does not match admitted sandbox session".to_string(),
@@ -163,6 +242,17 @@ fn validate_runtime_descriptor(
         return Err(BackendError::Descriptor(
             "runtime descriptor workload identity does not match admitted sandbox identity"
                 .to_string(),
+        ));
+    }
+    validate_transport_descriptor(runtime_descriptor)
+}
+
+fn validate_transport_descriptor(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
+) -> Result<(), BackendError> {
+    if runtime_descriptor.generation.is_empty() {
+        return Err(BackendError::Descriptor(
+            "boundary generation must not be empty".to_string(),
         ));
     }
     validate_resource_claims(&runtime_descriptor.resource_claims)?;
@@ -282,6 +372,10 @@ struct RemoteBound {
 
 #[async_trait]
 impl BoundBoundary for RemoteBound {
+    fn configuration(&self) -> Arc<dyn BoundaryConfiguration> {
+        self.client.clone()
+    }
+
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
         self.mediation.clone()
     }
@@ -332,6 +426,58 @@ struct RemoteReady {
 
 #[async_trait]
 impl ReadyBoundary for RemoteReady {
+    fn configuration(&self) -> Arc<dyn BoundaryConfiguration> {
+        self.client.clone()
+    }
+
+    async fn update_startup_policy(
+        &mut self,
+        policy: openshell_core::policy::SandboxPolicy,
+    ) -> Result<(), BackendError> {
+        let candidate = SandboxPolicyWire::from(policy.clone());
+        if candidate == SandboxPolicyWire::from(self.policy.clone()) {
+            // A replacement control may attach to an already-started main.
+            // Exact policy replay is harmless and must not invalidate its receipts.
+            return Ok(());
+        }
+        self.client.invalidate_activation();
+        let _operation = self.client.activation_operations.lock().await;
+        let snapshot = self.client.snapshot().await?;
+        if snapshot.active {
+            return Err(BackendError::Denied(
+                "startup policy replacement requires a held boundary".to_string(),
+            ));
+        }
+        let mut request = self
+            .client
+            .attach_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|envelope| envelope.request.clone())
+            .ok_or_else(|| {
+                BackendError::Attach(
+                    "startup policy replacement requires an attached boundary".to_string(),
+                )
+            })?;
+        let Request::Attach {
+            policy: selected_policy,
+            ..
+        } = &mut request
+        else {
+            return Err(BackendError::Attach(
+                "cached startup attachment has the wrong operation".to_string(),
+            ));
+        };
+        **selected_policy = candidate;
+        // The boundary validates selectors against its local account database
+        // and rejects changed static policy after the main process has started.
+        self.client.call_idempotent(request).await?;
+        self.client.call_idempotent(Request::Confirm).await?;
+        self.policy = policy;
+        Ok(())
+    }
+
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError> {
         let ca_paths = self
             .ca_file_paths
@@ -352,12 +498,9 @@ impl ReadyBoundary for RemoteReady {
         } else {
             (None, None)
         };
-        let (provider_env_revision, provider_env) = self
-            .provider_credentials
-            .child_env_snapshot_with_gcp_resolved()
-            .map_err(|error| {
-                BackendError::Process(format!("snapshot provider environment: {error}"))
-            })?;
+        let activation = self
+            .client
+            .active_configuration(self.provider_credentials.revision())?;
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
@@ -366,17 +509,24 @@ impl ReadyBoundary for RemoteReady {
                 policy: Box::new(SandboxPolicyWire::from(self.policy)),
                 ca_cert,
                 ca_bundle,
-                provider_env_revision,
-                provider_env,
+                activation: activation.clone(),
             })
             .await?;
         let Response::Started {
             process_id,
             provider_env_revision,
+            activation: acknowledged,
         } = response
         else {
             return Err(unexpected_response("started", &response));
         };
+        if let Err(error) =
+            validate_launch_acknowledgement(&activation, &acknowledged, provider_env_revision)
+        {
+            self.client.invalidate_activation();
+            return Err(error);
+        }
+        self.client.require_active(&activation)?;
         let process = Arc::new(RemoteProcess {
             client: self.client.clone(),
             process_id,
@@ -386,7 +536,6 @@ impl ReadyBoundary for RemoteReady {
             exec: Arc::new(RemoteExec {
                 client: self.client.clone(),
                 provider_credentials: self.provider_credentials,
-                boundary_revision: tokio::sync::Mutex::new(provider_env_revision),
             }),
             loopback_connector: Arc::new(RemoteLoopbackConnector {
                 client: self.client,
@@ -551,45 +700,17 @@ async fn pump_process_responses(
 struct RemoteExec {
     client: Arc<BoundaryClient>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
-    boundary_revision: tokio::sync::Mutex<u64>,
 }
 
 #[async_trait]
 impl BoundaryExec for RemoteExec {
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
-        let mut boundary_revision = self.boundary_revision.lock().await;
-        for _ in 0..3 {
-            let (revision, provider_env) = self
-                .provider_credentials
-                .child_env_snapshot_with_gcp_resolved()
-                .map_err(|error| {
-                    BackendError::Process(format!("snapshot provider environment: {error}"))
-                })?;
-            let response = self
-                .client
-                .call_idempotent(Request::UpdateProviderEnvironment {
-                    expected_revision: *boundary_revision,
-                    revision,
-                    provider_env,
-                })
-                .await?;
-            let Response::ProviderEnvironmentUpdated {
-                revision: effective_revision,
-            } = response
-            else {
-                return Err(unexpected_response(
-                    "provider_environment_updated",
-                    &response,
-                ));
-            };
-            *boundary_revision = effective_revision;
-            if effective_revision == revision {
-                return open_exec_session(self.client.clone(), spec).await;
-            }
-        }
-        Err(BackendError::Process(
-            "boundary provider environment changed concurrently during reconciliation".to_string(),
-        ))
+        // Exec consumes the accepted environment. It cannot independently install
+        // provider updates ahead of the policy/configuration activation transaction.
+        let activation = self
+            .client
+            .active_configuration(self.provider_credentials.revision())?;
+        open_exec_session(self.client.clone(), spec, activation).await
     }
 }
 
@@ -678,15 +799,31 @@ impl BoundaryTerminal for RemoteTerminal {
 async fn open_exec_session(
     client: Arc<BoundaryClient>,
     spec: ExecSpec,
+    activation: ActivatedBoundaryConfiguration,
 ) -> Result<ExecSession, BackendError> {
     let (stream, response) = client
         .call_stream_idempotent(Request::Exec {
             spec: ExecSpecWire::from(spec),
+            activation: activation.clone(),
         })
         .await?;
-    let Response::ExecStarted { process_id, pty } = response else {
+    let Response::ExecStarted {
+        process_id,
+        pty,
+        activation: acknowledged,
+    } = response
+    else {
         return Err(unexpected_response("exec_started", &response));
     };
+    if let Err(error) = validate_launch_acknowledgement(
+        &activation,
+        &acknowledged,
+        acknowledged.configuration.provider_env_revision,
+    ) {
+        client.invalidate_activation();
+        return Err(error);
+    }
+    client.require_active(&activation)?;
     let (network_reader, network_writer) = tokio::io::split(stream);
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
@@ -756,7 +893,10 @@ struct RemoteNetworkMediation {
 #[async_trait]
 impl NetworkMediationSource for RemoteNetworkMediation {
     async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
-        let (stream, response) = self.client.open_exchange(Request::AcceptNetwork).await?;
+        let (stream, response) = self
+            .client
+            .accept_mediation(|_| self.client.open_exchange(Request::AcceptNetwork))
+            .await?;
         let Response::NetworkConnected {
             identity,
             destination,
@@ -788,14 +928,12 @@ impl NetworkMediationSource for RemoteNetworkMediation {
     }
 
     async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
-        loop {
-            let session = self.client.mediation_session().await?;
-            match session.accept_dns().await {
-                Ok(query) => return Ok(query),
-                Err(BackendError::Unavailable(_)) if !session.is_healthy() => {}
-                Err(error) => return Err(error),
-            }
-        }
+        self.client
+            .accept_mediation(|epoch| async move {
+                let session = self.client.mediation_session(epoch).await?;
+                session.accept_dns().await
+            })
+            .await
     }
 }
 
@@ -833,35 +971,67 @@ struct OutboundMediationFrame {
 }
 
 struct ClientMediationSession {
+    activation_epoch: u64,
     dns: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PendingDnsQuery>>,
     healthy: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl ClientMediationSession {
-    fn start(stream: BoundaryDuplexStream) -> Arc<Self> {
+    fn start(
+        stream: BoundaryDuplexStream,
+        activation_epoch: u64,
+        mut activation_changes: tokio::sync::watch::Receiver<bool>,
+    ) -> Arc<Self> {
         let (dns_tx, dns_rx) = tokio::sync::mpsc::channel(MEDIATION_EVENT_QUEUE);
         let healthy = Arc::new(AtomicBool::new(true));
-        let session = Arc::new(Self {
-            dns: tokio::sync::Mutex::new(dns_rx),
-            healthy: healthy.clone(),
-        });
-        tokio::spawn(async move {
-            if let Err(error) = run_client_mediation(stream, dns_tx).await {
-                tracing::debug!(%error, "persistent mediation session ended");
+        let task_healthy = healthy.clone();
+        let task = tokio::spawn(async move {
+            // Subscribe before opening the stream: a delayed successful open may
+            // reach the boundary after its hold watcher has already advanced.
+            // A local hold must close that lane even if release immediately follows.
+            tokio::select! {
+                biased;
+                _ = activation_changes.changed() => {},
+                result = run_client_mediation(stream, dns_tx) => {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "persistent mediation session ended");
+                    }
+                }
             }
-            healthy.store(false, Ordering::Release);
+            task_healthy.store(false, Ordering::Release);
         });
-        session
+        Arc::new(Self {
+            activation_epoch,
+            dns: tokio::sync::Mutex::new(dns_rx),
+            healthy,
+            task,
+        })
     }
 
     fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
     }
 
+    fn retire(&self) {
+        self.healthy.store(false, Ordering::Release);
+        // The task owns the stream and therefore the boundary's exclusive DNS
+        // lease. Retire it even while an old accept still owns this session.
+        self.task.abort();
+    }
+
     async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
         self.dns.lock().await.recv().await.ok_or_else(|| {
             BackendError::Unavailable("persistent DNS mediation session ended".to_string())
         })
+    }
+}
+
+impl Drop for ClientMediationSession {
+    fn drop(&mut self) {
+        // Cancellation between the opening acknowledgement and cache publication
+        // must not detach a live stream that prevents the next lane from opening.
+        self.retire();
     }
 }
 
@@ -970,6 +1140,19 @@ struct BoundaryClient {
     reconnect: tokio::sync::Mutex<()>,
     next_connection_generation: AtomicU64,
     credential_monitor_started: AtomicBool,
+    activation: std::sync::Mutex<ConfigurationState>,
+    activation_operations: tokio::sync::Mutex<()>,
+    activation_ready: tokio::sync::watch::Sender<bool>,
+}
+
+/// Receipt publication shares one lock with transport invalidation, so a late
+/// response from a replaced connection cannot restore workload readiness.
+#[derive(Default)]
+struct ConfigurationState {
+    identity: Option<ConfigurationActivationIdentity>,
+    activated: Option<ActivatedBoundaryConfiguration>,
+    epoch: u64,
+    cancellation_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -983,10 +1166,11 @@ impl BoundaryClient {
     fn new(
         runtime_descriptor: SandboxRuntimeDescriptor,
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     ) -> Self {
         Self {
             runtime_descriptor,
-            supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
+            supervisor_instance_id,
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
@@ -996,7 +1180,281 @@ impl BoundaryClient {
             reconnect: tokio::sync::Mutex::new(()),
             next_connection_generation: AtomicU64::new(1),
             credential_monitor_started: AtomicBool::new(false),
+            activation: std::sync::Mutex::new(ConfigurationState::default()),
+            activation_operations: tokio::sync::Mutex::new(()),
+            activation_ready: tokio::sync::watch::channel(false).0,
         }
+    }
+
+    fn validate_identity(
+        &self,
+        identity: &ConfigurationActivationIdentity,
+        registered: bool,
+    ) -> Result<(), BackendError> {
+        if registered {
+            identity.validate()
+        } else {
+            identity.validate_bootstrap()
+        }
+        .map_err(|error| BackendError::Confirm(error.to_string()))?;
+        if identity.runtime_generation != self.runtime_descriptor.generation
+            || identity.boundary_session_id != self.runtime_descriptor.session_id.to_string()
+            || identity.supervisor_instance_id != self.supervisor_instance_id.to_string()
+        {
+            return Err(BackendError::Confirm(
+                "boundary activation identity does not match runtime descriptor or control process"
+                    .to_string(),
+            ));
+        }
+        let state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = &state.identity {
+            if !previous.same_incarnation(identity) {
+                return Err(BackendError::Terminated(
+                    "boundary incarnation changed; a new authorized runtime generation is required"
+                        .to_string(),
+                ));
+            }
+            if registered && previous.registration_revision != identity.registration_revision {
+                return Err(BackendError::Denied(
+                    "boundary registration revision does not match attached control".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_attached(
+        &self,
+        snapshot: &crate::boundary_protocol::SessionSnapshotWire,
+        registration_revision: u64,
+    ) -> Result<(), BackendError> {
+        self.validate_identity(&snapshot.configuration.identity, true)?;
+        if snapshot.generation != self.runtime_descriptor.generation
+            || snapshot.configuration.identity.registration_revision != registration_revision
+        {
+            return Err(BackendError::Confirm(
+                "attached generation or registration does not match requested identity".to_string(),
+            ));
+        }
+        if let Some(configuration) = &snapshot.configuration.installed {
+            configuration
+                .validate()
+                .map_err(|error| BackendError::Confirm(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn validate_confirmation(
+        &self,
+        evidence: &openshell_isolation_interface::contract::SandboxConfirmEvidence,
+    ) -> Result<(), BackendError> {
+        if evidence.generation != self.runtime_descriptor.generation
+            || evidence.session_id != self.runtime_descriptor.session_id
+            || evidence.resource_claims != self.runtime_descriptor.resource_claims
+            || evidence.driver_fence != self.runtime_descriptor.driver_fence
+            || evidence.identity != self.runtime_descriptor.workload_identity
+        {
+            return Err(BackendError::Confirm(
+                "reconnected boundary confirmation does not match admitted runtime".to_string(),
+            ));
+        }
+        evidence.validate(&self.runtime_descriptor.workload_identity)
+    }
+
+    fn invalidate_activation(&self) -> u64 {
+        self.hold_activation(true).0
+    }
+
+    fn hold_activation(&self, cancel_operation: bool) -> (u64, u64) {
+        let mut state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.epoch = state.epoch.wrapping_add(1);
+        if cancel_operation {
+            state.cancellation_epoch = state.cancellation_epoch.wrapping_add(1);
+        }
+        state.activated = None;
+        self.activation_ready.send_if_modified(|ready| {
+            let changed = *ready;
+            *ready = false;
+            changed
+        });
+        (state.epoch, state.cancellation_epoch)
+    }
+
+    fn configuration_attempt_epoch(&self, cancellation_epoch: u64) -> Result<u64, BackendError> {
+        let state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.cancellation_epoch != cancellation_epoch {
+            return Err(BackendError::Unavailable(
+                "configuration operation was superseded while awaiting acknowledgement".to_string(),
+            ));
+        }
+        Ok(state.epoch)
+    }
+
+    /// Retry only this pending operation after authenticated transport recovery.
+    /// A reconnect can preserve its transaction, but an explicit hold, abort,
+    /// or policy replacement cancels it and can never be repaired by retrying.
+    async fn call_configuration(
+        &self,
+        request: Request,
+        cancellation_epoch: u64,
+    ) -> Result<(Response, u64), BackendError> {
+        let envelope = Self::prepare_request(request)?;
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                self.configuration_attempt_epoch(cancellation_epoch)?;
+                self.ensure_current_credential_connection().await?;
+                let attempt_epoch = self.configuration_attempt_epoch(cancellation_epoch)?;
+                match self.exchange_envelope(&envelope).await {
+                    Ok(response) => {
+                        let response_epoch =
+                            self.configuration_attempt_epoch(cancellation_epoch)?;
+                        if response_epoch != attempt_epoch {
+                            // A response racing a different connection cannot
+                            // acknowledge activation. Retry the exact operation
+                            // on the newly confirmed connection before accepting it.
+                            continue;
+                        }
+                        return Ok((response, response_epoch));
+                    }
+                    Err(BackendError::Unavailable(message))
+                        if is_transport_unavailable(&message) =>
+                    {
+                        self.recover_after_unavailable().await?;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            BackendError::Unavailable(
+                "boundary configuration acknowledgement timed out".to_string(),
+            )
+        })?
+    }
+
+    fn publish_activation(
+        &self,
+        epoch: u64,
+        activated: &ActivatedBoundaryConfiguration,
+    ) -> Result<(), BackendError> {
+        let mut state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.epoch != epoch {
+            return Err(BackendError::Unavailable("boundary reconnected before activation acknowledgement; configuration remains unready".to_string()));
+        }
+        state.activated = Some(activated.clone());
+        self.activation_ready.send_replace(true);
+        Ok(())
+    }
+
+    fn require_epoch(&self, epoch: u64) -> Result<(), BackendError> {
+        if self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .epoch
+            != epoch
+        {
+            return Err(BackendError::Unavailable("boundary connection changed during configuration transition; fresh admission is required".to_string()));
+        }
+        Ok(())
+    }
+
+    fn active_configuration(
+        &self,
+        provider_revision: u64,
+    ) -> Result<ActivatedBoundaryConfiguration, BackendError> {
+        let state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let activated = state.activated.as_ref().ok_or_else(|| {
+            BackendError::Denied("boundary configuration has not been released".to_string())
+        })?;
+        if activated.configuration.provider_env_revision != provider_revision {
+            return Err(BackendError::Denied(
+                "provider environment does not match active configuration".to_string(),
+            ));
+        }
+        Ok(activated.clone())
+    }
+
+    fn require_active(
+        &self,
+        expected: &ActivatedBoundaryConfiguration,
+    ) -> Result<(), BackendError> {
+        let state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.activated.as_ref() != Some(expected) {
+            return Err(BackendError::Denied(
+                "boundary activation changed during workload request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn replay_attachment(
+        &self,
+        channel: tonic::transport::Channel,
+        attach: &RequestEnvelope,
+        confirm: Option<&RequestEnvelope>,
+    ) -> Result<(), BackendError> {
+        // A replacement boundary rejects the previous process's signed grant.
+        // Discover first so that replacement is classified as terminal instead
+        // of entering credential repair against a different workload incarnation.
+        let discovery = Self::prepare_request(Request::DescribeWorkload {
+            supervisor_instance_id: self.supervisor_instance_id,
+            resource_claims: self.runtime_descriptor.resource_claims.clone(),
+        })?;
+        let response = self
+            .exchange_on_channel(channel.clone(), &discovery)
+            .await?;
+        let Response::WorkloadDescribed { bootstrap } = response else {
+            return Err(unexpected_response("workload_described", &response));
+        };
+        self.validate_identity(&bootstrap.identity, false)?;
+        if bootstrap.workload_identity != self.runtime_descriptor.workload_identity {
+            return Err(BackendError::Terminated(
+                "boundary workload identity changed during recovery".to_string(),
+            ));
+        }
+        let Request::Attach {
+            registration_revision,
+            ..
+        } = &attach.request
+        else {
+            return Err(BackendError::Attach(
+                "cached boundary attachment has the wrong operation".to_string(),
+            ));
+        };
+        let response = self.exchange_on_channel(channel.clone(), attach).await?;
+        let Response::Attached { snapshot } = response else {
+            return Err(unexpected_response("attached", &response));
+        };
+        self.validate_attached(&snapshot, *registration_revision)?;
+        if let Some(confirm) = confirm {
+            let response = self.exchange_on_channel(channel, confirm).await?;
+            let Response::Confirmed { evidence } = response else {
+                return Err(unexpected_response("confirmed", &response));
+            };
+            self.validate_confirmation(&evidence)?;
+        }
+        Ok(())
     }
 
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {
@@ -1012,6 +1470,19 @@ impl BoundaryClient {
             loop {
                 match self.exchange_envelope(&envelope).await {
                     Ok(response) => {
+                        // Cache only verified lifecycle acknowledgements. Recovery
+                        // must never replay a request whose peer rejected its identity.
+                        match (&envelope.request, &response) {
+                            (Request::Attach { registration_revision, .. }, Response::Attached { snapshot }) => {
+                                self.validate_attached(snapshot, *registration_revision)?;
+                            }
+                            (Request::Confirm, Response::Confirmed { evidence }) => {
+                                self.validate_confirmation(evidence)?;
+                            }
+                            (Request::Attach { .. }, _) => return Err(unexpected_response("attached", &response)),
+                            (Request::Confirm, _) => return Err(unexpected_response("confirmed", &response)),
+                            _ => {}
+                        }
                         if remember_attach {
                             *self
                                 .attach_request
@@ -1242,9 +1713,12 @@ impl BoundaryClient {
                     "cannot rotate Sandbox Protocol connection before confirmation".to_string(),
                 )
             })?;
+        // Authentication/confirmation establishes connection ownership only.
+        // Configuration acceptance must be repeated before any workload resumes.
+        self.hold_activation(false);
         let channel = self.build_grpc_channel().await?;
-        self.exchange_on_channel(channel.clone(), &attach).await?;
-        self.exchange_on_channel(channel.clone(), &confirm).await?;
+        self.replay_attachment(channel.clone(), &attach, Some(&confirm))
+            .await?;
         *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch,
             generation: self
@@ -1277,6 +1751,7 @@ impl BoundaryClient {
             return Ok(());
         }
 
+        self.hold_activation(false);
         *self.grpc_channel.lock().await = None;
         *self.mediation.lock().await = None;
         let attach = self
@@ -1296,10 +1771,8 @@ impl BoundaryClient {
             BackendError::Unavailable("Sandbox Protocol credential unavailable".to_string())
         })?;
         let channel = self.build_grpc_channel().await?;
-        self.exchange_on_channel(channel.clone(), &attach).await?;
-        if let Some(confirm) = confirm {
-            self.exchange_on_channel(channel.clone(), &confirm).await?;
-        }
+        self.replay_attachment(channel.clone(), &attach, confirm.as_ref())
+            .await?;
         *self.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch,
             generation: self
@@ -1362,8 +1835,50 @@ impl BoundaryClient {
         }
     }
 
-    async fn mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
-        if let Some(session) = self.healthy_mediation_session().await {
+    fn active_mediation_epoch(&self) -> Option<u64> {
+        let state = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.activated.as_ref().map(|_| state.epoch)
+    }
+
+    /// Network consumers start before initial release and outlive later holds.
+    /// A hold retires their streams; only a fresh acknowledged release permits
+    /// another accept. Other failures must still reach the supervising task.
+    async fn accept_mediation<T, F, Fut>(&self, mut accept: F) -> Result<T, BackendError>
+    where
+        F: FnMut(u64) -> Fut,
+        Fut: Future<Output = Result<T, BackendError>>,
+    {
+        let mut readiness = self.activation_ready.subscribe();
+        loop {
+            let epoch = loop {
+                if let Some(epoch) = self.active_mediation_epoch() {
+                    break epoch;
+                }
+                readiness.changed().await.map_err(|_| {
+                    BackendError::Terminated("boundary activation monitor ended".to_string())
+                })?;
+            };
+            let result = accept(epoch).await;
+            if self.active_mediation_epoch() != Some(epoch)
+                && matches!(&result, Ok(_) | Err(BackendError::Unavailable(_)))
+            {
+                // Discard stale successes as well as streams closed by hold.
+                // Authentication and identity failures remain terminal even
+                // when their connection recovery also revoked readiness.
+                continue;
+            }
+            return result;
+        }
+    }
+
+    async fn mediation_session(
+        &self,
+        activation_epoch: u64,
+    ) -> Result<Arc<ClientMediationSession>, BackendError> {
+        if let Some(session) = self.healthy_mediation_session(activation_epoch).await? {
             return Ok(session);
         }
 
@@ -1371,7 +1886,7 @@ impl BoundaryClient {
         // a stream may rotate credentials or recover the physical connection;
         // both paths clear the cache and must be free to acquire that mutex.
         let _opening = self.mediation_open.lock().await;
-        if let Some(session) = self.healthy_mediation_session().await {
+        if let Some(session) = self.healthy_mediation_session(activation_epoch).await? {
             return Ok(session);
         }
 
@@ -1379,12 +1894,16 @@ impl BoundaryClient {
         // waiting. Never multiply that deadline with message-matching retries.
         let session = tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
-                match self.open_mediation_session().await {
+                match self.open_mediation_session(activation_epoch).await {
                     Ok(session) => return Ok(session),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
+                        self.require_epoch(activation_epoch)?;
                         self.recover_after_unavailable().await?;
+                        // Recovery holds the boundary. Return to the outer
+                        // readiness wait instead of reopening while held.
+                        self.require_epoch(activation_epoch)?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1395,20 +1914,39 @@ impl BoundaryClient {
         .map_err(|_| {
             BackendError::Unavailable("boundary mediation attach timed out".to_string())
         })??;
-        *self.mediation.lock().await = Some(session.clone());
+        let mut cached = self.mediation.lock().await;
+        // The cache lock can suspend after a successful open. Reject a retired
+        // epoch before publishing; dropping the owned session also closes its lane.
+        self.require_epoch(activation_epoch)?;
+        *cached = Some(session.clone());
         Ok(session)
     }
 
-    async fn healthy_mediation_session(&self) -> Option<Arc<ClientMediationSession>> {
-        self.mediation
-            .lock()
-            .await
-            .as_ref()
-            .filter(|session| session.is_healthy())
-            .cloned()
+    async fn healthy_mediation_session(
+        &self,
+        activation_epoch: u64,
+    ) -> Result<Option<Arc<ClientMediationSession>>, BackendError> {
+        let mut cached = self.mediation.lock().await;
+        // A stale waiter must never retire a lane already opened by a newer epoch.
+        self.require_epoch(activation_epoch)?;
+        if let Some(session) = cached.as_ref()
+            && session.is_healthy()
+            && session.activation_epoch == activation_epoch
+        {
+            return Ok(Some(session.clone()));
+        }
+        if let Some(session) = cached.take() {
+            session.retire();
+        }
+        Ok(None)
     }
 
-    async fn open_mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
+    async fn open_mediation_session(
+        &self,
+        activation_epoch: u64,
+    ) -> Result<Arc<ClientMediationSession>, BackendError> {
+        let activation_changes = self.activation_ready.subscribe();
+        self.require_epoch(activation_epoch)?;
         let mut stream = self.open_grpc_stream(GrpcStreamKind::Mediate).await?;
         let envelope = Self::prepare_request(Request::OpenMediation)?;
         let request_id = envelope.request_id.clone();
@@ -1436,7 +1974,12 @@ impl BoundaryClient {
             Response::Error { kind, message } => return Err(guest_error(kind, message)),
             response => return Err(unexpected_response("mediation_ready", &response)),
         }
-        Ok(ClientMediationSession::start(stream))
+        self.require_epoch(activation_epoch)?;
+        Ok(ClientMediationSession::start(
+            stream,
+            activation_epoch,
+            activation_changes,
+        ))
     }
 
     async fn grpc_channel(&self) -> Result<tonic::transport::Channel, BackendError> {
@@ -1487,6 +2030,333 @@ impl BoundaryClient {
     async fn connect_boundary_once(&self) -> Result<BoundaryDuplexStream, BackendError> {
         connect_boundary_once(&self.runtime_descriptor).await
     }
+}
+
+#[async_trait]
+impl BoundaryConfiguration for BoundaryClient {
+    fn identity(&self) -> ConfigurationActivationIdentity {
+        self.activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .identity
+            .clone()
+            .unwrap_or_else(|| ConfigurationActivationIdentity {
+                runtime_generation: self.runtime_descriptor.generation.clone(),
+                boundary_session_id: self.runtime_descriptor.session_id.to_string(),
+                supervisor_instance_id: self.supervisor_instance_id.to_string(),
+                boundary_instance_id: String::new(),
+                registration_revision: 0,
+            })
+    }
+
+    fn readiness(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.activation_ready.subscribe()
+    }
+
+    async fn snapshot(&self) -> Result<BoundaryConfigurationSnapshot, BackendError> {
+        let identity = self.identity();
+        self.validate_identity(&identity, true)?;
+        let response = self
+            .call_idempotent(Request::ConfigurationSnapshot { identity })
+            .await?;
+        let Response::ConfigurationSnapshot { snapshot } = response else {
+            return Err(unexpected_response("configuration_snapshot", &response));
+        };
+        self.validate_identity(&snapshot.identity, true)?;
+        if let Some(configuration) = &snapshot.installed {
+            configuration
+                .validate()
+                .map_err(|error| BackendError::Confirm(error.to_string()))?;
+        } else if snapshot.active {
+            return Err(BackendError::Confirm(
+                "boundary reported active without installed configuration".to_string(),
+            ));
+        }
+        let released_tuple_changed = self
+            .activation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .activated
+            .as_ref()
+            .is_some_and(|activated| {
+                snapshot.active && snapshot.installed.as_ref() != Some(&activated.configuration)
+            });
+        if released_tuple_changed {
+            self.invalidate_activation();
+            return Err(BackendError::Confirm(
+                "boundary snapshot changed the released configuration without activation"
+                    .to_string(),
+            ));
+        }
+        // A snapshot does not prove gateway acceptance or convey a release token.
+        // Only release may publish readiness, even if the peer reports active.
+        if !snapshot.active
+            && self
+                .activation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .activated
+                .is_some()
+        {
+            self.invalidate_activation();
+        }
+        Ok(snapshot)
+    }
+
+    async fn prepare(
+        &self,
+        expected: Option<ConfigurationRevision>,
+        candidate: ConfigurationRevision,
+        child_env: HashMap<String, String>,
+    ) -> Result<PreparedBoundaryConfiguration, BackendError> {
+        let _operation = self.activation_operations.lock().await;
+        candidate
+            .validate()
+            .map_err(|error| BackendError::Configuration(error.to_string()))?;
+        if let Some(expected) = &expected {
+            expected
+                .validate()
+                .map_err(|error| BackendError::Configuration(error.to_string()))?;
+        }
+        if child_env
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+        {
+            return Err(BackendError::Configuration(
+                "provider environment contains an invalid variable".to_string(),
+            ));
+        }
+        let identity = self.identity();
+        self.validate_identity(&identity, true)?;
+        let request = Request::PrepareConfiguration {
+            identity: identity.clone(),
+            expected: expected.clone(),
+            configuration: candidate.clone(),
+            provider_env: child_env,
+        };
+        // Validate the frame before closing admission so malformed oversized
+        // inputs cannot start a boundary transition or expose their contents.
+        encode_frame(&Self::prepare_request(request.clone())?).map_err(|_| {
+            BackendError::Configuration(
+                "provider configuration exceeds the control frame limit".to_string(),
+            )
+        })?;
+        let (_, cancellation_epoch) = self.hold_activation(true);
+        let (response, epoch) = self.call_configuration(request, cancellation_epoch).await?;
+        let Response::ConfigurationPrepared { prepared } = response else {
+            return Err(unexpected_response("configuration_prepared", &response));
+        };
+        validate_prepared_receipt(&prepared, &identity, &expected, &candidate)?;
+        self.require_epoch(epoch)?;
+        Ok(*prepared)
+    }
+
+    async fn commit(
+        &self,
+        prepared: &PreparedBoundaryConfiguration,
+    ) -> Result<InstalledBoundaryConfiguration, BackendError> {
+        let _operation = self.activation_operations.lock().await;
+        self.validate_identity(&prepared.identity, true)?;
+        validate_prepared_receipt(
+            prepared,
+            &self.identity(),
+            &prepared.expected,
+            &prepared.configuration,
+        )?;
+        let (_, cancellation_epoch) = self.hold_activation(true);
+        let (response, epoch) = self
+            .call_configuration(
+                Request::CommitConfiguration {
+                    prepared: Box::new(prepared.clone()),
+                },
+                cancellation_epoch,
+            )
+            .await?;
+        let Response::ConfigurationCommitted { installed } = response else {
+            return Err(unexpected_response("configuration_committed", &response));
+        };
+        validate_installed_receipt(&installed, prepared)?;
+        self.require_epoch(epoch)?;
+        Ok(*installed)
+    }
+
+    async fn release(
+        &self,
+        installed: &InstalledBoundaryConfiguration,
+    ) -> Result<ActivatedBoundaryConfiguration, BackendError> {
+        let _operation = self.activation_operations.lock().await;
+        self.validate_identity(&installed.identity, true)?;
+        installed
+            .configuration
+            .validate()
+            .map_err(|error| BackendError::Configuration(error.to_string()))?;
+        validate_transition_id(&installed.transition_id)?;
+        let (_, cancellation_epoch) = self.hold_activation(true);
+        let (response, epoch) = self
+            .call_configuration(
+                Request::ReleaseConfiguration {
+                    installed: Box::new(installed.clone()),
+                },
+                cancellation_epoch,
+            )
+            .await?;
+        let Response::ConfigurationReleased { activated } = response else {
+            return Err(unexpected_response("configuration_released", &response));
+        };
+        validate_released_receipt(&activated, installed)?;
+        self.publish_activation(epoch, &activated)?;
+        Ok(*activated)
+    }
+
+    async fn abort(&self, prepared: &PreparedBoundaryConfiguration) -> Result<(), BackendError> {
+        self.validate_identity(&prepared.identity, true)?;
+        self.invalidate_activation();
+        let _operation = self.activation_operations.lock().await;
+        let response = self
+            .call_idempotent(Request::AbortConfiguration {
+                prepared: Box::new(prepared.clone()),
+            })
+            .await?;
+        if !matches!(response, Response::ConfigurationAborted) {
+            return Err(unexpected_response("configuration_aborted", &response));
+        }
+        // Aborting never restores the previous release token. Retention of a
+        // previous candidate must use a fresh prepare/commit/accept/release.
+        Ok(())
+    }
+
+    async fn quiesce(&self) -> Result<(), BackendError> {
+        self.invalidate_activation();
+        let _operation = self.activation_operations.lock().await;
+        let identity = self.identity();
+        self.validate_identity(&identity, true)?;
+        let response = self
+            .call_idempotent(Request::QuiesceConfiguration { identity })
+            .await?;
+        if !matches!(response, Response::ConfigurationQuiesced) {
+            return Err(unexpected_response("configuration_quiesced", &response));
+        }
+        Ok(())
+    }
+
+    async fn refresh_registration(
+        &self,
+        grant: openshell_core::jwt::SecretJwt,
+        registration_revision: u64,
+    ) -> Result<(), BackendError> {
+        if registration_revision != self.identity().registration_revision {
+            return Err(BackendError::Denied(
+                "registration refresh must retain the current registration revision".to_string(),
+            ));
+        }
+        let mut attach = self
+            .attach_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(envelope) = attach.as_ref() else {
+            return Err(BackendError::Attach(
+                "cannot refresh registration before attachment".to_string(),
+            ));
+        };
+        let mut request = envelope.request.clone();
+        let Request::Attach {
+            registration_grant, ..
+        } = &mut request
+        else {
+            return Err(BackendError::Attach(
+                "cached registration has the wrong operation".to_string(),
+            ));
+        };
+        *registration_grant = grant.expose_secret().to_string();
+        // The refreshed grant changes the signed attachment body. Give it a
+        // matching digest and fresh idempotency key before reconnect replay.
+        *attach = Some(Self::prepare_request(request)?);
+        Ok(())
+    }
+}
+
+fn validate_transition_id(transition_id: &str) -> Result<(), BackendError> {
+    if transition_id.is_empty()
+        || transition_id.len() > 256
+        || transition_id.chars().any(char::is_whitespace)
+    {
+        return Err(BackendError::Confirm(
+            "invalid configuration transition identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_receipt(
+    receipt: &PreparedBoundaryConfiguration,
+    identity: &ConfigurationActivationIdentity,
+    expected: &Option<ConfigurationRevision>,
+    candidate: &ConfigurationRevision,
+) -> Result<(), BackendError> {
+    identity
+        .validate()
+        .map_err(|error| BackendError::Configuration(error.to_string()))?;
+    candidate
+        .validate()
+        .map_err(|error| BackendError::Configuration(error.to_string()))?;
+    if let Some(expected) = expected {
+        expected
+            .validate()
+            .map_err(|error| BackendError::Configuration(error.to_string()))?;
+    }
+    validate_transition_id(&receipt.transition_id)?;
+    if &receipt.identity != identity
+        || &receipt.expected != expected
+        || &receipt.configuration != candidate
+    {
+        return Err(BackendError::Confirm("prepared configuration receipt does not match requested identity, previous tuple, or candidate".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_installed_receipt(
+    receipt: &InstalledBoundaryConfiguration,
+    prepared: &PreparedBoundaryConfiguration,
+) -> Result<(), BackendError> {
+    if receipt.identity != prepared.identity
+        || receipt.transition_id != prepared.transition_id
+        || receipt.configuration != prepared.configuration
+    {
+        return Err(BackendError::Confirm(
+            "installed configuration receipt does not match preparation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_released_receipt(
+    receipt: &ActivatedBoundaryConfiguration,
+    installed: &InstalledBoundaryConfiguration,
+) -> Result<(), BackendError> {
+    if receipt.identity != installed.identity
+        || receipt.transition_id != installed.transition_id
+        || receipt.configuration != installed.configuration
+    {
+        return Err(BackendError::Confirm(
+            "released configuration receipt does not match installation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_launch_acknowledgement(
+    expected: &ActivatedBoundaryConfiguration,
+    acknowledged: &ActivatedBoundaryConfiguration,
+    provider_revision: u64,
+) -> Result<(), BackendError> {
+    if acknowledged != expected || provider_revision != expected.configuration.provider_env_revision
+    {
+        return Err(BackendError::Confirm(
+            "workload acknowledgement does not match released configuration and provider revision"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn connect_boundary_with_retry(
@@ -1641,6 +2511,9 @@ where
             }
             Err(error) => {
                 tracing::debug!(%error, "boundary gRPC response stream ended");
+                // The sibling read half keeps the split duplex alive. Close the
+                // response direction so the client observes EOF and reconnects.
+                let _ = writer.shutdown().await;
                 return;
             }
         }
@@ -1730,9 +2603,9 @@ fn expect_response(response: Response, expected: &str) -> Result<(), BackendErro
     }
 }
 
-fn unexpected_response(expected: &str, response: &Response) -> BackendError {
+fn unexpected_response(expected: &str, _response: &Response) -> BackendError {
     BackendError::Process(format!(
-        "expected boundary response {expected:?}, received {response:?}"
+        "expected boundary response {expected:?}, received a different response kind"
     ))
 }
 
@@ -1741,6 +2614,7 @@ fn guest_error(kind: crate::boundary_protocol::BoundaryErrorKind, message: Strin
     let message = format!("boundary process leaf: {message}");
     match kind {
         BoundaryErrorKind::Invalid => BackendError::Descriptor(message),
+        BoundaryErrorKind::Configuration => BackendError::Configuration(message),
         BoundaryErrorKind::Denied => BackendError::Denied(message),
         BoundaryErrorKind::Unavailable => BackendError::Unavailable(message),
         BoundaryErrorKind::Terminated => BackendError::Terminated(message),
@@ -1769,6 +2643,895 @@ mod tests {
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
 
+    fn test_supervisor_instance_id() -> crate::boundary_protocol::SupervisorInstanceId {
+        "22222222-2222-4222-8222-222222222222"
+            .parse()
+            .expect("supervisor instance")
+    }
+
+    fn test_activation() -> ActivatedBoundaryConfiguration {
+        ActivatedBoundaryConfiguration {
+            identity: ConfigurationActivationIdentity {
+                runtime_generation: "test-generation".to_string(),
+                boundary_session_id: test_session_id().to_string(),
+                supervisor_instance_id: test_supervisor_instance_id().to_string(),
+                boundary_instance_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                registration_revision: 1,
+            },
+            configuration: ConfigurationRevision {
+                config_revision: 1,
+                policy_version: 1,
+                policy_hash: "sha256:test".to_string(),
+                policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
+                provider_env_revision: 1,
+            },
+            transition_id: "test-transition".to_string(),
+        }
+    }
+
+    fn test_prepared() -> PreparedBoundaryConfiguration {
+        let activation = test_activation();
+        PreparedBoundaryConfiguration {
+            identity: activation.identity,
+            transition_id: activation.transition_id,
+            expected: None,
+            configuration: activation.configuration,
+        }
+    }
+
+    fn test_installed() -> InstalledBoundaryConfiguration {
+        let activation = test_activation();
+        InstalledBoundaryConfiguration {
+            identity: activation.identity,
+            transition_id: activation.transition_id,
+            configuration: activation.configuration,
+        }
+    }
+
+    async fn configuration_client(
+        response_override: Option<Response>,
+    ) -> (Arc<BoundaryClient>, tokio::task::JoinHandle<()>) {
+        let service = TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
+            response_override,
+            response_permits: None,
+        };
+        configuration_client_with_service(service).await
+    }
+
+    async fn configuration_client_with_service<T: IsolationBoundary>(
+        service: T,
+    ) -> (Arc<BoundaryClient>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tonic::transport::Server::builder()
+                .add_service(IsolationBoundaryServer::new(service))
+                .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
+                .await
+                .unwrap();
+        });
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = Arc::new(BoundaryClient::new(
+            tls_runtime_descriptor(address, test_certificate().client_tls),
+            test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
+        ));
+        *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
+            credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            generation: 1,
+            channel,
+        });
+        client.activation.lock().unwrap().identity = Some(test_activation().identity);
+        (client, server)
+    }
+
+    async fn assert_mediation_waits_and_reopens(dns: bool) {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let (client, server) = configuration_client_with_service(TestGrpcBoundary {
+            wait_for_half_close: false,
+            expected_token: "a".repeat(32),
+            requests: requests.clone(),
+            mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mediation_ready: false,
+            response_override: Some(Response::Error {
+                kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
+                message: "network stream ended".to_string(),
+            }),
+            response_permits: Some(permits.clone()),
+        })
+        .await;
+        let source = RemoteNetworkMediation {
+            client: client.clone(),
+        };
+        let mut accepted = tokio::spawn(async move {
+            if dns {
+                source.accept_dns().await.map(|_| ())
+            } else {
+                source.accept_tcp().await.map(|_| ())
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut accepted)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            requests.load(Ordering::Acquire),
+            0,
+            "held startup makes no network request"
+        );
+        client.publish_activation(0, &test_activation()).unwrap();
+        wait_for_network_requests(&requests, 1).await;
+        let epoch = client.invalidate_activation();
+        permits.add_permits(1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut accepted)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            requests.load(Ordering::Acquire),
+            1,
+            "a retired accept waits for release"
+        );
+        client
+            .publish_activation(epoch, &test_activation())
+            .unwrap();
+        wait_for_network_requests(&requests, 2).await;
+        permits.add_permits(1);
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), accepted)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(BackendError::Unavailable(_))
+            ),
+            "a failure in the current epoch remains terminal"
+        );
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+        server.abort();
+    }
+
+    async fn wait_for_network_requests(requests: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("released mediation issues its request");
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_tcp_accept_waits_and_reopens_after_hold() {
+        assert_mediation_waits_and_reopens(false).await;
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_dns_accept_waits_and_reopens_after_hold() {
+        assert_mediation_waits_and_reopens(true).await;
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_mediation_discards_stale_success_and_preserves_identity_failure()
+     {
+        let (client, server) = configuration_client(None).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let accepted = client
+            .accept_mediation(|_| async {
+                let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+                if attempt == 0 {
+                    let epoch = client.invalidate_activation();
+                    client
+                        .publish_activation(epoch, &test_activation())
+                        .unwrap();
+                }
+                Ok(attempt)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted, 1,
+            "an old stream success cannot cross activation epochs"
+        );
+        let result: Result<(), BackendError> = client
+            .accept_mediation(|_| async {
+                client.invalidate_activation();
+                Err(BackendError::Terminated("replacement boundary".to_string()))
+            })
+            .await;
+        assert!(matches!(result, Err(BackendError::Terminated(_))));
+        server.abort();
+    }
+
+    struct MediationLeaseTestState {
+        opens: std::sync::atomic::AtomicUsize,
+        first_open_entered: tokio::sync::Semaphore,
+        first_open_permit: tokio::sync::Semaphore,
+        closed: tokio::sync::Semaphore,
+        lease: tokio::sync::Mutex<()>,
+        responses: tokio::sync::Mutex<Vec<(usize, DnsQueryResultWire)>>,
+        response_received: tokio::sync::Notify,
+    }
+
+    impl MediationLeaseTestState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                opens: std::sync::atomic::AtomicUsize::new(0),
+                first_open_entered: tokio::sync::Semaphore::new(0),
+                first_open_permit: tokio::sync::Semaphore::new(0),
+                closed: tokio::sync::Semaphore::new(0),
+                lease: tokio::sync::Mutex::new(()),
+                responses: tokio::sync::Mutex::new(Vec::new()),
+                response_received: tokio::sync::Notify::new(),
+            })
+        }
+
+        async fn require_dns_response(&self, attempt: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let notified = self.response_received.notified();
+                    if self.responses.lock().await.iter().any(|(index, response)| {
+                        *index == attempt
+                            && *response == DnsQueryResultWire::Response(vec![4, 5, 6])
+                    }) {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("current lane receives the completed DNS response");
+        }
+    }
+
+    struct MediationLeaseTestBoundary(Arc<MediationLeaseTestState>);
+
+    #[tonic::async_trait]
+    impl IsolationBoundary for MediationLeaseTestBoundary {
+        type ExchangeStream = TestGrpcStream;
+        type MediateStream = TestGrpcStream;
+
+        async fn exchange(
+            &self,
+            _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "test only opens mediation streams",
+            ))
+        }
+
+        async fn mediate(
+            &self,
+            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
+            let state = self.0.clone();
+            let mut inbound = request.into_inner();
+            let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                let mut frame = Vec::new();
+                while !complete_control_frame(&frame) {
+                    let Some(chunk) = inbound.message().await.unwrap() else {
+                        return;
+                    };
+                    frame.extend_from_slice(&chunk.data);
+                }
+                let envelope: RequestEnvelope = decode_frame(&frame).unwrap();
+                assert!(matches!(envelope.request, Request::OpenMediation));
+                let attempt = state.opens.fetch_add(1, Ordering::AcqRel);
+                if attempt == 0 {
+                    state.first_open_entered.add_permits(1);
+                    state.first_open_permit.acquire().await.unwrap().forget();
+                }
+                // Hold the same exclusive lease as the boundary until this actual
+                // gRPC request stream closes, including while it is otherwise idle.
+                let lease = tokio::time::timeout(Duration::from_secs(1), state.lease.lock()).await;
+                let response = if lease.is_ok() {
+                    Response::MediationReady
+                } else {
+                    Response::Error {
+                        kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
+                        message: "a mediation session is already active".to_string(),
+                    }
+                };
+                let mut frame = encode_frame(&ResponseEnvelope {
+                    request_id: envelope.request_id,
+                    response,
+                })
+                .unwrap();
+                let Ok(lease) = lease else {
+                    let _ = outbound.send(Ok(BoundaryChunk { data: frame })).await;
+                    return;
+                };
+                let query = DnsQueryWire {
+                    request: vec![u8::try_from(attempt).unwrap(), 2, 3],
+                    transport: openshell_isolation_interface::contract::DnsTransport::Udp,
+                    identity: crate::boundary_protocol::BinaryIdentityWire::Resolved {
+                        binary_path: PathBuf::from("/usr/bin/dig"),
+                        binary_digest: Some("a".repeat(64).parse().unwrap()),
+                        ancestors: Vec::new(),
+                        cmdline_paths: Vec::new(),
+                    },
+                    timing: crate::boundary_protocol::MediationTimingWire::default(),
+                };
+                mediation::write_frame(
+                    &mut frame,
+                    MediationFrameKind::DnsQuery,
+                    42,
+                    &mediation::encode_json(&query).unwrap(),
+                )
+                .await
+                .unwrap();
+                let _ = outbound.send(Ok(BoundaryChunk { data: frame })).await;
+                let mut received = Vec::new();
+                while let Ok(Some(chunk)) = inbound.message().await {
+                    received.extend_from_slice(&chunk.data);
+                    if received.len() < 13 {
+                        continue;
+                    }
+                    let length = u32::from_be_bytes(received[9..13].try_into().unwrap()) as usize;
+                    if received.len() < 13 + length {
+                        continue;
+                    }
+                    let reply = mediation::read_frame(&mut received.as_slice())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(reply.kind, MediationFrameKind::DnsResponse);
+                    let response = mediation::decode_json(&reply.payload).unwrap();
+                    state.responses.lock().await.push((attempt, response));
+                    state.response_received.notify_one();
+                    received.drain(..13 + length);
+                }
+                drop(lease);
+                state.closed.add_permits(1);
+            });
+            Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
+                outbound_rx,
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_late_mediation_open_retires_lease_before_replacement() {
+        let state = MediationLeaseTestState::new();
+        let (client, server) =
+            configuration_client_with_service(MediationLeaseTestBoundary(state.clone())).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        let source = RemoteNetworkMediation {
+            client: client.clone(),
+        };
+        let accepted = tokio::spawn(async move { source.accept_dns().await });
+        state.first_open_entered.acquire().await.unwrap().forget();
+        let epoch = client.invalidate_activation();
+        client
+            .publish_activation(epoch, &test_activation())
+            .unwrap();
+        // The delayed request reaches the boundary only after the new release.
+        // Its stream cannot observe the old boundary hold and must close locally.
+        state.first_open_permit.add_permits(1);
+        let query = tokio::time::timeout(Duration::from_secs(3), accepted)
+            .await
+            .expect("replacement mediation must complete without another hold or reconnect")
+            .unwrap()
+            .expect("current activation opens a replacement lane");
+        assert_eq!(query.message, [1, 2, 3]);
+        query.response.send(Ok(vec![4, 5, 6])).unwrap();
+        state.require_dns_response(1).await;
+        assert_eq!(state.opens.load(Ordering::Acquire), 2);
+        assert_eq!(state.closed.available_permits(), 1);
+        assert_eq!(
+            client
+                .grpc_channel
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .generation,
+            1
+        );
+        assert_eq!(client.active_mediation_epoch(), Some(epoch));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_cancelled_mediation_open_releases_unpublished_lease() {
+        let state = MediationLeaseTestState::new();
+        let (client, server) =
+            configuration_client_with_service(MediationLeaseTestBoundary(state.clone())).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        state.first_open_permit.add_permits(1);
+        let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
+        let opening_client = client.clone();
+        let opening = tokio::spawn(async move {
+            let session = opening_client.open_mediation_session(0).await.unwrap();
+            // Ensure the stream task has delivered its first frame and is idle;
+            // receiver closure on a not-yet-delivered frame cannot satisfy cleanup.
+            let query = session.accept_dns().await.unwrap();
+            acknowledged.send(()).unwrap();
+            // This is the ownership interval while mediation_session waits to
+            // publish its acknowledged session into the async cache mutex.
+            std::future::pending::<()>().await;
+            drop(query);
+            drop(session);
+        });
+        acknowledgement.await.unwrap();
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), state.closed.acquire())
+            .await
+            .expect("cancelling an acknowledged open closes its actual gRPC stream")
+            .unwrap()
+            .forget();
+        assert!(client.mediation.lock().await.is_none());
+        let source = RemoteNetworkMediation {
+            client: client.clone(),
+        };
+        let query = tokio::time::timeout(Duration::from_secs(2), source.accept_dns())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(query.message, [1, 2, 3]);
+        query.response.send(Ok(vec![4, 5, 6])).unwrap();
+        state.require_dns_response(1).await;
+        assert_eq!(state.opens.load(Ordering::Acquire), 2);
+        assert_eq!(client.active_mediation_epoch(), Some(0));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_hold_closes_cached_mediation_with_retained_session() {
+        let state = MediationLeaseTestState::new();
+        let (client, server) =
+            configuration_client_with_service(MediationLeaseTestBoundary(state.clone())).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        state.first_open_permit.add_permits(1);
+        let retired = client.mediation_session(0).await.unwrap();
+        let old_query = retired.accept_dns().await.unwrap();
+        let epoch = client.invalidate_activation();
+        client
+            .publish_activation(epoch, &test_activation())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), state.closed.acquire())
+            .await
+            .expect("hold closes a cached stream even while old accepts retain its session")
+            .unwrap()
+            .forget();
+        assert!(!retired.is_healthy());
+        assert!(client.healthy_mediation_session(0).await.is_err());
+        let source = RemoteNetworkMediation {
+            client: client.clone(),
+        };
+        let query = tokio::time::timeout(Duration::from_secs(2), source.accept_dns())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(query.message, [1, 2, 3]);
+        query.response.send(Ok(vec![4, 5, 6])).unwrap();
+        state.require_dns_response(1).await;
+        assert_eq!(state.opens.load(Ordering::Acquire), 2);
+        assert_eq!(client.active_mediation_epoch(), Some(epoch));
+        drop(old_query);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_requires_exact_prepare_commit_release_receipts() {
+        let (client, server) = configuration_client(None).await;
+        let readiness = client.readiness();
+        let prepared = client
+            .prepare(None, test_activation().configuration, HashMap::new())
+            .await
+            .unwrap();
+        assert!(!*readiness.borrow());
+        let installed = client.commit(&prepared).await.unwrap();
+        assert!(!*readiness.borrow());
+        assert!(client.active_configuration(1).is_err());
+        let activated = client.release(&installed).await.unwrap();
+        assert!(*readiness.borrow());
+        assert_eq!(client.active_configuration(1).unwrap(), activated);
+        assert!(client.active_configuration(2).is_err());
+        client.quiesce().await.unwrap();
+        assert!(!*readiness.borrow());
+        assert!(client.active_configuration(1).is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_rejects_wrong_peer_install_and_release_tuples() {
+        let mut wrong_installed = test_installed();
+        wrong_installed.configuration.provider_env_revision += 1;
+        let (client, server) = configuration_client(Some(Response::ConfigurationCommitted {
+            installed: Box::new(wrong_installed),
+        }))
+        .await;
+        assert!(client.commit(&test_prepared()).await.is_err());
+        assert!(!*client.readiness().borrow());
+        server.abort();
+
+        let mut wrong_activated = test_activation();
+        wrong_activated.identity.registration_revision += 1;
+        let (client, server) = configuration_client(Some(Response::ConfigurationReleased {
+            activated: Box::new(wrong_activated),
+        }))
+        .await;
+        assert!(client.release(&test_installed()).await.is_err());
+        assert!(!*client.readiness().borrow());
+        server.abort();
+
+        let mut wrong_prepared = test_prepared();
+        wrong_prepared.expected = Some(wrong_prepared.configuration.clone());
+        let (client, server) = configuration_client(Some(Response::ConfigurationPrepared {
+            prepared: Box::new(wrong_prepared),
+        }))
+        .await;
+        assert!(
+            client
+                .prepare(None, test_activation().configuration, HashMap::new())
+                .await
+                .is_err()
+        );
+        assert!(!*client.readiness().borrow());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_rejects_wrong_start_and_exec_receipts() {
+        let mut wrong_activated = test_activation();
+        wrong_activated.configuration.provider_env_revision += 1;
+        let (client, server) = configuration_client(Some(Response::Started {
+            process_id: "test-generation:main:0".to_string(),
+            provider_env_revision: 2,
+            activation: wrong_activated.clone(),
+        }))
+        .await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        let context = sandbox();
+        let ready = RemoteReady {
+            client,
+            agent: context.agent,
+            policy: context.policy,
+            sandbox_id: context.sandbox_id,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials: openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(1, HashMap::new()),
+        };
+        assert!(Box::new(ready).start_agent().await.is_err());
+        server.abort();
+
+        let (client, server) = configuration_client(Some(Response::ExecStarted {
+            process_id: "test-generation:exec:1".to_string(),
+            pty: false,
+            activation: wrong_activated,
+        }))
+        .await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        assert!(
+            open_exec_session(
+                client,
+                ExecSpec {
+                    program: "/bin/true".to_string(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    workdir: None,
+                    pty: false,
+                },
+                test_activation()
+            )
+            .await
+            .is_err()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_snapshot_cannot_replace_a_released_tuple() {
+        let mut unexpected = test_activation().configuration;
+        unexpected.provider_env_revision += 1;
+        let (client, server) = configuration_client(Some(Response::ConfigurationSnapshot {
+            snapshot: BoundaryConfigurationSnapshot {
+                identity: test_activation().identity,
+                installed: Some(unexpected),
+                active: true,
+            },
+        }))
+        .await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        assert!(client.snapshot().await.is_err());
+        assert!(!*client.readiness().borrow());
+        assert!(client.active_configuration(1).is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_invalid_candidate_preserves_existing_release() {
+        let (client, server) = configuration_client(None).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        let mut invalid = test_activation().configuration;
+        invalid.config_revision = 0;
+        assert!(client.prepare(None, invalid, HashMap::new()).await.is_err());
+        assert!(*client.readiness().borrow());
+        assert!(
+            client
+                .prepare(
+                    None,
+                    test_activation().configuration,
+                    HashMap::from([("BAD=KEY".to_string(), "redacted".to_string())])
+                )
+                .await
+                .is_err()
+        );
+        assert!(*client.readiness().borrow());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_reconnect_epoch_rejects_late_release() {
+        let (client, server) = configuration_client(None).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        let observed_epoch = client.activation.lock().unwrap().epoch;
+        client.invalidate_activation();
+        assert!(
+            client
+                .publish_activation(observed_epoch, &test_activation())
+                .is_err()
+        );
+        assert!(!*client.readiness().borrow());
+        assert!(client.active_configuration(1).is_err());
+        let mut replacement = test_activation().identity;
+        replacement.boundary_instance_id = "44444444-4444-4444-8444-444444444444".to_string();
+        assert!(matches!(
+            client.validate_identity(&replacement, true),
+            Err(BackendError::Terminated(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_replacement_is_terminal_before_stale_grant_replay() {
+        let mut identity = test_activation().identity;
+        identity.boundary_instance_id = "44444444-4444-4444-8444-444444444444".to_string();
+        identity.registration_revision = 0;
+        let (client, server) = configuration_client(Some(Response::WorkloadDescribed {
+            bootstrap: Box::new(BoundaryBootstrap {
+                identity,
+                workload_identity: sandbox().identity,
+                image_policy:
+                    openshell_isolation_interface::contract::ImagePolicyDiscovery::Missing,
+                filesystem_baseline:
+                    openshell_isolation_interface::contract::BoundaryFilesystemBaseline::default(),
+            }),
+        }))
+        .await;
+        let channel = client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .channel
+            .clone();
+        let attach = BoundaryClient::prepare_request(Request::Attach {
+            supervisor_instance_id: test_supervisor_instance_id(),
+            registration_grant: "old-boundary-grant".to_string(),
+            registration_revision: 1,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            resource_claims: std::collections::BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(matches!(
+            client.replay_attachment(channel, &attach, None).await,
+            Err(BackendError::Terminated(_))
+        ));
+        assert!(!*client.readiness().borrow());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_retry_token_survives_only_transport_recovery() {
+        let (client, server) = configuration_client(None).await;
+        let (original_epoch, operation) = client.hold_activation(true);
+        client.hold_activation(false);
+        let retry_epoch = client
+            .configuration_attempt_epoch(operation)
+            .expect("same operation may retry");
+        assert_ne!(original_epoch, retry_epoch);
+        assert!(
+            client
+                .publish_activation(original_epoch, &test_activation())
+                .is_err()
+        );
+        client.invalidate_activation();
+        assert!(client.configuration_attempt_epoch(operation).is_err());
+        assert!(
+            client
+                .publish_activation(retry_epoch, &test_activation())
+                .is_err()
+        );
+        assert!(!*client.readiness().borrow());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_startup_policy_refresh_updates_cached_attachment() {
+        let (client, server) = configuration_client(None).await;
+        let context = sandbox();
+        client
+            .call_idempotent(Request::Attach {
+                supervisor_instance_id: test_supervisor_instance_id(),
+                registration_grant: "same-registration".to_string(),
+                registration_revision: 1,
+                policy: Box::new(SandboxPolicyWire::from(context.policy.clone())),
+                resource_claims: std::collections::BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        let mut ready = RemoteReady {
+            client: client.clone(), agent: context.agent, policy: context.policy.clone(), sandbox_id: context.sandbox_id,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials: openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(1, HashMap::new()),
+        };
+        let mut repaired = context.policy;
+        repaired
+            .filesystem
+            .read_only
+            .push(PathBuf::from("/tmp/repaired"));
+        ready.update_startup_policy(repaired.clone()).await.unwrap();
+        assert_eq!(
+            SandboxPolicyWire::from(ready.policy.clone()),
+            SandboxPolicyWire::from(repaired.clone())
+        );
+        let epoch = client.activation.lock().unwrap().epoch;
+        ready.update_startup_policy(repaired.clone()).await.unwrap();
+        assert_eq!(
+            client.activation.lock().unwrap().epoch,
+            epoch,
+            "exact policy replay preserves receipts"
+        );
+        assert!(!*client.readiness().borrow());
+        let cached = client.attach_request.lock().unwrap();
+        let envelope = cached.as_ref().unwrap();
+        envelope.validate_payload_digest().unwrap();
+        let Request::Attach {
+            policy,
+            registration_grant,
+            ..
+        } = &envelope.request
+        else {
+            panic!("attachment");
+        };
+        assert_eq!(**policy, SandboxPolicyWire::from(repaired));
+        assert_eq!(registration_grant, "same-registration");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_startup_policy_refresh_rejects_active_boundary() {
+        let (client, server) = configuration_client(Some(Response::ConfigurationSnapshot {
+            snapshot: BoundaryConfigurationSnapshot {
+                identity: test_activation().identity,
+                installed: Some(test_activation().configuration),
+                active: true,
+            },
+        }))
+        .await;
+        let context = sandbox();
+        let original = SandboxPolicyWire::from(context.policy.clone());
+        let mut ready = RemoteReady {
+            client: client.clone(), agent: context.agent, policy: context.policy.clone(), sandbox_id: context.sandbox_id,
+            ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
+            provider_credentials: openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(1, HashMap::new()),
+        };
+        let mut repaired = context.policy;
+        repaired
+            .filesystem
+            .read_only
+            .push(PathBuf::from("/tmp/repaired"));
+        assert!(matches!(
+            ready.update_startup_policy(repaired).await,
+            Err(BackendError::Denied(_))
+        ));
+        assert_eq!(SandboxPolicyWire::from(ready.policy), original);
+        assert!(!*client.readiness().borrow());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_registration_refresh_keeps_current_fence() {
+        let (client, server) = configuration_client(None).await;
+        *client.attach_request.lock().unwrap() = Some(
+            BoundaryClient::prepare_request(Request::Attach {
+                supervisor_instance_id: test_supervisor_instance_id(),
+                registration_grant: "old-grant".to_string(),
+                registration_revision: 1,
+                policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+                resource_claims: std::collections::BTreeMap::new(),
+            })
+            .unwrap(),
+        );
+        client.publish_activation(0, &test_activation()).unwrap();
+        assert!(
+            client
+                .refresh_registration(SecretJwt::parse("replacement").unwrap(), 2)
+                .await
+                .is_err()
+        );
+        client
+            .refresh_registration(SecretJwt::parse("replacement").unwrap(), 1)
+            .await
+            .unwrap();
+        assert!(*client.readiness().borrow());
+        let attach = client.attach_request.lock().unwrap();
+        attach.as_ref().unwrap().validate_payload_digest().unwrap();
+        let Request::Attach {
+            registration_grant,
+            registration_revision,
+            ..
+        } = &attach.as_ref().unwrap().request
+        else {
+            panic!("attachment");
+        };
+        assert_eq!(registration_grant, "replacement");
+        assert_eq!(*registration_revision, 1);
+        server.abort();
+    }
+
+    #[test]
+    fn configuration_activation_receipts_bind_every_revision_coordinate() {
+        let original = test_activation();
+        let mut variants = Vec::new();
+        let mut changed = original.clone();
+        changed.configuration.config_revision += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.configuration.policy_version += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.configuration.policy_hash.push('x');
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.configuration.policy_source += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.configuration.provider_env_revision += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.identity.runtime_generation.push('x');
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.identity.boundary_session_id.push('x');
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.identity.supervisor_instance_id.push('x');
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.identity.boundary_instance_id.push('x');
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.identity.registration_revision += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.transition_id.push('x');
+        variants.push(changed);
+        for changed in variants {
+            assert!(validate_released_receipt(&changed, &test_installed()).is_err());
+            assert!(validate_launch_acknowledgement(&original, &changed, 1).is_err());
+        }
+        assert!(validate_launch_acknowledgement(&original, &original, 2).is_err());
+    }
+
     fn test_driver_fence() -> openshell_isolation_interface::contract::DriverFenceEvidence {
         openshell_isolation_interface::contract::DriverFenceEvidence::Vm {
             generation: "test-generation".to_string(),
@@ -1796,6 +3559,8 @@ mod tests {
         requests: Arc<std::sync::atomic::AtomicUsize>,
         mediation_failures: Arc<std::sync::atomic::AtomicUsize>,
         mediation_ready: bool,
+        response_override: Option<Response>,
+        response_permits: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     type TestGrpcStream = Pin<
@@ -1824,6 +3589,8 @@ mod tests {
             let wait_for_half_close = self.wait_for_half_close;
             let requests = self.requests.clone();
             let mediation_ready = self.mediation_ready;
+            let response_override = self.response_override.clone();
+            let response_permits = self.response_permits.clone();
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let mut frame = Vec::new();
@@ -1855,13 +3622,85 @@ mod tests {
                     };
                     match encode_frame(&ResponseEnvelope {
                         request_id: envelope.request_id,
-                        response: match envelope.request {
-                            Request::Attach { .. } => Response::Attached {
-                                snapshot: crate::boundary_protocol::SessionSnapshotWire {
-                                    generation: "test-generation".to_string(),
-                                    processes: Vec::new(),
-                                },
+                        response: response_override.unwrap_or_else(|| match envelope.request {
+                            Request::DescribeWorkload {
+                                supervisor_instance_id,
+                                ..
+                            } => {
+                                let mut identity = test_activation().identity;
+                                identity.supervisor_instance_id =
+                                    supervisor_instance_id.to_string();
+                                identity.registration_revision = 0;
+                                Response::WorkloadDescribed { bootstrap: Box::new(BoundaryBootstrap {
+                                    identity,
+                                    workload_identity: sandbox().identity,
+                                    image_policy: openshell_isolation_interface::contract::ImagePolicyDiscovery::Missing,
+                                    filesystem_baseline: openshell_isolation_interface::contract::BoundaryFilesystemBaseline::default(),
+                                }) }
+                            }
+                            Request::Attach {
+                                supervisor_instance_id,
+                                registration_revision,
+                                ..
+                            } => {
+                                let mut identity = test_activation().identity;
+                                identity.supervisor_instance_id =
+                                    supervisor_instance_id.to_string();
+                                identity.registration_revision = registration_revision;
+                                Response::Attached {
+                                    snapshot: crate::boundary_protocol::SessionSnapshotWire {
+                                        generation: "test-generation".to_string(),
+                                        configuration: BoundaryConfigurationSnapshot {
+                                            identity,
+                                            installed: None,
+                                            active: false,
+                                        },
+                                        processes: Vec::new(),
+                                    },
+                                }
+                            }
+                            Request::ConfigurationSnapshot { identity } => {
+                                Response::ConfigurationSnapshot {
+                                    snapshot: BoundaryConfigurationSnapshot {
+                                        identity,
+                                        installed: None,
+                                        active: false,
+                                    },
+                                }
+                            }
+                            Request::PrepareConfiguration {
+                                identity,
+                                expected,
+                                configuration,
+                                ..
+                            } => Response::ConfigurationPrepared {
+                                prepared: Box::new(PreparedBoundaryConfiguration {
+                                    identity,
+                                    expected,
+                                    configuration,
+                                    transition_id: "test-transition".to_string(),
+                                }),
                             },
+                            Request::CommitConfiguration { prepared } => {
+                                Response::ConfigurationCommitted {
+                                    installed: Box::new(InstalledBoundaryConfiguration {
+                                        identity: prepared.identity,
+                                        configuration: prepared.configuration,
+                                        transition_id: prepared.transition_id,
+                                    }),
+                                }
+                            }
+                            Request::ReleaseConfiguration { installed } => {
+                                Response::ConfigurationReleased {
+                                    activated: Box::new(ActivatedBoundaryConfiguration {
+                                        identity: installed.identity,
+                                        configuration: installed.configuration,
+                                        transition_id: installed.transition_id,
+                                    }),
+                                }
+                            }
+                            Request::AbortConfiguration { .. } => Response::ConfigurationAborted,
+                            Request::QuiesceConfiguration { .. } => Response::ConfigurationQuiesced,
                             Request::Confirm => Response::Confirmed {
                                 evidence: Box::new(test_confirmation_evidence()),
                             },
@@ -1873,9 +3712,10 @@ mod tests {
                             Request::Wait { .. } => Response::Exited {
                                 status: ExitStatusWire::Exited(23),
                             },
-                            Request::Exec { .. } => Response::ExecStarted {
+                            Request::Exec { activation, .. } => Response::ExecStarted {
                                 process_id: "test-generation:exec:1".to_string(),
                                 pty: false,
+                                activation,
                             },
                             Request::AttachProcess { .. } => {
                                 Response::ProcessAttached { terminal: false }
@@ -1885,23 +3725,20 @@ mod tests {
                             }
                             Request::Terminate { .. } => Response::Terminated,
                             Request::TerminateBoundary => Response::BoundaryTerminated,
-                            Request::UpdateProviderEnvironment { revision, .. } => {
-                                Response::ProviderEnvironmentUpdated { revision }
-                            }
                             Request::Resize { .. } => Response::Resized,
                             Request::LoopbackConnect { .. } => Response::PortConnected,
-                            Request::StartAgent {
-                                provider_env_revision,
-                                ..
-                            } => Response::Started {
+                            Request::StartAgent { activation, .. } => Response::Started {
                                 process_id: "test-generation:main:0".to_string(),
-                                provider_env_revision,
+                                provider_env_revision: activation
+                                    .configuration
+                                    .provider_env_revision,
+                                activation,
                             },
                             Request::AcceptNetwork => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
                                 message: "no pending network request".to_string(),
                             },
-                        },
+                        }),
                     }) {
                         Ok(response) => response,
                         Err(error) => {
@@ -1914,6 +3751,13 @@ mod tests {
                 } else {
                     b"complete response".to_vec()
                 };
+                if let Some(permits) = response_permits {
+                    permits
+                        .acquire()
+                        .await
+                        .expect("test response permit")
+                        .forget();
+                }
                 let _ = outbound.send(Ok(BoundaryChunk { data: response })).await;
             });
             Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
@@ -1960,6 +3804,8 @@ mod tests {
             requests: requests.clone(),
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
+            response_override: None,
+            response_permits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -1977,6 +3823,7 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, test_certificate().client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
         *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
@@ -1986,8 +3833,9 @@ mod tests {
         // A caller may try again later, but each call makes exactly one
         // bounded attach attempt and preserves the server's typed denial.
         for expected_requests in 1..=2 {
+            let epoch = client.activation.lock().unwrap().epoch;
             assert!(matches!(
-                client.mediation_session().await,
+                client.mediation_session(epoch).await,
                 Err(BackendError::Denied(_))
             ));
             assert_eq!(requests.load(Ordering::Acquire), expected_requests);
@@ -1997,7 +3845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_replays_attach_and_confirm_on_a_new_physical_connection() {
+    async fn configuration_activation_recovery_replays_attach_and_confirm_without_release() {
         let certificate = test_certificate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2020,6 +3868,8 @@ mod tests {
                     requests: server_requests.clone(),
                     mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     mediation_ready: false,
+                    response_override: None,
+                    response_permits: None,
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2035,9 +3885,12 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
+            registration_grant: "test-grant".to_string(),
+            registration_revision: 1,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             resource_claims: std::collections::BTreeMap::new(),
         };
@@ -2050,13 +3903,19 @@ mod tests {
             Response::Confirmed { .. }
         ));
 
+        client.activation.lock().unwrap().identity = Some(test_activation().identity);
+        client.publish_activation(0, &test_activation()).unwrap();
+        let readiness = client.readiness();
+        assert!(*readiness.borrow());
         client.recover_after_unavailable().await.unwrap();
+        assert!(!*readiness.borrow());
+        assert!(client.active_configuration(1).is_err());
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("replacement connection accepted")
             .unwrap();
         assert_eq!(accepted.load(Ordering::Acquire), 2);
-        assert_eq!(requests.load(Ordering::Acquire), 4);
+        assert_eq!(requests.load(Ordering::Acquire), 5);
     }
 
     #[test]
@@ -2094,6 +3953,8 @@ mod tests {
                     requests: server_requests.clone(),
                     mediation_failures: server_failures.clone(),
                     mediation_ready: true,
+                    response_override: None,
+                    response_permits: None,
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2109,9 +3970,12 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
+            registration_grant: "test-grant".to_string(),
+            registration_revision: 1,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             resource_claims: std::collections::BTreeMap::new(),
         };
@@ -2124,16 +3988,27 @@ mod tests {
             Response::Confirmed { .. }
         ));
 
-        tokio::time::timeout(Duration::from_secs(2), client.mediation_session())
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), client.mediation_session(0))
+                .await
+                .expect("mediation recovery must not deadlock"),
+            Err(BackendError::Unavailable(_))
+        ));
+        assert!(!*client.readiness().borrow());
+        let epoch = client.activation.lock().unwrap().epoch;
+        client
+            .publish_activation(epoch, &test_activation())
+            .unwrap();
+        client
+            .mediation_session(epoch)
             .await
-            .expect("mediation recovery must not deadlock")
-            .expect("mediation recovery must open a replacement session");
+            .expect("fresh release permits a replacement session");
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("replacement physical connection must be accepted")
             .unwrap();
         assert_eq!(mediation_failures.load(Ordering::Acquire), 0);
-        assert_eq!(requests.load(Ordering::Acquire), 5);
+        assert_eq!(requests.load(Ordering::Acquire), 6);
     }
 
     #[tokio::test]
@@ -2147,6 +4022,8 @@ mod tests {
             requests,
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
+            response_override: None,
+            response_permits: None,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2180,7 +4057,8 @@ mod tests {
     #[tokio::test]
     async fn persistent_dns_exchange_returns_supervisor_response() {
         let (client_stream, mut server_stream) = tokio::io::duplex(4096);
-        let session = ClientMediationSession::start(Box::new(client_stream));
+        let (_activation, activation_changes) = tokio::sync::watch::channel(true);
+        let session = ClientMediationSession::start(Box::new(client_stream), 0, activation_changes);
         let server = tokio::spawn(async move {
             let query = DnsQueryWire {
                 request: vec![1, 2, 3],
@@ -2319,6 +4197,8 @@ mod tests {
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
+            response_override: None,
+            response_permits: None,
         };
         tonic::transport::Server::builder()
             .add_service(IsolationBoundaryServer::new(service))
@@ -2333,6 +4213,8 @@ mod tests {
         SandboxContext {
             sandbox_id: "sandbox-1".to_string(),
             session_id: test_session_id(),
+            registration_grant: SecretJwt::parse("test-grant").unwrap(),
+            registration_revision: 1,
             policy: SandboxPolicy {
                 version: 1,
                 filesystem: FilesystemPolicy::default(),
@@ -2507,6 +4389,7 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
 
         assert_eq!(
@@ -2549,7 +4432,9 @@ mod tests {
         let client = Arc::new(BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         ));
+        client.activation.lock().unwrap().activated = Some(test_activation());
         let session = open_exec_session(
             client,
             ExecSpec {
@@ -2559,6 +4444,7 @@ mod tests {
                 workdir: None,
                 pty: false,
             },
+            test_activation(),
         )
         .await
         .unwrap();
@@ -2638,6 +4524,8 @@ mod tests {
             requests: handled.clone(),
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
+            response_override: None,
+            response_permits: None,
         };
         let server = tokio::spawn(async move {
             loop {
@@ -2675,6 +4563,7 @@ mod tests {
                 driver_fence: test_driver_fence(),
             },
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         ));
         let mut requests = Vec::new();
         for _ in 0..REQUESTS {
@@ -2703,6 +4592,7 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
         let context = sandbox();
 
@@ -2714,8 +4604,7 @@ mod tests {
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
                     ca_cert: Some(vec![b'c'; 16 * 1024]),
                     ca_bundle: Some(vec![b'b'; 256 * 1024]),
-                    provider_env_revision: 0,
-                    provider_env: HashMap::new(),
+                    activation: test_activation(),
                 })
                 .await
                 .expect("large TLS request"),
@@ -2762,6 +4651,7 @@ mod tests {
                 driver_fence: test_driver_fence(),
             },
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
 
         assert!(matches!(
@@ -2773,8 +4663,7 @@ mod tests {
                     policy: Box::new(SandboxPolicyWire::from(context.policy)),
                     ca_cert: Some(vec![b'c'; 16 * 1024]),
                     ca_bundle: Some(vec![b'b'; 256 * 1024]),
-                    provider_env_revision: 0,
-                    provider_env: HashMap::new(),
+                    activation: test_activation(),
                 })
             )
             .await
@@ -2797,6 +4686,7 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer("incorrect-token-incorrect-token"),
+            test_supervisor_instance_id(),
         );
 
         assert!(matches!(
@@ -2814,6 +4704,7 @@ mod tests {
         let client = BoundaryClient::new(
             tls_runtime_descriptor(address, trusted.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         );
 
         assert!(matches!(

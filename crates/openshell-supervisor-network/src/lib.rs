@@ -10,6 +10,7 @@
 
 #[cfg(target_os = "windows")]
 pub mod host;
+mod host_gateway;
 pub mod identity;
 pub mod identity_source;
 pub mod l7;

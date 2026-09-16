@@ -12,12 +12,12 @@ Use this page to apply and iterate policy changes on running sandboxes. For a fu
 
 ## Policy Structure
 
-A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and dynamic `network_policies` and `network_middlewares` sections that are hot-reloadable on a running sandbox.
+A policy has static sections `filesystem_policy`, `landlock`, and `process` that become locked when the gateway first authorizes workload release. Dynamic `network_policies` and `network_middlewares` sections can be updated on a running sandbox.
 
 ```yaml wordWrap showLineNumbers={false}
 version: 1
 
-# Static: locked at sandbox creation. Paths the agent can read vs read/write.
+# Static: locked before first workload release. Read-only and writable paths.
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /etc]
@@ -60,8 +60,12 @@ network_middlewares:
 
 ```
 
-Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
-Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+A rejected initial configuration can be repaired before the gateway authorizes its first workload release. After that authorization, changing static sections requires a new sandbox, even if the workload has not yet started or a later acknowledgement fails. See [Repair a Rejected Configuration](#repair-a-rejected-configuration).
+
+Dynamic sections can be updated with `openshell policy update` for incremental merges or `openshell policy set` for full replacement. The supervisor prepares policy and matching providers together, holds workload execution and readiness during installation, and resumes only after the complete configuration is accepted and released. Provider-only changes follow the same activation path.
+
+While execution is held, requested process signals and timeout termination wait until the configuration is released. You can still stop the sandbox during a hold.
+
 When a hot reload changes rules, the supervisor publishes a new policy generation and closes connections pinned to the previous generation. This includes HTTP keep-alive tunnels, `tls: skip`, non-HTTP payloads, HTTP upgrades such as WebSocket, and long-lived response streams such as SSE. Most clients reconnect automatically, and the next connection or request is evaluated against the current policy. A parsed WebSocket relay closes with code `1012` when its attached policy generation becomes stale. Use `protocol: websocket` when policy should stay attached to the RFC 6455 upgrade and client text messages after the allowed upgrade. Provider-credentialed endpoints reject L4-only and `tls: skip` modes by default. On a credentialed WebSocket upgrade, OpenShell keeps the connection on the parsed relay and rejects binary frames unless the endpoint explicitly sets `allow_uninspected_credentials: true`. Add `websocket_credential_rewrite: true` when the relay should rewrite credential placeholders in client-to-server WebSocket text messages. Add `request_body_credential_rewrite: true` only on inspected REST endpoints that need OpenShell to rewrite placeholders in supported text request bodies.
 
 | Section | Type | Description |
@@ -165,7 +169,7 @@ Do not combine `protocol: tcp` with L7-only fields such as `path`, `enforcement`
 
 Prefer exact hostnames for TCP endpoints. A wildcard authorizes DNS queries for every matching name, which means a compromised process can encode data into matching DNS labels even when the lookup does not return an address. OpenShell records failed eligible lookups for operators, but logging does not remove that exfiltration channel.
 
-The first TCP endpoint is a deliberate exception to ordinary dynamic network policy updates. A sandbox created without any `protocol: tcp` endpoint does not install the DNS and transparent-capture substrate. A hot reload that introduces the first TCP endpoint is rejected atomically and leaves the previous policy active; recreate the sandbox with a TCP endpoint to install the substrate. A sandbox that started with TCP support can remove and later re-add TCP endpoints through normal policy reloads.
+The first TCP endpoint is a deliberate exception to ordinary dynamic network policy updates. A sandbox created without any `protocol: tcp` endpoint does not install the DNS and transparent-capture substrate. A hot reload that introduces the first TCP endpoint is rejected atomically; the configured validation failure mode determines whether the workload stays blocked or retains a known accepted configuration. Recreate the sandbox with a TCP endpoint to install the substrate. A sandbox that started with TCP support can remove and later re-add TCP endpoints through normal policy reloads.
 
 ## Apply a Custom Policy
 
@@ -292,7 +296,7 @@ default is `fail_closed`:
 policy_validation_failure_mode = "fail_closed"
 ```
 
-In `fail_closed` mode, the supervisor publishes a quarantine generation, denies new egress, and closes connections pinned to the previous generation. The previous policy is not active. A later valid policy exits quarantine automatically.
+In `fail_closed` mode, OpenShell holds the workload, blocks new exec, and keeps readiness false. The supervisor denies new egress and closes connections pinned to the previous policy. A later valid configuration resumes execution only after matching policy and provider installation, gateway acceptance, and confirmed boundary release.
 
 Operators that explicitly prioritize availability can retain the previous generation:
 
@@ -301,9 +305,35 @@ Operators that explicitly prioritize availability can retain the previous genera
 policy_validation_failure_mode = "retain_last_valid"
 ```
 
-In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
+In `retain_last_valid` mode, the rejected candidate remains inactive. OpenShell can keep or restore the previous accepted configuration only when its installation is still known for the same workload boundary. This mode cannot resume an uncertain or mixed installation, and initial startup remains blocked when no accepted configuration exists. Restart the gateway after changing `gateway.toml`; connected supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
 
 OCSF configuration and finding events identify the rejected candidate, validation rationale, configured and effective modes, active generation, and whether the previous policy is active. When `retain_last_valid` is configured without a previous valid generation, the effective mode remains `fail_closed`. Connection denials during quarantine include the validation failure as their policy denial rationale.
+
+### Repair a Rejected Configuration
+
+An invalid image policy, unresolved provider binding, or unavailable matching provider environment can leave a newly created sandbox waiting for configuration repair. The workload stays blocked, and the sandbox remains available through the gateway for inspection and policy/provider changes. When neither user nor image policy is available, OpenShell selects restrictive defaults; absence of image policy does not grant unrestricted network access.
+
+Inspect the desired configuration and admission error:
+
+```shell
+openshell sandbox get my-sandbox --output json
+openshell provider list
+openshell provider get my-provider
+```
+
+`configuration_desired` describes the candidate delivered to the supervisor. `configuration_admission` describes its accepted or rejected installation state. An `accepted` state with `activation_confirmed: false` is still waiting for boundary release confirmation. Under `retain_last_valid`, an older accepted installation may remain usable while a newer desired candidate reports an error.
+
+Correct the base policy and any referenced provider credentials, profile, or attachment. Use [Manage Providers](/sandboxes/manage-providers) for credential repair and [Attach and Detach Providers](/providers/profiles#attach-and-detach-providers) for attachment changes. Submit a corrected policy:
+
+```shell
+openshell policy set my-sandbox --policy policy.yaml
+openshell sandbox get my-sandbox --output json
+openshell policy list my-sandbox
+```
+
+Before first release authorization, a pending or rejected sandbox with an explicit never-authorized marker can accept static policy corrections as well as network changes. The gateway consumes this permission before the workload may run. A missing marker, a failed acknowledgement, or a supervisor restart does not reopen it. After authorization, create a new sandbox to change static policy.
+
+The supervisor retries the repaired configuration. Successful repair permits one initial workload launch; repeated acknowledgements cannot launch it again. Wait for `activation_confirmed: true` and the current sandbox's `Ready` condition before using it. Policy history becomes `loaded` only after the gateway accepts the matching final activation report. The displayed `policy_source` is the scope `sandbox` or `global`, not the image or default origin of the policy.
 
 ## Incremental Policy Updates
 

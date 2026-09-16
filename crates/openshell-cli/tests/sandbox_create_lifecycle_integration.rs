@@ -63,6 +63,7 @@ struct SandboxState {
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
+    configuration_rejected: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
@@ -583,6 +584,7 @@ impl OpenShell for TestOpenShell {
         let sandbox_id = request.into_inner().id;
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
+        let configuration_rejected = self.state.configuration_rejected.load(Ordering::SeqCst);
         let vm_error_with_observed_exit = self
             .state
             .vm_error_with_observed_exit
@@ -619,6 +621,22 @@ impl OpenShell for TestOpenShell {
                 ..Sandbox::default()
             };
             provisioning.set_phase(SandboxPhase::Provisioning as i32);
+            if configuration_rejected {
+                provisioning.status.as_mut().unwrap().configuration_desired =
+                    Some(openshell_core::proto::SandboxConfigurationSnapshot {
+                        error: "required provider is unavailable".to_string(),
+                        ..Default::default()
+                    });
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
+                    }))
+                    .await;
+                // Keep the stream open as a repairable gateway does. The client
+                // must report rejection without waiting for a terminal phase.
+                tx.closed().await;
+                return;
+            }
             let mut error = Sandbox {
                 status: Some(SandboxStatus {
                     sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
@@ -824,6 +842,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -1463,6 +1488,60 @@ fn test_config() -> run::SandboxCreateConfig<'static> {
         auto_providers_override: Some(false),
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn configuration_activation_rejected_create_returns_repair_without_deletion() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .configuration_rejected
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("repair-provider"),
+                command: &["echo".into(), "OK".into()],
+                keep: false,
+                ..test_config()
+            },
+            "default",
+            &tls,
+        ),
+    )
+    .await
+    .expect("rejection must finish without a terminal status")
+    .expect_err("rejected configuration cannot complete create");
+    let message = error.to_string();
+    assert!(
+        message.contains("required provider is unavailable"),
+        "{message}"
+    );
+    assert!(
+        message.contains("openshell sandbox get repair-provider"),
+        "{message}"
+    );
+    assert!(
+        deleted_names(&server).await.is_empty(),
+        "rejected sandbox must remain repairable"
+    );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        0
+    );
 }
 
 #[tokio::test]

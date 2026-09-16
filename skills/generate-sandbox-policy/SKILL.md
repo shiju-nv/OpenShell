@@ -366,6 +366,22 @@ If the user needs access to multiple hosts or the same host with different rules
 
 Before presenting the policy to the user, verify correctness **and** flag breadth concerns.
 
+For gateway-managed sandboxes, validate the policy together with attached provider profiles and credential bindings. A syntactically valid policy can still be rejected when those inputs cannot activate together. Such an initial rejection keeps the workload unstarted and the sandbox available for repair; an absent image policy selects restrictive defaults.
+
+When repairing a rejected sandbox, inspect the desired configuration error and edit the base policy so provider-composed entries are not copied into it unintentionally:
+
+```fish
+openshell sandbox get my-sandbox --output json
+openshell policy get my-sandbox --base > repair-policy.yaml
+openshell sandbox provider list my-sandbox
+```
+
+Correct the policy or the attached provider's credentials, profile coverage, or binding, then submit the corrected policy with `openshell policy set my-sandbox --policy repair-policy.yaml --wait` when a policy change is needed. The JSON `policy_source` describes `sandbox` or `global` gateway policy scope; it does not identify whether the sandbox policy came from an image or defaults. Check the governing scope before proposing a repair.
+
+Static fields (`filesystem_policy`, `landlock`, and `process`) can be repaired only while admission is pending or rejected and `configuration_activation_authorized` is explicitly `false`. The first authorization to release the workload consumes that permission before execution may begin. A missing value or restart does not restore it. After authorization, generate a policy for a new sandbox when static fields must change.
+
+Verify `configuration_admission.activation_confirmed` and sandbox readiness after repair. Gateway admission and an accepted held installation are intermediate states; `loaded` follows the final report for matching policy/providers and current runtime instances. A rejected desired candidate can leave an earlier accepted configuration active only under `retain_last_valid`. The default `fail_closed` posture holds workload execution and readiness until a valid configuration activates. A successful initial repair starts the waiting workload once. Standalone network-proxy use retains local-file policy loading and does not use sandbox admission status.
+
 ### Hard Errors (would block sandbox startup)
 
 - [ ] `rules` and `access` are NOT both present on the same endpoint

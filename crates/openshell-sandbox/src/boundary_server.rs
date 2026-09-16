@@ -17,7 +17,9 @@ mod linux {
     use std::io::{self, Read, Write};
     use std::mem::size_of;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd as _, OwnedFd};
-    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{
+        FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -27,18 +29,23 @@ mod linux {
 
     use crate::boundary_io::BoundaryRuntimeState;
     use crate::delegated::{AgentSignaler, spawn_workload};
-    use crate::identity::{DriverIdentity, resolve_process_identity};
+    use crate::identity::{
+        DriverIdentity, resolve_process_identity, validate_selected_process_identity,
+    };
     use crate::main_session::{MainOutput, MainSession};
     use crate::network_broker::NetworkBroker;
     use crate::process::ProcessStatus;
+    use openshell_core::configuration::{ConfigurationActivationIdentity, ConfigurationRevision};
     use openshell_core::jwt::{
         SandboxId, SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SystemJwtClock,
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
-        BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
-        CapabilityEvidence, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
-        SandboxConfirmEvidence,
+        ActivatedBoundaryConfiguration, BoundaryBootstrap, BoundaryConfigurationSnapshot,
+        BoundaryExec, BoundaryFilesystemBaseline, BoundaryLoopbackConnector, BoundaryProcess,
+        BoundaryTerminal, CapabilityEvidence, ExecSession, ImagePolicyDiscovery,
+        InstalledBoundaryConfiguration, LoopbackTarget, PreparedBoundaryConfiguration,
+        ResolvedWorkloadIdentity, SandboxConfirmEvidence,
     };
     use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
     use openshell_sandbox_backend::mediation::{
@@ -52,7 +59,7 @@ mod linux {
     };
     use openshell_sandbox_backend::sandbox_auth::{
         SandboxConnectionId, SandboxConnectionRegistry, SandboxProtocolAuthenticator,
-        SandboxProtocolPrincipal,
+        SandboxProtocolPrincipal, VerifiedControlRegistration,
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_stream::wrappers::ReceiverStream;
@@ -63,8 +70,8 @@ mod linux {
         ExitStatusWire, MediationTimingWire, OutputWindowWire, ProcessKindWire,
         ProcessSnapshotWire, Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT,
         STREAM_NETWORK_DECISION, STREAM_STDERR, STREAM_STDIN, STREAM_STDIN_CLOSED, STREAM_STDOUT,
-        SandboxPolicyWire, SessionSnapshotWire, SignalWire, encode_frame, read_frame,
-        read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
+        SandboxPolicyWire, SessionSnapshotWire, SignalWire, SupervisorInstanceId, encode_frame,
+        read_frame, read_stream_frame, validate_resource_claims, write_frame, write_stream_frame,
     };
 
     const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -78,8 +85,13 @@ mod linux {
     const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
+    // JSON escaping can expand one UTF-8 input byte to six bytes. Leave room
+    // for the immutable runtime identity and bounded baseline in the 1 MiB frame.
+    const MAX_IMAGE_POLICY_BYTES: u64 = 128 * 1024;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
+    const MAX_GPU_DEVICE_ENTRIES: usize = 4096;
+    const MAX_GPU_DEVICE_INDEX_DIGITS: usize = 10;
 
     const GPU_BASELINE_READ_ONLY: &[&str] = &["/run/nvidia-persistenced", "/usr/lib/wsl"];
     const GPU_BASELINE_READ_WRITE: &[&str] = &[
@@ -95,43 +107,92 @@ mod linux {
         u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
     }
 
-    /// Add the filesystem paths required by GPU devices visible inside the
-    /// workload container. The companion supervisor intentionally has no GPU
-    /// devices, so it cannot discover these paths on the sandbox's behalf.
-    fn enrich_gpu_filesystem_paths(
-        policy: &mut openshell_core::policy::SandboxPolicy,
-        gpu_requested: bool,
-    ) -> bool {
-        if !gpu_requested {
-            return false;
-        }
-        let has_gpu = Path::new("/dev/nvidiactl").exists() || Path::new("/dev/dxg").exists();
-        if !has_gpu {
-            return false;
-        }
+    fn gpu_device_names() -> io::Result<impl Iterator<Item = io::Result<std::ffi::OsString>>> {
+        std::fs::read_dir("/dev")
+            .map(|entries| entries.map(|entry| entry.map(|entry| entry.file_name())))
+    }
 
-        let mut read_write = GPU_BASELINE_READ_WRITE
+    /// Collect one bounded GPU inventory for both admission and launch checks.
+    /// Oversized or unreadable inventories fail instead of publishing a partial
+    /// baseline whose contents would depend on directory enumeration order.
+    fn discover_gpu_filesystem_baseline<I>(
+        gpu_requested: bool,
+        path_exists: impl Fn(&Path) -> bool,
+        device_names: impl FnOnce() -> io::Result<I>,
+    ) -> Result<BoundaryFilesystemBaseline, String>
+    where
+        I: IntoIterator<Item = io::Result<std::ffi::OsString>>,
+    {
+        let mut baseline = BoundaryFilesystemBaseline::default();
+        if !gpu_requested
+            || !(path_exists(Path::new("/dev/nvidiactl")) || path_exists(Path::new("/dev/dxg")))
+        {
+            return Ok(baseline);
+        }
+        baseline.read_only = GPU_BASELINE_READ_ONLY
             .iter()
             .copied()
-            .map(std::path::PathBuf::from)
-            .collect::<Vec<_>>();
-        if let Ok(entries) = std::fs::read_dir("/dev") {
-            read_write.extend(entries.flatten().filter_map(|entry| {
-                let name = entry.file_name();
-                let suffix = name.to_str()?.strip_prefix("nvidia")?;
-                (!suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()))
-                    .then(|| entry.path())
-            }));
+            .filter(|path| path_exists(Path::new(path)))
+            .map(str::to_string)
+            .collect();
+        baseline.read_write = GPU_BASELINE_READ_WRITE
+            .iter()
+            .copied()
+            .filter(|path| path_exists(Path::new(path)))
+            .map(str::to_string)
+            .collect();
+        let names =
+            device_names().map_err(|error| format!("read GPU device inventory: {error}"))?;
+        for (index, name) in names
+            .into_iter()
+            .take(MAX_GPU_DEVICE_ENTRIES + 1)
+            .enumerate()
+        {
+            if index == MAX_GPU_DEVICE_ENTRIES {
+                return Err("GPU device inventory exceeds the entry limit".to_string());
+            }
+            let name = name.map_err(|error| format!("read GPU device inventory entry: {error}"))?;
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.strip_prefix("nvidia").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= MAX_GPU_DEVICE_INDEX_DIGITS
+                    && suffix.bytes().all(|character| character.is_ascii_digit())
+            }) {
+                let path = format!("/dev/{name}");
+                if path_exists(Path::new(&path)) {
+                    baseline.read_write.push(path);
+                }
+            }
         }
+        baseline.read_only.sort();
+        baseline.read_only.dedup();
+        baseline.read_write.sort();
+        baseline.read_write.dedup();
+        Ok(baseline)
+    }
 
+    /// Check the admitted policy against the same workload-local GPU inventory
+    /// used during discovery. Changes only affect the temporary launch policy;
+    /// the caller rejects any required expansion before spawning a workload.
+    fn enrich_gpu_filesystem_paths<I>(
+        policy: &mut openshell_core::policy::SandboxPolicy,
+        gpu_requested: bool,
+        path_exists: impl Fn(&Path) -> bool,
+        device_names: impl FnOnce() -> io::Result<I>,
+    ) -> Result<bool, String>
+    where
+        I: IntoIterator<Item = io::Result<std::ffi::OsString>>,
+    {
+        let baseline = discover_gpu_filesystem_baseline(gpu_requested, path_exists, device_names)?;
         let mut modified = false;
-        for path in GPU_BASELINE_READ_ONLY.iter().copied().map(Path::new) {
-            if path.exists()
-                && !policy
-                    .filesystem
-                    .read_only
-                    .iter()
-                    .any(|allowed| allowed == path)
+        for path in baseline.read_only.iter().map(Path::new) {
+            if !policy
+                .filesystem
+                .read_only
+                .iter()
+                .any(|allowed| allowed == path)
                 && !policy
                     .filesystem
                     .read_write
@@ -142,8 +203,12 @@ mod linux {
                 modified = true;
             }
         }
-        for path in read_write {
-            if !path.exists() || policy.filesystem.read_write.contains(&path) {
+        for path in baseline
+            .read_write
+            .into_iter()
+            .map(std::path::PathBuf::from)
+        {
+            if policy.filesystem.read_write.contains(&path) {
                 continue;
             }
             if policy.filesystem.read_only.contains(&path) {
@@ -158,7 +223,7 @@ mod linux {
             policy.filesystem.read_write.push(path);
             modified = true;
         }
-        modified
+        Ok(modified)
     }
 
     struct ControlConnectionSlot(Arc<AtomicUsize>);
@@ -914,6 +979,8 @@ mod linux {
         runtime: Arc<BoundaryRuntime>,
         broker: NetworkBroker,
     ) -> Result<(), String> {
+        let mut activation_changes = runtime.activation_epoch.subscribe();
+        runtime.network_accept_context()?;
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (outbound_tx, mut outbound_rx) =
             tokio::sync::mpsc::channel::<BoundaryOutboundFrame>(MEDIATION_EVENT_QUEUE);
@@ -940,12 +1007,19 @@ mod linux {
             }
             Ok::<(), String>(())
         };
-        let accept_task =
-            run_boundary_accepts(runtime, broker, outbound_tx.clone(), routes.clone());
+        let accept_task = run_boundary_accepts(
+            runtime,
+            broker,
+            outbound_tx.clone(),
+            routes.clone(),
+            activation_changes.clone(),
+        );
         tokio::pin!(writer_task);
         tokio::pin!(reader_task);
         tokio::pin!(accept_task);
         let result = tokio::select! {
+            biased;
+            _ = activation_changes.changed() => Err("configuration hold ended mediation".to_string()),
             result = &mut writer_task => result,
             result = &mut reader_task => result,
             result = &mut accept_task => result,
@@ -959,6 +1033,7 @@ mod linux {
         broker: NetworkBroker,
         outbound: tokio::sync::mpsc::Sender<BoundaryOutboundFrame>,
         routes: BoundaryMediationRoutes,
+        activation_changes: tokio::sync::watch::Receiver<u64>,
     ) -> Result<(), String> {
         loop {
             let pending = broker
@@ -976,6 +1051,8 @@ mod linux {
                 route_rx,
                 outbound.clone(),
                 routes.clone(),
+                runtime.clone(),
+                activation_changes.clone(),
             ));
         }
     }
@@ -986,7 +1063,14 @@ mod linux {
         mut inbound: tokio::sync::mpsc::Receiver<MediationFrame>,
         outbound: tokio::sync::mpsc::Sender<BoundaryOutboundFrame>,
         routes: BoundaryMediationRoutes,
+        runtime: Arc<BoundaryRuntime>,
+        mut activation_changes: tokio::sync::watch::Receiver<u64>,
     ) {
+        let mediation_epoch = *activation_changes.borrow();
+        tokio::select! {
+            biased;
+            _ = activation_changes.changed() => {},
+            () = async {
         let query = DnsQueryWire {
             request: pending.request.clone(),
             transport: pending.transport,
@@ -1028,7 +1112,14 @@ mod linux {
                 "mediation session ended before DNS response",
             )),
         };
-        let _ = pending.complete(result);
+        // DNS tasks outlive the stream's accept loop. The activation gate
+        // prevents an already-received old decision crossing a held transition.
+        let activation = lock(&runtime.activation);
+        if activation.released.is_some() && *runtime.activation_epoch.borrow() == mediation_epoch {
+            let _ = pending.complete(result);
+        }
+            } => {},
+        }
         routes.lock().await.remove(&stream_id);
     }
 
@@ -1054,6 +1145,21 @@ mod linux {
             return write_frame(&mut stream, &response)
                 .map_err(|error| format!("write control frame: {error}"));
         }
+        if let Request::Attach {
+            supervisor_instance_id,
+            registration_grant,
+            registration_revision,
+            ..
+        } = &request.request
+        {
+            let expected =
+                runtime.activation_identity(*supervisor_instance_id, *registration_revision);
+            let registration = runtime
+                .authenticator
+                .verify_control_registration(registration_grant, &expected)
+                .map_err(|error| format!("verify control registration: {error}"))?;
+            runtime.commit_attach(principal, &registration)?;
+        }
         match request.request.clone() {
             Request::TerminateBoundary => {
                 let response = runtime
@@ -1068,21 +1174,25 @@ mod linux {
                 )
                 .map_err(|error| format!("write boundary termination response: {error}"));
             }
-            Request::Exec { spec } => {
-                let started =
-                    match runtime.start_exec(&request.request_id, &request.payload_digest, spec) {
-                        Ok(started) => started,
-                        Err(response) => {
-                            return write_frame(
-                                &mut stream,
-                                &ResponseEnvelope {
-                                    request_id: request.request_id,
-                                    response,
-                                },
-                            )
-                            .map_err(|error| format!("write exec error response: {error}"));
-                        }
-                    };
+            Request::Exec { spec, activation } => {
+                let started = match runtime.start_exec(
+                    &request.request_id,
+                    &request.payload_digest,
+                    spec,
+                    &activation,
+                ) {
+                    Ok(started) => started,
+                    Err(response) => {
+                        return write_frame(
+                            &mut stream,
+                            &ResponseEnvelope {
+                                request_id: request.request_id,
+                                response,
+                            },
+                        )
+                        .map_err(|error| format!("write exec error response: {error}"));
+                    }
+                };
                 if let Err(error) = write_frame(
                     &mut stream,
                     &ResponseEnvelope {
@@ -1090,6 +1200,7 @@ mod linux {
                         response: Response::ExecStarted {
                             process_id: started.process_id.clone(),
                             pty: started.terminal,
+                            activation,
                         },
                     },
                 ) {
@@ -1122,6 +1233,7 @@ mod linux {
                 return runtime.stream_process(stream, attachment);
             }
             Request::LoopbackConnect { host, port } => {
+                let mut activation_changes = runtime.activation_epoch.subscribe();
                 let target = match LoopbackTarget::new(host, port)
                     .map_err(|error| format!("validate port-forward target: {error}"))
                     .and_then(|target| {
@@ -1153,16 +1265,24 @@ mod linux {
                 .map_err(|error| format!("write port-forward response: {error}"))?;
                 runtime.process_runtime.block_on(async move {
                     let mut stream = stream.into_tokio()?;
-                    tokio::io::copy_bidirectional(&mut stream, &mut target)
-                        .await
-                        .map_err(|error| format!("bridge boundary loopback stream: {error}"))
+                    tokio::select! {
+                        biased;
+                        _ = activation_changes.changed() => Err("configuration hold ended loopback stream".to_string()),
+                        result = tokio::io::copy_bidirectional(&mut stream, &mut target) => result
+                            .map_err(|error| format!("bridge boundary loopback stream: {error}")),
+                    }
                 })?;
                 return Ok(());
             }
             Request::AcceptNetwork => {
+                let mut activation_changes = runtime.activation_epoch.subscribe();
                 let broker = runtime.network_accept_context()?;
                 let request_id = request.request_id;
                 runtime.process_runtime.block_on(async move {
+                    tokio::select! {
+                        biased;
+                        _ = activation_changes.changed() => Err("configuration hold ended network stream".to_string()),
+                        result = async move {
                     let mut stream = stream.into_tokio()?;
                     let mut disconnect_probe = [0_u8; 1];
                     let pending = tokio::select! {
@@ -1227,29 +1347,18 @@ mod linux {
                         .await
                         .map(|_| ())
                         .map_err(|error| format!("bridge sandbox network stream: {error}"))
+                        } => result,
+                    }
                 })?;
                 return Ok(());
             }
             _ => {}
         }
-        let supervisor_instance_id = match &request.request {
-            Request::Attach {
-                supervisor_instance_id,
-                ..
-            } => Some(*supervisor_instance_id),
-            _ => None,
-        };
-        let is_attach = supervisor_instance_id.is_some();
         let is_confirm = matches!(&request.request, Request::Confirm);
         let response = ResponseEnvelope {
             request_id: request.request_id.clone(),
             response: runtime.dispatch(request),
         };
-        if is_attach && matches!(&response.response, Response::Attached { .. }) {
-            let supervisor_instance_id = supervisor_instance_id
-                .ok_or_else(|| "attach request lost supervisor instance identity".to_string())?;
-            runtime.commit_attach(principal, supervisor_instance_id)?;
-        }
         if is_confirm && matches!(&response.response, Response::Confirmed { .. }) {
             runtime.commit_confirm(principal)?;
         }
@@ -1266,6 +1375,13 @@ mod linux {
             Mutex<std::collections::HashMap<SandboxConnectionId, tokio::sync::watch::Sender<()>>>,
         process_runtime: tokio::runtime::Handle,
         state: Mutex<RuntimeState>,
+        // Acquire before runtime/process locks. Holding this gate through
+        // launch/exec closes the check-to-spawn race with configuration freeze.
+        activation: Mutex<ConfigurationState>,
+        activation_epoch: tokio::sync::watch::Sender<u64>,
+        boundary_instance_id: String,
+        image_policy: ImagePolicyDiscovery,
+        filesystem_baseline: BoundaryFilesystemBaseline,
         supervisor_connection: Mutex<SupervisorConnectionState>,
         next_recovery_id: AtomicU64,
         /// The wire policy bound at first attach, so an idempotent attach retry
@@ -1369,14 +1485,12 @@ mod linux {
         policy: SandboxPolicyWire,
         ca_cert: Option<Vec<u8>>,
         ca_bundle: Option<Vec<u8>>,
-        provider_env_revision: u64,
-        provider_env: std::collections::HashMap<String, String>,
     }
 
     impl StartedAgent {
         /// Provider environment is mutable runtime state. A replacement
-        /// control must replay every immutable launch input exactly, then
-        /// reconcile the current provider snapshot through the CAS update.
+        /// control must replay every immutable launch input exactly. Mutable
+        /// providers are checked separately through the released configuration.
         fn matches_replay(&self, other: &Self) -> bool {
             self.sandbox_id == other.sandbox_id
                 && self.spec == other.spec
@@ -1454,6 +1568,23 @@ mod linux {
         Running(Arc<ManagedProcess>),
     }
 
+    #[derive(Default)]
+    struct ConfigurationState {
+        identity: Option<ConfigurationActivationIdentity>,
+        installed: Option<ConfigurationRevision>,
+        prepared: Option<PendingConfiguration>,
+        committed: Option<InstalledBoundaryConfiguration>,
+        released: Option<ActivatedBoundaryConfiguration>,
+        aborted: Option<PreparedBoundaryConfiguration>,
+        // The environment is deliberately absent from all receipts and Debug.
+        provider_env: std::collections::HashMap<String, String>,
+    }
+
+    struct PendingConfiguration {
+        receipt: PreparedBoundaryConfiguration,
+        provider_env: std::collections::HashMap<String, String>,
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SupervisorConnectionState {
         AwaitingConfirmation,
@@ -1466,6 +1597,92 @@ mod linux {
     #[derive(Clone)]
     struct PreparedBoundary {
         network_broker: NetworkBroker,
+    }
+
+    fn discover_image_policy(path: &Path) -> ImagePolicyDiscovery {
+        let invalid = || ImagePolicyDiscovery::Invalid {
+            message: "image policy could not be read safely".to_string(),
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return ImagePolicyDiscovery::Missing;
+            }
+            Err(_) => return invalid(),
+        };
+        // Nonblocking open prevents an image-owned FIFO from stalling bootstrap.
+        // Symlinks and nonregular files are not policy documents.
+        if !file
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_IMAGE_POLICY_BYTES)
+        {
+            return invalid();
+        }
+        let mut bytes = Vec::new();
+        if Read::by_ref(&mut file)
+            .take(MAX_IMAGE_POLICY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_IMAGE_POLICY_BYTES
+        {
+            return invalid();
+        }
+        String::from_utf8(bytes)
+            .map_or_else(|_| invalid(), |yaml| ImagePolicyDiscovery::Present { yaml })
+    }
+
+    fn discover_filesystem_baseline(
+        gpu_requested: bool,
+    ) -> Result<BoundaryFilesystemBaseline, String> {
+        let mut baseline = BoundaryFilesystemBaseline {
+            read_only: [
+                "/usr",
+                "/lib",
+                "/etc",
+                "/app",
+                "/var/log",
+                "/proc",
+                "/dev/urandom",
+            ]
+            .into_iter()
+            .filter(|path| Path::new(path).exists())
+            .map(str::to_string)
+            .collect(),
+            read_write: ["/tmp", "/dev/null"]
+                .into_iter()
+                .filter(|path| Path::new(path).exists())
+                .map(str::to_string)
+                .collect(),
+        };
+        let gpu = discover_gpu_filesystem_baseline(gpu_requested, Path::exists, gpu_device_names)?;
+        baseline.read_only.extend(gpu.read_only);
+        baseline.read_write.extend(gpu.read_write);
+        baseline
+            .read_only
+            .retain(|path| !baseline.read_write.contains(path));
+        baseline.read_only.sort();
+        baseline.read_only.dedup();
+        baseline.read_write.sort();
+        baseline.read_write.dedup();
+        Ok(baseline)
+    }
+
+    fn validate_child_environment(
+        environment: &std::collections::HashMap<String, String>,
+    ) -> Result<(), String> {
+        // Validate before holding workloads. Neither an invalid name nor a NUL
+        // value may become a delayed exec failure after gateway acceptance.
+        if environment
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+        {
+            return Err("configuration contains an invalid child environment".to_string());
+        }
+        Ok(())
     }
 
     impl BoundaryRuntime {
@@ -1496,6 +1713,11 @@ mod linux {
                 Arc::new(SystemJwtClock),
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
+            let gpu_requested = config
+                .resource_claims
+                .get(GPU_RESOURCE_CLAIM)
+                .is_some_and(|value| value == "true");
+            let filesystem_baseline = discover_filesystem_baseline(gpu_requested)?;
             Ok(Self {
                 authenticator: SandboxProtocolAuthenticator::new(
                     verifier,
@@ -1511,6 +1733,13 @@ mod linux {
                 config,
                 process_runtime,
                 state: Mutex::new(RuntimeState::AwaitingAttach),
+                activation: Mutex::new(ConfigurationState::default()),
+                activation_epoch: tokio::sync::watch::channel(0).0,
+                boundary_instance_id: uuid::Uuid::new_v4().to_string(),
+                image_policy: discover_image_policy(Path::new(
+                    openshell_policy::CONTAINER_POLICY_PATH,
+                )),
+                filesystem_baseline,
                 supervisor_connection: Mutex::new(SupervisorConnectionState::AwaitingConfirmation),
                 next_recovery_id: AtomicU64::new(1),
                 attached_policy: Mutex::new(None),
@@ -1537,12 +1766,271 @@ mod linux {
                 .map_err(|error| tonic::Status::unauthenticated(error.to_string()))
         }
 
+        fn activation_identity(
+            &self,
+            supervisor: SupervisorInstanceId,
+            registration_revision: u64,
+        ) -> ConfigurationActivationIdentity {
+            ConfigurationActivationIdentity {
+                runtime_generation: self.config.generation.clone(),
+                boundary_session_id: self.config.session_id.to_string(),
+                supervisor_instance_id: supervisor.to_string(),
+                boundary_instance_id: self.boundary_instance_id.clone(),
+                registration_revision,
+            }
+        }
+
+        fn describe_workload(&self, supervisor: SupervisorInstanceId) -> Response {
+            Response::WorkloadDescribed {
+                bootstrap: Box::new(BoundaryBootstrap {
+                    identity: self.activation_identity(supervisor, 0),
+                    workload_identity: self.config.workload_identity.clone(),
+                    image_policy: self.image_policy.clone(),
+                    filesystem_baseline: self.filesystem_baseline.clone(),
+                }),
+            }
+        }
+
+        fn require_configuration_identity(
+            state: &ConfigurationState,
+            identity: &ConfigurationActivationIdentity,
+        ) -> Result<(), String> {
+            identity.validate().map_err(|error| error.to_string())?;
+            if state.identity.as_ref() != Some(identity) {
+                return Err(
+                    "configuration belongs to a different boundary or control registration"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+
+        fn configuration_snapshot(&self) -> Result<BoundaryConfigurationSnapshot, String> {
+            let activation = lock(&self.activation);
+            let identity = activation
+                .identity
+                .clone()
+                .ok_or_else(|| "boundary has no registered control".to_string())?;
+            Ok(BoundaryConfigurationSnapshot {
+                identity,
+                installed: activation.installed.clone(),
+                active: activation.released.is_some(),
+            })
+        }
+
+        fn hold_configuration(&self, activation: &mut ConfigurationState) -> Result<(), String> {
+            // Explicit cancellation ends the transaction. Delayed responses or
+            // old release requests must not revive it after repair or replacement.
+            activation.prepared = None;
+            activation.committed = None;
+            activation.aborted = None;
+            self.hold_execution(activation)
+        }
+
+        fn hold_execution(&self, activation: &mut ConfigurationState) -> Result<(), String> {
+            // Transport loss revokes execution but retains the same registered
+            // control's uncertain transaction so an identical in-flight retry can
+            // recover its receipt. Only explicit release can resume after Confirm.
+            activation.released = None;
+            self.activation_epoch
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+            let state = lock(&self.state);
+            if let RuntimeState::Running(process) = &*state {
+                process
+                    .boundary_runtime
+                    .freeze_confirmed()
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+
+        fn require_released(
+            activation: &ConfigurationState,
+            receipt: &ActivatedBoundaryConfiguration,
+        ) -> Result<(), String> {
+            Self::require_configuration_identity(activation, &receipt.identity)?;
+            if activation.released.as_ref() != Some(receipt) {
+                return Err(
+                    "workload configuration is not released with this exact receipt".to_string(),
+                );
+            }
+            Ok(())
+        }
+
+        fn prepare_configuration(
+            &self,
+            identity: ConfigurationActivationIdentity,
+            expected: Option<ConfigurationRevision>,
+            configuration: ConfigurationRevision,
+            provider_env: std::collections::HashMap<String, String>,
+        ) -> Result<PreparedBoundaryConfiguration, String> {
+            configuration
+                .validate()
+                .map_err(|error| error.to_string())?;
+            validate_child_environment(&provider_env)?;
+            let mut activation = lock(&self.activation);
+            Self::require_configuration_identity(&activation, &identity)?;
+            // Identical preparation retries retain their transition token even
+            // after commit; different bytes under a reused revision are rejected.
+            if let Some(pending) = &activation.prepared {
+                if pending.receipt.identity == identity
+                    && pending.receipt.expected == expected
+                    && pending.receipt.configuration == configuration
+                    && pending.provider_env == provider_env
+                {
+                    return Ok(pending.receipt.clone());
+                }
+                if activation.released.is_none() && activation.committed.is_none() {
+                    return Err("another configuration transition is pending".to_string());
+                }
+            }
+            if activation.installed != expected {
+                return Err(
+                    "configuration preparation expected a different installed revision".to_string(),
+                );
+            }
+            if activation.installed.as_ref().is_some_and(|current| {
+                current.provider_env_revision == configuration.provider_env_revision
+            }) && activation.provider_env != provider_env
+            {
+                return Err(
+                    "provider environment bytes conflict with the installed revision".to_string(),
+                );
+            }
+            self.hold_configuration(&mut activation)?;
+            let receipt = PreparedBoundaryConfiguration {
+                identity,
+                transition_id: uuid::Uuid::new_v4().to_string(),
+                expected,
+                configuration,
+            };
+            activation.prepared = Some(PendingConfiguration {
+                receipt: receipt.clone(),
+                provider_env,
+            });
+            Ok(receipt)
+        }
+
+        fn commit_configuration(
+            &self,
+            prepared: &PreparedBoundaryConfiguration,
+        ) -> Result<InstalledBoundaryConfiguration, String> {
+            let mut activation = lock(&self.activation);
+            Self::require_configuration_identity(&activation, &prepared.identity)?;
+            let pending = activation
+                .prepared
+                .as_ref()
+                .filter(|pending| pending.receipt == *prepared)
+                .ok_or_else(|| "configuration preparation receipt is stale".to_string())?;
+            if let Some(installed) = &activation.committed {
+                return Ok(installed.clone());
+            }
+            if activation.installed != prepared.expected || activation.released.is_some() {
+                return Err("configuration installation does not match the held state".to_string());
+            }
+            let provider_env = pending.provider_env.clone();
+            let state = lock(&self.state);
+            if let RuntimeState::Running(process) = &*state {
+                let previous = process.provider_credentials.snapshot().revision;
+                let revision = process
+                    .provider_credentials
+                    .compare_and_install_child_env_snapshot(
+                        previous,
+                        prepared.configuration.provider_env_revision,
+                        provider_env.clone(),
+                    )
+                    .map_err(|_| {
+                        "configuration child environment could not be installed".to_string()
+                    })?;
+                if revision != prepared.configuration.provider_env_revision {
+                    return Err("configuration child environment installation returned a different revision".to_string());
+                }
+            }
+            let installed = InstalledBoundaryConfiguration {
+                identity: prepared.identity.clone(),
+                transition_id: prepared.transition_id.clone(),
+                configuration: prepared.configuration.clone(),
+            };
+            activation.installed = Some(prepared.configuration.clone());
+            activation.provider_env = provider_env;
+            activation.committed = Some(installed.clone());
+            Ok(installed)
+        }
+
+        fn release_configuration(
+            &self,
+            installed: &InstalledBoundaryConfiguration,
+        ) -> Result<ActivatedBoundaryConfiguration, String> {
+            let mut activation = lock(&self.activation);
+            Self::require_configuration_identity(&activation, &installed.identity)?;
+            if activation.committed.as_ref() != Some(installed)
+                || activation.installed.as_ref() != Some(&installed.configuration)
+            {
+                return Err("configuration installation receipt is stale".to_string());
+            }
+            let released = ActivatedBoundaryConfiguration {
+                identity: installed.identity.clone(),
+                transition_id: installed.transition_id.clone(),
+                configuration: installed.configuration.clone(),
+            };
+            if activation.released.as_ref() == Some(&released) {
+                return Ok(released);
+            }
+            if !matches!(
+                *lock(&self.supervisor_connection),
+                SupervisorConnectionState::Connected(_)
+            ) {
+                return Err("configuration cannot release without confirmed control".to_string());
+            }
+            let state = lock(&self.state);
+            if let RuntimeState::Running(process) = &*state
+                && !process.boundary_runtime.resume()
+            {
+                return Err("held workload could not resume".to_string());
+            }
+            activation.released = Some(released.clone());
+            Ok(released)
+        }
+
+        fn abort_configuration(
+            &self,
+            prepared: &PreparedBoundaryConfiguration,
+        ) -> Result<(), String> {
+            let mut activation = lock(&self.activation);
+            Self::require_configuration_identity(&activation, &prepared.identity)?;
+            if activation.aborted.as_ref() == Some(prepared) {
+                return Ok(());
+            }
+            if !activation
+                .prepared
+                .as_ref()
+                .is_some_and(|pending| pending.receipt == *prepared)
+            {
+                return Err("configuration preparation receipt is stale".to_string());
+            }
+            self.hold_configuration(&mut activation)?;
+            activation.aborted = Some(prepared.clone());
+            Ok(())
+        }
+
+        fn quiesce_configuration(
+            &self,
+            identity: &ConfigurationActivationIdentity,
+        ) -> Result<(), String> {
+            let mut activation = lock(&self.activation);
+            Self::require_configuration_identity(&activation, identity)?;
+            self.hold_configuration(&mut activation)
+        }
+
         fn authorize_request(
             &self,
             principal: &SandboxProtocolPrincipal,
             request: &Request,
         ) -> Result<(), String> {
-            if matches!(request, Request::Attach { .. }) {
+            if matches!(
+                request,
+                Request::DescribeWorkload { .. } | Request::Attach { .. }
+            ) {
                 return Ok(());
             }
             if matches!(request, Request::Confirm) {
@@ -1559,32 +2047,33 @@ mod linux {
         fn commit_attach(
             &self,
             principal: &SandboxProtocolPrincipal,
-            supervisor_instance_id: openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId,
+            registration: &VerifiedControlRegistration,
         ) -> Result<(), String> {
-            if let Some(replaced) = self
+            let mut activation = lock(&self.activation);
+            let attached = self
                 .connections
-                .attach(principal, supervisor_instance_id)
-                .map_err(|error| error.to_string())?
-            {
+                .attach(principal, registration)
+                .map_err(|error| error.to_string())?;
+            let same_connection = matches!(*lock(&self.supervisor_connection), SupervisorConnectionState::Connected(id) if id == principal.connection_id());
+            if attached.replaced_registration {
+                self.hold_configuration(&mut activation)?;
+            } else if !same_connection {
+                self.hold_execution(&mut activation)?;
+            }
+            activation.identity = Some(registration.identity().clone());
+            drop(activation);
+            for replaced in attached.replaced_connections {
                 self.close_connection(replaced);
             }
             Ok(())
         }
 
         fn commit_confirm(&self, principal: &SandboxProtocolPrincipal) -> Result<(), String> {
+            let mut activation = lock(&self.activation);
             let replaced = self
                 .connections
                 .confirm(principal)
                 .map_err(|error| error.to_string())?;
-            let process = {
-                let state = lock(&self.state);
-                match &*state {
-                    RuntimeState::Running(process) => Some(process.clone()),
-                    RuntimeState::AwaitingAttach
-                    | RuntimeState::Bound(_)
-                    | RuntimeState::Ready(_) => None,
-                }
-            };
             {
                 let mut connection = lock(&self.supervisor_connection);
                 if matches!(
@@ -1594,16 +2083,10 @@ mod linux {
                     self.connections.mark_terminal();
                     return Err("sandbox session is terminating".to_string());
                 }
-                if matches!(*connection, SupervisorConnectionState::Frozen { .. })
-                    && let Some(process) = process
-                {
-                    if !process.boundary_runtime.resume() {
-                        return Err("frozen workload could not be resumed".to_string());
-                    }
-                    tracing::info!(
-                        connection_id = ?principal.connection_id(),
-                        "Sandbox Protocol connection recovered; workload resumed"
-                    );
+                if *connection != SupervisorConnectionState::Connected(principal.connection_id()) {
+                    // Connection recovery verifies isolation and cancels its
+                    // deadline. Only a new exact release may resume execution.
+                    self.hold_execution(&mut activation)?;
                 }
                 *connection = SupervisorConnectionState::Connected(principal.connection_id());
             }
@@ -1636,7 +2119,10 @@ mod linux {
             if !self.connections.disconnect(connection_id) {
                 return;
             }
-
+            let mut activation = lock(&self.activation);
+            if let Err(error) = self.hold_execution(&mut activation) {
+                tracing::error!(%error, "workload hold could not be confirmed after disconnect");
+            }
             let recovery_id = self.next_recovery_id.fetch_add(1, Ordering::Relaxed);
             let process = {
                 let state = lock(&self.state);
@@ -1660,6 +2146,7 @@ mod linux {
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
             }
+            drop(activation);
             tracing::warn!(
                 recovery_id,
                 "Sandbox Protocol connection lost; workload frozen pending authenticated recovery"
@@ -1730,6 +2217,8 @@ mod linux {
 
         async fn terminate_boundary(&self) -> Response {
             {
+                let mut activation = lock(&self.activation);
+                let _ = self.hold_configuration(&mut activation);
                 let mut connection = lock(&self.supervisor_connection);
                 if *connection == SupervisorConnectionState::Terminal {
                     return Response::BoundaryTerminated;
@@ -1791,6 +2280,8 @@ mod linux {
         }
 
         fn shutdown(&self) {
+            let mut activation = lock(&self.activation);
+            let _ = self.hold_configuration(&mut activation);
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -1812,7 +2303,13 @@ mod linux {
                     "control request payload digest mismatch",
                 );
             }
-            let replayable = envelope.request.is_replayable_mutation();
+            // Start/attach/confirm derive their response from current activation
+            // state. Their own idempotency must not replay obsolete receipts.
+            let replayable = envelope.request.is_replayable_mutation()
+                && !matches!(
+                    &envelope.request,
+                    Request::StartAgent { .. } | Request::Attach { .. } | Request::Confirm
+                );
             let mut replay_ledger = replayable.then(|| lock(&self.replay_ledger));
             if let Some(record) = replay_ledger
                 .as_ref()
@@ -1830,10 +2327,24 @@ mod linux {
             let request_id = envelope.request_id;
             let payload_digest = envelope.payload_digest;
             let response = match envelope.request {
+                Request::DescribeWorkload {
+                    supervisor_instance_id,
+                    resource_claims,
+                } => {
+                    if resource_claims == self.config.resource_claims {
+                        self.describe_workload(supervisor_instance_id)
+                    } else {
+                        guest_error(
+                            BoundaryErrorKind::Denied,
+                            "discovery resource claims do not match boundary",
+                        )
+                    }
+                }
                 Request::Attach {
                     supervisor_instance_id: _,
                     policy,
                     resource_claims,
+                    ..
                 } => {
                     if resource_claims == self.config.resource_claims {
                         self.attach(*policy)
@@ -1845,28 +2356,68 @@ mod linux {
                     }
                 }
                 Request::Confirm => self.confirm(),
+                Request::ConfigurationSnapshot { identity } => {
+                    let activation = lock(&self.activation);
+                    match Self::require_configuration_identity(&activation, &identity) {
+                        Ok(()) => Response::ConfigurationSnapshot {
+                            snapshot: BoundaryConfigurationSnapshot {
+                                identity,
+                                installed: activation.installed.clone(),
+                                active: activation.released.is_some(),
+                            },
+                        },
+                        Err(error) => guest_error(BoundaryErrorKind::Configuration, error),
+                    }
+                }
+                Request::PrepareConfiguration {
+                    identity,
+                    expected,
+                    configuration,
+                    provider_env,
+                } => self
+                    .prepare_configuration(identity, expected, configuration, provider_env)
+                    .map_or_else(
+                        |error| guest_error(BoundaryErrorKind::Configuration, error),
+                        |prepared| Response::ConfigurationPrepared {
+                            prepared: Box::new(prepared),
+                        },
+                    ),
+                Request::CommitConfiguration { prepared } => {
+                    self.commit_configuration(&prepared).map_or_else(
+                        |error| guest_error(BoundaryErrorKind::Configuration, error),
+                        |installed| Response::ConfigurationCommitted {
+                            installed: Box::new(installed),
+                        },
+                    )
+                }
+                Request::ReleaseConfiguration { installed } => {
+                    self.release_configuration(&installed).map_or_else(
+                        |error| guest_error(BoundaryErrorKind::Configuration, error),
+                        |activated| Response::ConfigurationReleased {
+                            activated: Box::new(activated),
+                        },
+                    )
+                }
+                Request::AbortConfiguration { prepared } => {
+                    self.abort_configuration(&prepared).map_or_else(
+                        |error| guest_error(BoundaryErrorKind::Configuration, error),
+                        |()| Response::ConfigurationAborted,
+                    )
+                }
+                Request::QuiesceConfiguration { identity } => {
+                    self.quiesce_configuration(&identity).map_or_else(
+                        |error| guest_error(BoundaryErrorKind::Configuration, error),
+                        |()| Response::ConfigurationQuiesced,
+                    )
+                }
                 Request::StartAgent {
                     sandbox_id,
                     spec,
                     policy,
                     ca_cert,
                     ca_bundle,
-                    provider_env_revision,
-                    provider_env,
-                } => self.start_agent(
-                    sandbox_id,
-                    spec,
-                    *policy,
-                    ca_cert,
-                    ca_bundle,
-                    provider_env_revision,
-                    provider_env,
-                ),
-                Request::UpdateProviderEnvironment {
-                    expected_revision,
-                    revision,
-                    provider_env,
-                } => self.update_provider_environment(expected_revision, revision, provider_env),
+                    activation,
+                } => self.start_agent(sandbox_id, spec, *policy, ca_cert, ca_bundle, activation),
                 Request::Wait { process_id } => self.wait(&process_id),
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
@@ -1910,7 +2461,11 @@ mod linux {
             request_id: &str,
             payload_digest: &str,
             spec: ExecSpecWire,
+            receipt: &ActivatedBoundaryConfiguration,
         ) -> Result<StartedExec, Response> {
+            let activation = lock(&self.activation);
+            Self::require_released(&activation, receipt)
+                .map_err(|error| guest_error(BoundaryErrorKind::Configuration, error))?;
             let executor = {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {
@@ -2081,6 +2636,10 @@ mod linux {
             &self,
             target: LoopbackTarget,
         ) -> Result<openshell_isolation_interface::contract::BoundaryDuplexStream, String> {
+            let activation = lock(&self.activation);
+            if activation.released.is_none() {
+                return Err("boundary configuration is held".to_string());
+            }
             let loopback_connector = {
                 let state = lock(&self.state);
                 let RuntimeState::Running(process) = &*state else {
@@ -2094,6 +2653,9 @@ mod linux {
         }
 
         fn network_accept_context(&self) -> Result<NetworkBroker, String> {
+            if lock(&self.activation).released.is_none() {
+                return Err("boundary configuration is held".to_string());
+            }
             self.network_broker
                 .confirm_healthy()
                 .map_err(|error| format!("sandbox network broker unavailable: {error}"))?;
@@ -2134,6 +2696,20 @@ mod linux {
         }
 
         fn attach(&self, policy: SandboxPolicyWire) -> Response {
+            let selected_policy = policy.clone().into();
+            if let Err(error) = validate_selected_process_identity(
+                &selected_policy,
+                self.config.workload_identity.uid,
+                self.config.workload_identity.gid,
+            ) {
+                return guest_error(BoundaryErrorKind::Configuration, error.to_string());
+            }
+            // Preparation opens workload-local policy paths without enforcing
+            // restrictions on the boundary process or launching any child.
+            if let Err(error) = crate::process::prepare_child_sandbox(&selected_policy, None, &[]) {
+                return guest_error(BoundaryErrorKind::Configuration, error.to_string());
+            }
+            let mut activation = lock(&self.activation);
             let mut state = lock(&self.state);
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
@@ -2145,17 +2721,39 @@ mod linux {
                     *state = RuntimeState::Bound(prepared);
                     true
                 }
-                RuntimeState::Bound(_) | RuntimeState::Ready(_) | RuntimeState::Running(_) => {
-                    // Idempotent retry of the same attach; a different policy
-                    // must not be silently coalesced onto the bound boundary.
+                RuntimeState::Bound(_) | RuntimeState::Ready(_) => {
+                    let mut attached_policy = lock(&self.attached_policy);
+                    if attached_policy.as_ref() == Some(&policy) {
+                        true
+                    } else if activation.released.is_none() && lock(&self.started_agent).is_none() {
+                        // A superseded startup candidate is repairable only while
+                        // no workload has launched and execution remains held.
+                        // Discard its transaction before accepting different static
+                        // restrictions; the caller must prepare a new full tuple.
+                        activation.prepared = None;
+                        activation.committed = None;
+                        activation.aborted = None;
+                        self.activation_epoch
+                            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                        *attached_policy = Some(policy);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                RuntimeState::Running(_) => {
+                    // Static launch restrictions remain immutable even if the
+                    // original main process exits or control is replaced.
                     lock(&self.attached_policy).as_ref() == Some(&policy)
                 }
             };
             drop(state);
+            drop(activation);
             if accepted {
-                Response::Attached {
-                    snapshot: self.session_snapshot(),
-                }
+                self.session_snapshot().map_or_else(
+                    |error| guest_error(BoundaryErrorKind::Configuration, error),
+                    |snapshot| Response::Attached { snapshot },
+                )
             } else {
                 guest_error(
                     BoundaryErrorKind::Denied,
@@ -2164,7 +2762,8 @@ mod linux {
             }
         }
 
-        fn session_snapshot(&self) -> SessionSnapshotWire {
+        fn session_snapshot(&self) -> Result<SessionSnapshotWire, String> {
+            let configuration = self.configuration_snapshot()?;
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -2207,10 +2806,11 @@ mod linux {
                 }
             }));
             processes.sort_by(|left, right| left.process_id.cmp(&right.process_id));
-            SessionSnapshotWire {
+            Ok(SessionSnapshotWire {
                 generation: self.config.generation.clone(),
+                configuration,
                 processes,
-            }
+            })
         }
 
         fn confirm(&self) -> Response {
@@ -2311,9 +2911,20 @@ mod linux {
             policy: SandboxPolicyWire,
             ca_cert: Option<Vec<u8>>,
             ca_bundle: Option<Vec<u8>>,
-            provider_env_revision: u64,
-            provider_env: std::collections::HashMap<String, String>,
+            receipt: ActivatedBoundaryConfiguration,
         ) -> Response {
+            let activation = lock(&self.activation);
+            if let Err(error) = Self::require_released(&activation, &receipt) {
+                return guest_error(BoundaryErrorKind::Configuration, error);
+            }
+            let provider_env_revision = receipt.configuration.provider_env_revision;
+            let provider_env = activation.provider_env.clone();
+            if lock(&self.attached_policy).as_ref() != Some(&policy) {
+                return guest_error(
+                    BoundaryErrorKind::Configuration,
+                    "launch policy differs from the attached policy",
+                );
+            }
             let spec = match resolve_agent_spec(spec) {
                 Ok(spec) => spec,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
@@ -2325,8 +2936,6 @@ mod linux {
                 policy: policy.clone(),
                 ca_cert: ca_cert.clone(),
                 ca_bundle: ca_bundle.clone(),
-                provider_env_revision,
-                provider_env: provider_env.clone(),
             };
             if let RuntimeState::Running(process) = &*state {
                 return if lock(&self.started_agent)
@@ -2336,6 +2945,7 @@ mod linux {
                     Response::Started {
                         process_id: process.process_id(),
                         provider_env_revision: process.provider_credentials.snapshot().revision,
+                        activation: receipt,
                     }
                 } else {
                     guest_error(
@@ -2360,15 +2970,29 @@ mod linux {
                 .resource_claims
                 .get(GPU_RESOURCE_CLAIM)
                 .is_some_and(|value| value == "true");
-            if enrich_gpu_filesystem_paths(&mut policy, gpu_requested) {
-                openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(openshell_ocsf::SeverityId::Informational)
-                        .status(openshell_ocsf::StatusId::Success)
-                        .state(openshell_ocsf::StateId::Enabled, "enriched")
-                        .message("Added workload-local GPU filesystem paths".to_string())
-                        .build()
-                );
+            // GPU paths are part of the discovered and admitted filesystem
+            // baseline. Device changes cannot expand it after acceptance.
+            match enrich_gpu_filesystem_paths(
+                &mut policy,
+                gpu_requested,
+                Path::exists,
+                gpu_device_names,
+            ) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return guest_error(
+                        BoundaryErrorKind::Configuration,
+                        "GPU filesystem paths changed after configuration admission",
+                    );
+                }
+                Err(error) => return guest_error(BoundaryErrorKind::Configuration, error),
+            }
+            if let Err(error) = validate_selected_process_identity(
+                &policy,
+                self.config.workload_identity.uid,
+                self.config.workload_identity.gid,
+            ) {
+                return guest_error(BoundaryErrorKind::Configuration, error.to_string());
             }
             let driver_identity = DriverIdentity::Resolved {
                 uid: self.config.workload_identity.uid,
@@ -2400,33 +3024,8 @@ mod linux {
             Response::Started {
                 process_id,
                 provider_env_revision,
+                activation: receipt,
             }
-        }
-
-        fn update_provider_environment(
-            &self,
-            expected_revision: u64,
-            revision: u64,
-            provider_env: std::collections::HashMap<String, String>,
-        ) -> Response {
-            let process = {
-                let state = lock(&self.state);
-                let RuntimeState::Running(process) = &*state else {
-                    return guest_error(
-                        BoundaryErrorKind::Invalid,
-                        "agent process must be running before provider environment updates",
-                    );
-                };
-                process.clone()
-            };
-            let revision = match process
-                .provider_credentials
-                .compare_and_install_child_env_snapshot(expected_revision, revision, provider_env)
-            {
-                Ok(revision) => revision,
-                Err(error) => return guest_error(BoundaryErrorKind::Process, error.to_string()),
-            };
-            Response::ProviderEnvironmentUpdated { revision }
         }
 
         fn wait(&self, process_id: &str) -> Response {
@@ -3461,6 +4060,9 @@ mod linux {
         };
         use rcgen::{KeyPair, PKCS_ED25519};
 
+        include!("boundary_activation_tests.rs");
+        include!("boundary_transport_activation_tests.rs");
+
         #[test]
         fn exec_tombstones_outlive_retained_handles_and_fail_closed_at_capacity() {
             let mut requests = std::collections::HashSet::new();
@@ -3520,13 +4122,12 @@ mod linux {
                 .expect("test session ID")
         }
 
-        fn test_supervisor_instance_id()
-        -> openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId {
-            openshell_sandbox_backend::boundary_protocol::SupervisorInstanceId::new()
+        fn test_supervisor_instance_id() -> SupervisorInstanceId {
+            SupervisorInstanceId::new()
         }
 
         fn test_verification_key() -> GatewayVerificationKey {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let key = KeyPair::from_pem(test_private_key()).expect("parse test gateway key");
             GatewayVerificationKey {
                 key_id: "test-key".to_string(),
                 public_key_pem: key.public_key_pem(),
@@ -3534,7 +4135,7 @@ mod linux {
         }
 
         fn test_auth_material(sandbox_id: &str) -> (GatewayVerificationKey, String) {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate gateway key");
+            let key = KeyPair::from_pem(test_private_key()).expect("parse test gateway key");
             let verification_key = GatewayVerificationKey {
                 key_id: "test-key".to_string(),
                 public_key_pem: key.public_key_pem(),
@@ -3563,6 +4164,782 @@ mod linux {
                 .expose_secret()
                 .to_string();
             (verification_key, token)
+        }
+
+        fn test_private_key() -> &'static str {
+            static KEY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+                KeyPair::generate_for(&PKCS_ED25519)
+                    .expect("generate test key")
+                    .serialize_pem()
+            });
+            &KEY
+        }
+
+        fn test_registration_grant(
+            runtime: &BoundaryRuntime,
+            supervisor: SupervisorInstanceId,
+            revision: u64,
+        ) -> String {
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                test_private_key().as_bytes(),
+                "test-key",
+                "test-gateway",
+                DEFAULT_SESSION_TOKEN_TTL,
+                Arc::new(SystemJwtClock),
+            )
+            .expect("test registration issuer");
+            issuer
+                .mint_control_registration(&openshell_core::jwt::ControlRegistrationGrant {
+                    runtime_identity: SandboxRuntimeIdentity {
+                        sandbox_id: SandboxId::parse(runtime.config.boundary_id.clone()).unwrap(),
+                        runtime_generation:
+                            openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                                runtime.config.generation.clone(),
+                            )
+                            .unwrap(),
+                        auth_epoch: runtime.config.auth_epoch,
+                    },
+                    supervisor_instance_id: uuid::Uuid::parse_str(&supervisor.to_string()).unwrap(),
+                    boundary_session_id: uuid::Uuid::parse_str(
+                        &runtime.config.session_id.to_string(),
+                    )
+                    .unwrap(),
+                    boundary_instance_id: uuid::Uuid::parse_str(&runtime.boundary_instance_id)
+                        .unwrap(),
+                    registration_revision: revision,
+                })
+                .expect("signed registration")
+                .token
+                .expose_secret()
+                .to_string()
+        }
+
+        fn test_registration(
+            runtime: &BoundaryRuntime,
+            supervisor: SupervisorInstanceId,
+            revision: u64,
+        ) -> VerifiedControlRegistration {
+            runtime
+                .authenticator
+                .verify_control_registration(
+                    &test_registration_grant(runtime, supervisor, revision),
+                    &runtime.activation_identity(supervisor, revision),
+                )
+                .expect("verified registration")
+        }
+
+        fn register_test_boundary(runtime: &BoundaryRuntime) -> SandboxProtocolPrincipal {
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                test_private_key().as_bytes(),
+                "test-key",
+                "test-gateway",
+                DEFAULT_SESSION_TOKEN_TTL,
+                Arc::new(SystemJwtClock),
+            )
+            .unwrap();
+            let token = issuer
+                .mint_pair(&SandboxRuntimeIdentity {
+                    sandbox_id: SandboxId::parse(runtime.config.boundary_id.clone()).unwrap(),
+                    runtime_generation:
+                        openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                            runtime.config.generation.clone(),
+                        )
+                        .unwrap(),
+                    auth_epoch: runtime.config.auth_epoch,
+                })
+                .unwrap()
+                .sandbox
+                .token
+                .expose_secret()
+                .to_string();
+            let principal = runtime
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .unwrap();
+            let registration = test_registration(runtime, test_supervisor_instance_id(), 1);
+            runtime.commit_attach(&principal, &registration).unwrap();
+            runtime.commit_confirm(&principal).unwrap();
+            principal
+        }
+
+        fn activate_test_configuration(
+            runtime: &BoundaryRuntime,
+            revision: u64,
+            provider_env: std::collections::HashMap<String, String>,
+        ) -> ActivatedBoundaryConfiguration {
+            let snapshot = runtime.configuration_snapshot().unwrap();
+            let configuration = ConfigurationRevision {
+                config_revision: snapshot
+                    .installed
+                    .as_ref()
+                    .map_or(1, |previous| previous.config_revision + 1),
+                policy_version: 1,
+                policy_hash: "test-policy-hash".to_string(),
+                policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
+                provider_env_revision: revision,
+            };
+            let prepared = runtime
+                .prepare_configuration(
+                    snapshot.identity,
+                    snapshot.installed,
+                    configuration,
+                    provider_env,
+                )
+                .unwrap();
+            let installed = runtime.commit_configuration(&prepared).unwrap();
+            runtime.release_configuration(&installed).unwrap()
+        }
+
+        fn test_active_receipt(runtime: &BoundaryRuntime) -> ActivatedBoundaryConfiguration {
+            lock(&runtime.activation)
+                .released
+                .clone()
+                .expect("active test configuration")
+        }
+
+        fn isolated_activation_test(name: &str) -> bool {
+            const MARKER: &str = "OPENSHELL_TEST_CONFIGURATION_ACTIVATION";
+            if std::env::var(MARKER).ok().as_deref() == Some(name) {
+                return false;
+            }
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("boundary_server::linux::tests::{name}"),
+                    "--nocapture",
+                ])
+                .env(MARKER, name)
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated activation test failed: {name}");
+            true
+        }
+
+        struct RunningActivationFixture {
+            boundary: Arc<BoundaryRuntime>,
+            runtime: tokio::runtime::Runtime,
+            principal: SandboxProtocolPrincipal,
+            directory: tempfile::TempDir,
+            policy: SandboxPolicyWire,
+            spec: AgentSpecWire,
+            process_id: String,
+        }
+
+        impl RunningActivationFixture {
+            fn new() -> Self {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let directory = tempfile::tempdir().unwrap();
+                let boundary = {
+                    let _entered = runtime.enter();
+                    availability_test_runtime().0
+                };
+                let principal = register_test_boundary(&boundary);
+                // The shell and its libraries need the same discovered runtime
+                // paths used during configuration admission. A workdir-only
+                // ruleset would prevent the fixture's executable from starting.
+                let policy = SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                    version: 1,
+                    filesystem: openshell_core::policy::FilesystemPolicy {
+                        read_only: boundary
+                            .filesystem_baseline
+                            .read_only
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .collect(),
+                        read_write: boundary
+                            .filesystem_baseline
+                            .read_write
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .collect(),
+                        include_workdir: true,
+                    },
+                    network: openshell_core::policy::NetworkPolicy::default(),
+                    landlock: openshell_core::policy::LandlockPolicy::default(),
+                    process: openshell_core::policy::ProcessPolicy::default(),
+                });
+                assert!(matches!(
+                    boundary.attach(policy.clone()),
+                    Response::Attached { .. }
+                ));
+                assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+                let receipt = activate_test_configuration(
+                    &boundary,
+                    4,
+                    std::collections::HashMap::from([(
+                        "CONFIGURATION_TEST_TOKEN".to_string(),
+                        "credential-a".to_string(),
+                    )]),
+                );
+                let spec = AgentSpecWire {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "printf '%s\\n' \"$$\" >> \"$1/starts\"; while :; do printf 'beat\\n' >> \"$1/heartbeat\"; sleep 0.02; done".to_string(), "activation-workload".to_string(), directory.path().to_string_lossy().into_owned()],
+                    workdir: Some(directory.path().to_string_lossy().into_owned()),
+                    timeout_secs: 30,
+                    interactive: false,
+                };
+                let response = boundary.start_agent(
+                    boundary.config.boundary_id.clone(),
+                    spec.clone(),
+                    policy.clone(),
+                    None,
+                    None,
+                    receipt,
+                );
+                let Response::Started { process_id, .. } = response else {
+                    panic!("configuration workload did not start: {response:?}");
+                };
+                let fixture = Self {
+                    boundary,
+                    runtime,
+                    principal,
+                    directory,
+                    policy,
+                    spec,
+                    process_id,
+                };
+                fixture.wait_for_heartbeat(0);
+                assert_eq!(fixture.start_count(), 1);
+                fixture
+            }
+
+            fn heartbeat(&self) -> usize {
+                std::fs::read_to_string(self.directory.path().join("heartbeat"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            }
+
+            fn start_count(&self) -> usize {
+                std::fs::read_to_string(self.directory.path().join("starts"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            }
+
+            fn workload_pid(&self) -> u32 {
+                std::fs::read_to_string(self.directory.path().join("starts"))
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            }
+
+            fn wait_for_heartbeat(&self, after: usize) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while self.heartbeat() <= after && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    self.heartbeat() > after,
+                    "workload heartbeat did not advance"
+                );
+            }
+
+            fn assert_held(&self, old_receipt: &ActivatedBoundaryConfiguration) {
+                let before = self.heartbeat();
+                std::thread::sleep(Duration::from_millis(100));
+                assert_eq!(
+                    self.heartbeat(),
+                    before,
+                    "held workload executed instructions"
+                );
+                assert!(!self.boundary.configuration_snapshot().unwrap().active);
+                let request = RequestEnvelope::new(Request::Exec {
+                    spec: ExecSpecWire {
+                        program: "/bin/true".to_string(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        workdir: None,
+                        pty: false,
+                    },
+                    activation: old_receipt.clone(),
+                })
+                .unwrap();
+                let Request::Exec { spec, activation } = request.request else {
+                    unreachable!()
+                };
+                assert!(
+                    self.boundary
+                        .start_exec(
+                            &request.request_id,
+                            &request.payload_digest,
+                            spec,
+                            &activation
+                        )
+                        .is_err()
+                );
+                assert_eq!(self.start_count(), 1);
+            }
+
+            fn prepare_next(&self) -> PreparedBoundaryConfiguration {
+                let snapshot = self.boundary.configuration_snapshot().unwrap();
+                let mut configuration = snapshot.installed.clone().unwrap();
+                configuration.config_revision += 1;
+                configuration.provider_env_revision = 7;
+                self.boundary
+                    .prepare_configuration(
+                        snapshot.identity,
+                        snapshot.installed,
+                        configuration,
+                        std::collections::HashMap::from([(
+                            "CONFIGURATION_TEST_TOKEN".to_string(),
+                            "credential-b".to_string(),
+                        )]),
+                    )
+                    .unwrap()
+            }
+        }
+
+        impl Drop for RunningActivationFixture {
+            fn drop(&mut self) {
+                let response = self.runtime.block_on(self.boundary.terminate_boundary());
+                assert!(
+                    matches!(response, Response::BoundaryTerminated),
+                    "workload cleanup failed: {response:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn configuration_activation_holds_real_workload_until_release() {
+            if isolated_activation_test(
+                "configuration_activation_holds_real_workload_until_release",
+            ) {
+                return;
+            }
+            let fixture = RunningActivationFixture::new();
+            let old = test_active_receipt(&fixture.boundary);
+            let pid = fixture.workload_pid();
+            let prepared = fixture.prepare_next();
+            fixture.assert_held(&old);
+            assert_eq!(
+                fixture
+                    .boundary
+                    .running_process(&fixture.process_id)
+                    .unwrap()
+                    .provider_credentials
+                    .snapshot()
+                    .revision,
+                4
+            );
+            // Repeating a preparation after a lost response must retain its token.
+            assert_eq!(
+                fixture
+                    .boundary
+                    .prepare_configuration(
+                        prepared.identity.clone(),
+                        prepared.expected.clone(),
+                        prepared.configuration.clone(),
+                        std::collections::HashMap::from([(
+                            "CONFIGURATION_TEST_TOKEN".to_string(),
+                            "credential-b".to_string()
+                        ),])
+                    )
+                    .unwrap(),
+                prepared
+            );
+            let installed = fixture.boundary.commit_configuration(&prepared).unwrap();
+            fixture.assert_held(&old);
+            assert_eq!(
+                fixture
+                    .boundary
+                    .running_process(&fixture.process_id)
+                    .unwrap()
+                    .provider_credentials
+                    .snapshot()
+                    .revision,
+                7
+            );
+            assert_eq!(
+                fixture.boundary.commit_configuration(&prepared).unwrap(),
+                installed,
+                "lost commit response must replay exactly"
+            );
+            let before = fixture.heartbeat();
+            let released = fixture.boundary.release_configuration(&installed).unwrap();
+            fixture.wait_for_heartbeat(before);
+            assert_eq!(
+                fixture.boundary.release_configuration(&installed).unwrap(),
+                released,
+                "lost release response must replay exactly"
+            );
+            let Response::Started {
+                process_id,
+                activation,
+                ..
+            } = fixture.boundary.start_agent(
+                fixture.boundary.config.boundary_id.clone(),
+                fixture.spec.clone(),
+                fixture.policy.clone(),
+                None,
+                None,
+                released.clone(),
+            )
+            else {
+                panic!("immutable launch replay rejected");
+            };
+            assert_eq!(process_id, fixture.process_id);
+            assert_eq!(activation, released);
+            assert_eq!(fixture.workload_pid(), pid);
+            assert_eq!(fixture.start_count(), 1);
+            println!(
+                "configuration_activation_observation pid={pid} starts=1 preparation_held=true installation_held=true release_resumed=true commit_retry_exact=true release_retry_exact=true"
+            );
+        }
+
+        #[test]
+        fn configuration_activation_confirm_does_not_resume_or_accept_stale_registration() {
+            if isolated_activation_test(
+                "configuration_activation_confirm_does_not_resume_or_accept_stale_registration",
+            ) {
+                return;
+            }
+            let fixture = RunningActivationFixture::new();
+            let old = test_active_receipt(&fixture.boundary);
+            let old_supervisor = old
+                .identity
+                .supervisor_instance_id
+                .parse::<SupervisorInstanceId>()
+                .unwrap();
+            let old_registration = test_registration(&fixture.boundary, old_supervisor, 1);
+            let pid = fixture.workload_pid();
+            fixture
+                .boundary
+                .transport_disconnected(fixture.principal.connection_id());
+            fixture.assert_held(&old);
+            let (_, token) = test_auth_material("availability");
+            let replacement = fixture
+                .boundary
+                .authenticate_request(
+                    SandboxConnectionId::new(),
+                    bearer_request((), &token).metadata(),
+                )
+                .unwrap();
+            let registration =
+                test_registration(&fixture.boundary, test_supervisor_instance_id(), 2);
+            fixture
+                .boundary
+                .commit_attach(&replacement, &registration)
+                .unwrap();
+            assert!(matches!(
+                fixture.boundary.attach(fixture.policy.clone()),
+                Response::Attached { .. }
+            ));
+            assert!(matches!(
+                fixture.boundary.confirm(),
+                Response::Confirmed { .. }
+            ));
+            fixture.boundary.commit_confirm(&replacement).unwrap();
+            fixture.assert_held(&old);
+            assert!(
+                fixture
+                    .boundary
+                    .commit_attach(&fixture.principal, &old_registration)
+                    .is_err()
+            );
+            let stale = InstalledBoundaryConfiguration {
+                identity: old.identity.clone(),
+                configuration: old.configuration.clone(),
+                transition_id: old.transition_id.clone(),
+            };
+            assert!(fixture.boundary.release_configuration(&stale).is_err());
+            let before = fixture.heartbeat();
+            let snapshot = fixture.boundary.configuration_snapshot().unwrap();
+            let current_environment = lock(&fixture.boundary.activation).provider_env.clone();
+            let prepared = fixture
+                .boundary
+                .prepare_configuration(
+                    snapshot.identity,
+                    snapshot.installed.clone(),
+                    snapshot.installed.unwrap(),
+                    current_environment,
+                )
+                .unwrap();
+            let installed = fixture.boundary.commit_configuration(&prepared).unwrap();
+            fixture.assert_held(&old);
+            fixture.boundary.release_configuration(&installed).unwrap();
+            fixture.wait_for_heartbeat(before);
+            assert_eq!(fixture.workload_pid(), pid);
+            assert_eq!(fixture.start_count(), 1);
+            println!(
+                "configuration_activation_observation pid={pid} starts=1 confirm_held=true stale_registration_rejected=true stale_activation_rejected=true fresh_release_resumed=true"
+            );
+        }
+
+        #[test]
+        fn configuration_activation_fresh_boundary_rejects_old_receipts() {
+            if isolated_activation_test(
+                "configuration_activation_fresh_boundary_rejects_old_receipts",
+            ) {
+                return;
+            }
+            let fixture = RunningActivationFixture::new();
+            let receipt = test_active_receipt(&fixture.boundary);
+            let replacement = {
+                let _entered = fixture.runtime.enter();
+                availability_test_runtime().0
+            };
+            register_test_boundary(&replacement);
+            assert_ne!(
+                replacement.boundary_instance_id,
+                fixture.boundary.boundary_instance_id
+            );
+            assert!(
+                replacement
+                    .prepare_configuration(
+                        receipt.identity.clone(),
+                        None,
+                        receipt.configuration.clone(),
+                        std::collections::HashMap::new()
+                    )
+                    .is_err()
+            );
+            assert!(
+                replacement
+                    .release_configuration(&InstalledBoundaryConfiguration {
+                        identity: receipt.identity.clone(),
+                        transition_id: receipt.transition_id.clone(),
+                        configuration: receipt.configuration.clone(),
+                    })
+                    .is_err()
+            );
+            assert!(matches!(
+                replacement.start_agent(
+                    replacement.config.boundary_id.clone(),
+                    fixture.spec.clone(),
+                    fixture.policy.clone(),
+                    None,
+                    None,
+                    receipt
+                ),
+                Response::Error {
+                    kind: BoundaryErrorKind::Configuration,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                *lock(&replacement.state),
+                RuntimeState::AwaitingAttach
+            ));
+            assert_eq!(fixture.start_count(), 1);
+            println!(
+                "configuration_activation_observation starts=1 replacement_starts=0 stale_incarnation_rejected=true"
+            );
+        }
+
+        #[test]
+        fn configuration_activation_same_registration_recovery_preserves_inflight_transaction() {
+            if isolated_activation_test(
+                "configuration_activation_same_registration_recovery_preserves_inflight_transaction",
+            ) {
+                return;
+            }
+            let fixture = RunningActivationFixture::new();
+            let old = test_active_receipt(&fixture.boundary);
+            let supervisor = old
+                .identity
+                .supervisor_instance_id
+                .parse::<SupervisorInstanceId>()
+                .unwrap();
+            let registration = test_registration(
+                &fixture.boundary,
+                supervisor,
+                old.identity.registration_revision,
+            );
+            let reconnect = |connection_id| {
+                fixture.boundary.transport_disconnected(connection_id);
+                let (_, token) = test_auth_material("availability");
+                let principal = fixture
+                    .boundary
+                    .authenticate_request(
+                        SandboxConnectionId::new(),
+                        bearer_request((), &token).metadata(),
+                    )
+                    .unwrap();
+                fixture
+                    .boundary
+                    .commit_attach(&principal, &registration)
+                    .unwrap();
+                assert!(matches!(
+                    fixture.boundary.attach(fixture.policy.clone()),
+                    Response::Attached { .. }
+                ));
+                assert!(matches!(
+                    fixture.boundary.confirm(),
+                    Response::Confirmed { .. }
+                ));
+                fixture.boundary.commit_confirm(&principal).unwrap();
+                principal
+            };
+            let prepared = fixture.prepare_next();
+            let connection = reconnect(fixture.principal.connection_id());
+            fixture.assert_held(&old);
+            let installed = fixture.boundary.commit_configuration(&prepared).unwrap();
+            let connection = reconnect(connection.connection_id());
+            fixture.assert_held(&old);
+            assert_eq!(
+                fixture.boundary.commit_configuration(&prepared).unwrap(),
+                installed
+            );
+            let before = fixture.heartbeat();
+            let released = fixture.boundary.release_configuration(&installed).unwrap();
+            fixture.wait_for_heartbeat(before);
+            let connection = reconnect(connection.connection_id());
+            fixture.assert_held(&released);
+            let before = fixture.heartbeat();
+            assert_eq!(
+                fixture.boundary.release_configuration(&installed).unwrap(),
+                released
+            );
+            fixture.wait_for_heartbeat(before);
+
+            // Explicit quiesce cancels the transaction, unlike transport loss.
+            // Reconnecting afterward cannot revive a delayed old commit/release.
+            fixture
+                .boundary
+                .quiesce_configuration(&released.identity)
+                .unwrap();
+            let _connection = reconnect(connection.connection_id());
+            fixture.assert_held(&released);
+            assert!(fixture.boundary.commit_configuration(&prepared).is_err());
+            assert!(fixture.boundary.release_configuration(&installed).is_err());
+            fixture.assert_held(&released);
+            assert_eq!(fixture.start_count(), 1);
+        }
+
+        #[test]
+        fn configuration_activation_startup_policy_repair_invalidates_prior_transition() {
+            if isolated_activation_test(
+                "configuration_activation_startup_policy_repair_invalidates_prior_transition",
+            ) {
+                return;
+            }
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let boundary = {
+                let _entered = process_runtime.enter();
+                availability_test_runtime().0
+            };
+            register_test_boundary(&boundary);
+            let original = SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            });
+            assert!(matches!(
+                boundary.attach(original.clone()),
+                Response::Attached { .. }
+            ));
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            let snapshot = boundary.configuration_snapshot().unwrap();
+            let configuration = ConfigurationRevision {
+                config_revision: 1,
+                policy_version: 1,
+                policy_hash: "startup-a".to_string(),
+                policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
+                provider_env_revision: 4,
+            };
+            let prepared = boundary
+                .prepare_configuration(
+                    snapshot.identity,
+                    None,
+                    configuration.clone(),
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+            let installed = boundary.commit_configuration(&prepared).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let mut replacement = original;
+            replacement.read_write.push(directory.path().to_path_buf());
+            assert!(matches!(
+                boundary.attach(replacement.clone()),
+                Response::Attached { .. }
+            ));
+            assert_eq!(lock(&boundary.attached_policy).as_ref(), Some(&replacement));
+            assert!(boundary.commit_configuration(&prepared).is_err());
+            assert!(boundary.release_configuration(&installed).is_err());
+            assert!(lock(&boundary.started_agent).is_none());
+            let mut invalid = replacement.clone();
+            invalid.run_as_user = Some("0".to_string());
+            assert!(matches!(
+                boundary.attach(invalid),
+                Response::Error {
+                    kind: BoundaryErrorKind::Configuration,
+                    ..
+                }
+            ));
+            assert_eq!(lock(&boundary.attached_policy).as_ref(), Some(&replacement));
+
+            let snapshot = boundary.configuration_snapshot().unwrap();
+            let mut candidate = configuration;
+            candidate.config_revision += 1;
+            candidate.policy_hash = "startup-b".to_string();
+            let prepared = boundary
+                .prepare_configuration(
+                    snapshot.identity,
+                    snapshot.installed,
+                    candidate,
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+            let installed = boundary.commit_configuration(&prepared).unwrap();
+            boundary.release_configuration(&installed).unwrap();
+            let mut changed_while_released = replacement.clone();
+            changed_while_released.read_write.clear();
+            assert!(matches!(
+                boundary.attach(changed_while_released),
+                Response::Error {
+                    kind: BoundaryErrorKind::Denied,
+                    ..
+                }
+            ));
+            assert_eq!(lock(&boundary.attached_policy).as_ref(), Some(&replacement));
+        }
+
+        #[test]
+        fn configuration_activation_image_discovery_preserves_missing_and_invalid_input() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("policy.yaml");
+            assert_eq!(discover_image_policy(&path), ImagePolicyDiscovery::Missing);
+            std::fs::write(&path, "network_policies: [").unwrap();
+            assert!(
+                matches!(discover_image_policy(&path), ImagePolicyDiscovery::Present { yaml } if yaml == "network_policies: [")
+            );
+            std::fs::write(&path, [0xff]).unwrap();
+            assert!(matches!(
+                discover_image_policy(&path),
+                ImagePolicyDiscovery::Invalid { .. }
+            ));
+            let oversized_len = usize::try_from(MAX_IMAGE_POLICY_BYTES).unwrap() + 1;
+            std::fs::write(&path, vec![b'x'; oversized_len]).unwrap();
+            assert!(matches!(
+                discover_image_policy(&path),
+                ImagePolicyDiscovery::Invalid { .. }
+            ));
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(directory.path().join("missing-target"), &path).unwrap();
+            assert!(matches!(
+                discover_image_policy(&path),
+                ImagePolicyDiscovery::Invalid { .. }
+            ));
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert!(matches!(
+                discover_image_policy(&path),
+                ImagePolicyDiscovery::Invalid { .. }
+            ));
         }
 
         fn bearer_request<T>(message: T, token: &str) -> tonic::Request<T> {
@@ -3725,6 +5102,165 @@ mod linux {
             assert!(!supplementary_groups_match(&[44, 992], &[1001], true));
         }
 
+        fn admitted_gpu_policy(
+            baseline: BoundaryFilesystemBaseline,
+        ) -> openshell_core::policy::SandboxPolicy {
+            openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy {
+                    read_only: baseline.read_only.into_iter().map(Into::into).collect(),
+                    read_write: baseline.read_write.into_iter().map(Into::into).collect(),
+                    include_workdir: false,
+                },
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            }
+        }
+
+        #[test]
+        fn gpu_inventory_unchanged_long_numeric_name_does_not_expand_launch_policy() {
+            let names = || {
+                Ok(["nvidiactl", "nvidia0", "nvidia12345678901"]
+                    .map(|name| Ok(std::ffi::OsString::from(name))))
+            };
+            let baseline = discover_gpu_filesystem_baseline(true, |_| true, names).unwrap();
+            assert!(baseline.read_write.contains(&"/dev/nvidia0".to_string()));
+            assert!(
+                !baseline
+                    .read_write
+                    .contains(&"/dev/nvidia12345678901".to_string())
+            );
+            let mut policy = admitted_gpu_policy(baseline);
+            assert!(
+                !enrich_gpu_filesystem_paths(&mut policy, true, |_| true, names).unwrap(),
+                "unchanged GPU inventory must not expand the admitted policy"
+            );
+        }
+
+        #[test]
+        fn gpu_inventory_full_directory_is_independent_of_enumeration_order() {
+            let names = (0..MAX_GPU_DEVICE_ENTRIES - 2)
+                .map(|index| std::ffi::OsString::from(format!("unrelated{index}")))
+                .chain(["nvidiactl".into(), "nvidia0".into()])
+                .collect::<Vec<_>>();
+            let baseline = discover_gpu_filesystem_baseline(
+                true,
+                |_| true,
+                || Ok(names.iter().cloned().map(Ok)),
+            )
+            .unwrap();
+            assert!(baseline.read_write.contains(&"/dev/nvidia0".to_string()));
+            let reverse = discover_gpu_filesystem_baseline(
+                true,
+                |_| true,
+                || Ok(names.iter().rev().cloned().map(Ok)),
+            )
+            .unwrap();
+            assert_eq!(baseline, reverse);
+            let mut policy = admitted_gpu_policy(baseline);
+            assert!(
+                !enrich_gpu_filesystem_paths(
+                    &mut policy,
+                    true,
+                    |_| true,
+                    || Ok(names.iter().rev().cloned().map(Ok)),
+                )
+                .unwrap(),
+                "reordered unchanged GPU inventory must preserve the admitted policy"
+            );
+        }
+
+        #[test]
+        fn gpu_inventory_oversized_directory_rejects_discovery_and_launch() {
+            let names = (0..MAX_GPU_DEVICE_ENTRIES)
+                .map(|index| std::ffi::OsString::from(format!("unrelated{index}")))
+                .chain(["nvidia0".into()])
+                .collect::<Vec<_>>();
+            for reverse in [false, true] {
+                let mut ordered = names.clone();
+                if reverse {
+                    ordered.reverse();
+                }
+                let discovered = discover_gpu_filesystem_baseline(
+                    true,
+                    |_| true,
+                    || Ok(ordered.iter().cloned().map(Ok)),
+                )
+                .expect_err("oversized GPU discovery must not admit a partial inventory");
+                assert_eq!(discovered, "GPU device inventory exceeds the entry limit");
+                let mut policy = admitted_gpu_policy(BoundaryFilesystemBaseline::default());
+                let launch = enrich_gpu_filesystem_paths(
+                    &mut policy,
+                    true,
+                    |_| true,
+                    || Ok(ordered.iter().cloned().map(Ok)),
+                )
+                .expect_err("oversized GPU launch inventory must fail closed");
+                assert_eq!(launch, discovered);
+                assert!(policy.filesystem.read_only.is_empty());
+                assert!(policy.filesystem.read_write.is_empty());
+            }
+        }
+
+        #[test]
+        fn gpu_inventory_rejects_new_required_device_after_admission() {
+            let baseline = discover_gpu_filesystem_baseline(
+                true,
+                |_| true,
+                || Ok(["nvidiactl", "nvidia0"].map(|name| Ok(std::ffi::OsString::from(name)))),
+            )
+            .unwrap();
+            let mut policy = admitted_gpu_policy(baseline);
+            assert!(
+                enrich_gpu_filesystem_paths(
+                    &mut policy,
+                    true,
+                    |_| true,
+                    || Ok(["nvidiactl", "nvidia0", "nvidia1"]
+                        .map(|name| Ok(std::ffi::OsString::from(name)))),
+                )
+                .unwrap(),
+                "new GPU requirements must reject launch before spawning"
+            );
+        }
+
+        #[test]
+        fn gpu_inventory_requires_resource_claim_and_visible_device() {
+            for (gpu_requested, visible) in [(false, true), (true, false)] {
+                let names = || -> io::Result<Vec<io::Result<std::ffi::OsString>>> {
+                    panic!("GPU discovery must not enumerate devices without the claim and device")
+                };
+                let baseline =
+                    discover_gpu_filesystem_baseline(gpu_requested, |_| visible, names).unwrap();
+                assert_eq!(baseline, BoundaryFilesystemBaseline::default());
+                let mut policy = admitted_gpu_policy(baseline);
+                assert!(
+                    !enrich_gpu_filesystem_paths(&mut policy, gpu_requested, |_| visible, names)
+                        .unwrap()
+                );
+            }
+        }
+
+        #[test]
+        fn gpu_inventory_preserves_explicit_read_only_device_and_promotes_proc() {
+            let names =
+                || Ok(["nvidiactl", "nvidia0"].map(|name| Ok(std::ffi::OsString::from(name))));
+            let baseline = discover_gpu_filesystem_baseline(true, |_| true, names).unwrap();
+            let mut policy = admitted_gpu_policy(baseline);
+            let device = std::path::PathBuf::from("/dev/nvidia0");
+            policy.filesystem.read_write.retain(|path| path != &device);
+            policy.filesystem.read_only.push(device.clone());
+            assert!(!enrich_gpu_filesystem_paths(&mut policy, true, |_| true, names).unwrap());
+            assert!(policy.filesystem.read_only.contains(&device));
+            let proc = std::path::PathBuf::from("/proc");
+            policy.filesystem.read_write.retain(|path| path != &proc);
+            policy.filesystem.read_only.push(proc.clone());
+            assert!(enrich_gpu_filesystem_paths(&mut policy, true, |_| true, names).unwrap());
+            assert!(!policy.filesystem.read_only.contains(&proc));
+            assert!(policy.filesystem.read_write.contains(&proc));
+        }
+
         #[test]
         fn control_connection_slots_bound_authenticated_sessions() {
             let active = Arc::new(AtomicUsize::new(MAX_CONTROL_CONNECTIONS - 1));
@@ -3878,7 +5414,10 @@ mod linux {
                 .authenticate_request(first_id, bearer_request((), &token).metadata())
                 .expect("first principal");
             runtime
-                .commit_attach(&first, supervisor_instance_id)
+                .commit_attach(
+                    &first,
+                    &test_registration(&runtime, supervisor_instance_id, 1),
+                )
                 .expect("attach first");
             runtime.commit_confirm(&first).expect("confirm first");
             assert_eq!(
@@ -3898,12 +5437,18 @@ mod linux {
                 .expect("replacement principal");
             assert!(
                 runtime
-                    .commit_attach(&replacement, test_supervisor_instance_id())
+                    .commit_attach(
+                        &replacement,
+                        &test_registration(&runtime, test_supervisor_instance_id(), 1)
+                    )
                     .is_err(),
                 "a replacement supervisor process must not claim the generation"
             );
             runtime
-                .commit_attach(&replacement, supervisor_instance_id)
+                .commit_attach(
+                    &replacement,
+                    &test_registration(&runtime, supervisor_instance_id, 1),
+                )
                 .expect("reattach replacement");
             assert_eq!(
                 runtime.connections.require_active(&replacement),
@@ -3934,7 +5479,10 @@ mod linux {
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
-                .commit_attach(&principal, supervisor_instance_id)
+                .commit_attach(
+                    &principal,
+                    &test_registration(&runtime, supervisor_instance_id, 1),
+                )
                 .expect("attach");
             runtime.commit_confirm(&principal).expect("confirm");
             runtime.transport_disconnected(connection_id);
@@ -3955,7 +5503,10 @@ mod linux {
                 .expect("replacement principal");
             assert!(
                 runtime
-                    .commit_attach(&replacement, supervisor_instance_id)
+                    .commit_attach(
+                        &replacement,
+                        &test_registration(&runtime, supervisor_instance_id, 1)
+                    )
                     .is_err()
             );
         }
@@ -3969,7 +5520,10 @@ mod linux {
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
-                .commit_attach(&principal, supervisor_instance_id)
+                .commit_attach(
+                    &principal,
+                    &test_registration(&runtime, supervisor_instance_id, 1),
+                )
                 .expect("attach");
             runtime.commit_confirm(&principal).expect("confirm");
 
@@ -3996,13 +5550,15 @@ mod linux {
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
-                .connections
-                .attach(&principal, supervisor_instance_id)
+                .commit_attach(
+                    &principal,
+                    &test_registration(&runtime, supervisor_instance_id, 1),
+                )
                 .expect("attach test connection");
             runtime
-                .connections
-                .confirm(&principal)
+                .commit_confirm(&principal)
                 .expect("confirm test connection");
+            activate_test_configuration(&runtime, 0, std::collections::HashMap::new());
             *lock(&runtime.supervisor_connection) =
                 SupervisorConnectionState::Connected(connection_id);
             let server_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4078,13 +5634,15 @@ mod linux {
                 )
                 .expect("test principal");
             runtime
-                .connections
-                .attach(&principal, supervisor_instance_id)
+                .commit_attach(
+                    &principal,
+                    &test_registration(&runtime, supervisor_instance_id, 1),
+                )
                 .expect("attach test connection");
             runtime
-                .connections
-                .confirm(&principal)
+                .commit_confirm(&principal)
                 .expect("confirm test connection");
+            activate_test_configuration(&runtime, 0, std::collections::HashMap::new());
             let (mut replacement, task) = request_test_mediation(runtime, principal).await;
             let ready: ResponseEnvelope =
                 openshell_sandbox_backend::boundary_protocol::read_frame_async(&mut replacement)
@@ -4122,13 +5680,15 @@ mod linux {
                 .authenticate_request(connection_id, bearer_request((), &token).metadata())
                 .expect("test principal");
             runtime
-                .connections
-                .attach(&principal, test_supervisor_instance_id())
+                .commit_attach(
+                    &principal,
+                    &test_registration(&runtime, test_supervisor_instance_id(), 1),
+                )
                 .expect("attach test connection");
             runtime
-                .connections
-                .confirm(&principal)
+                .commit_confirm(&principal)
                 .expect("confirm test connection");
+            activate_test_configuration(&runtime, 0, std::collections::HashMap::new());
             let (mut first, first_task) =
                 request_test_mediation(runtime.clone(), principal.clone()).await;
             let ready: ResponseEnvelope =
@@ -4393,6 +5953,8 @@ mod linux {
                 .await
                 .expect("bind gRPC test listener");
             let address = listener.local_addr().expect("gRPC test address");
+            let supervisor_instance_id = test_supervisor_instance_id();
+            let registration_grant = test_registration_grant(&boundary, supervisor_instance_id, 1);
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept gRPC client");
                 serve_grpc(Box::new(stream), boundary, SandboxConnectionId::new()).await
@@ -4410,7 +5972,9 @@ mod linux {
                 process: openshell_core::policy::ProcessPolicy::default(),
             });
             let request = RequestEnvelope::new(Request::Attach {
-                supervisor_instance_id: test_supervisor_instance_id(),
+                supervisor_instance_id,
+                registration_grant,
+                registration_revision: 1,
                 policy: Box::new(policy),
                 resource_claims: std::collections::BTreeMap::new(),
             })
@@ -4579,11 +6143,13 @@ mod linux {
                 interactive: false,
             };
 
+            register_test_boundary(&boundary);
             assert!(matches!(
                 boundary.attach(policy.clone()),
                 Response::Attached { .. }
             ));
             assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            activate_test_configuration(&boundary, 0, std::collections::HashMap::new());
             let start = || {
                 boundary.start_agent(
                     "sandbox-reconnect".to_string(),
@@ -4591,44 +6157,49 @@ mod linux {
                     policy.clone(),
                     None,
                     None,
-                    0,
-                    std::collections::HashMap::new(),
+                    test_active_receipt(&boundary),
                 )
             };
             let Response::Started {
                 process_id,
                 provider_env_revision: 0,
+                ..
             } = start()
             else {
                 panic!("initial start did not succeed");
             };
 
-            let update = RequestEnvelope::new(Request::UpdateProviderEnvironment {
-                expected_revision: 0,
-                revision: 7,
-                provider_env: std::collections::HashMap::from([(
+            let revision = activate_test_configuration(
+                &boundary,
+                7,
+                std::collections::HashMap::from([(
                     "REPLAY_TEST".to_string(),
                     "set-once".to_string(),
                 )]),
-            })
-            .expect("build replayed update");
-            assert_eq!(
-                boundary.dispatch(update.clone()),
-                Response::ProviderEnvironmentUpdated { revision: 7 }
             );
+            let installed = lock(&boundary.activation).committed.clone().unwrap();
             assert_eq!(
-                boundary.dispatch(update.clone()),
-                Response::ProviderEnvironmentUpdated { revision: 7 },
-                "the same request ID and payload must replay its recorded response"
+                boundary.release_configuration(&installed).unwrap(),
+                revision
             );
-            let mut changed = RequestEnvelope::new(Request::Terminate {
-                process_id: process_id.clone(),
+            let changed = RequestEnvelope::new(Request::StartAgent {
+                sandbox_id: "sandbox-reconnect".to_string(),
+                spec: spec.clone(),
+                policy: Box::new(policy.clone()),
+                ca_cert: None,
+                ca_bundle: None,
+                activation: ActivatedBoundaryConfiguration {
+                    transition_id: "stale-transition".to_string(),
+                    ..revision
+                },
             })
-            .expect("build changed request");
-            changed.request_id = update.request_id;
+            .unwrap();
             assert!(matches!(
                 boundary.dispatch(changed),
-                Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
+                Response::Error {
+                    kind: BoundaryErrorKind::Configuration,
+                    ..
+                }
             ));
 
             let (first_attachment, _) = boundary
@@ -4662,6 +6233,7 @@ mod linux {
                 Response::Started {
                     process_id: process_id.clone(),
                     provider_env_revision: 7,
+                    activation: test_active_receipt(&boundary),
                 }
             );
 
@@ -4678,10 +6250,9 @@ mod linux {
                     changed_policy,
                     None,
                     None,
-                    0,
-                    std::collections::HashMap::new(),
+                    test_active_receipt(&boundary),
                 ),
-                Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
+                Response::Error { kind, .. } if kind == BoundaryErrorKind::Configuration
             ));
 
             let exec_spec = ExecSpecWire {
@@ -4693,6 +6264,7 @@ mod linux {
             };
             let exec_request = RequestEnvelope::new(Request::Exec {
                 spec: exec_spec.clone(),
+                activation: test_active_receipt(&boundary),
             })
             .expect("build exec request");
             let exec = boundary
@@ -4700,6 +6272,7 @@ mod linux {
                     &exec_request.request_id,
                     &exec_request.payload_digest,
                     exec_spec,
+                    &test_active_receipt(&boundary),
                 )
                 .expect("exec after reconnect");
             let exec_id = exec.process_id.clone();
@@ -4845,9 +6418,10 @@ mod linux {
                 policy: wire_policy.clone(),
                 ca_cert: None,
                 ca_bundle: None,
-                provider_env_revision: 0,
-                provider_env: std::collections::HashMap::new(),
             });
+
+            register_test_boundary(&boundary);
+            activate_test_configuration(&boundary, 0, std::collections::HashMap::new());
 
             // A replacement control process replays the durable lifecycle and
             // receives the original process rather than spawning another one.
@@ -4863,58 +6437,56 @@ mod linux {
                     wire_policy.clone(),
                     None,
                     None,
-                    0,
-                    std::collections::HashMap::new(),
+                    test_active_receipt(&boundary),
                 ),
                 Response::Started {
                     process_id: process.process_id(),
                     provider_env_revision: 0,
+                    activation: test_active_receipt(&boundary),
                 }
             );
 
+            let original = boundary.configuration_snapshot().unwrap().installed;
+            activate_test_configuration(
+                &boundary,
+                2,
+                std::collections::HashMap::from([(
+                    "ROTATED_TOKEN".to_string(),
+                    "refreshed".to_string(),
+                )]),
+            );
+            let current = boundary.configuration_snapshot().unwrap();
+            let mut candidate = current.installed.clone().unwrap();
+            candidate.config_revision += 1;
+            candidate.provider_env_revision = 1;
+            assert!(
+                boundary
+                    .prepare_configuration(
+                        current.identity.clone(),
+                        original,
+                        candidate.clone(),
+                        std::collections::HashMap::new()
+                    )
+                    .is_err()
+            );
+            let prepared = boundary
+                .prepare_configuration(
+                    current.identity,
+                    current.installed,
+                    candidate,
+                    std::collections::HashMap::new(),
+                )
+                .unwrap();
+            let installed = boundary.commit_configuration(&prepared).unwrap();
+            assert_eq!(boundary.commit_configuration(&prepared).unwrap(), installed);
+            let released = boundary.release_configuration(&installed).unwrap();
             assert_eq!(
-                boundary.update_provider_environment(
-                    0,
-                    2,
-                    std::collections::HashMap::from([(
-                        "ROTATED_TOKEN".to_string(),
-                        "refreshed".to_string(),
-                    )]),
-                ),
-                Response::ProviderEnvironmentUpdated { revision: 2 }
+                boundary.release_configuration(&installed).unwrap(),
+                released
             );
             assert_eq!(
-                boundary.update_provider_environment(
-                    0,
-                    1,
-                    std::collections::HashMap::from([(
-                        "ROTATED_TOKEN".to_string(),
-                        "stale".to_string(),
-                    )]),
-                ),
-                Response::ProviderEnvironmentUpdated { revision: 2 }
-            );
-            assert_eq!(
-                boundary.update_provider_environment(2, 1, std::collections::HashMap::new()),
-                Response::ProviderEnvironmentUpdated { revision: 1 },
-                "a numerically smaller opaque revision must revoke the environment"
-            );
-            assert_eq!(
-                boundary.update_provider_environment(
-                    2,
-                    3,
-                    std::collections::HashMap::from([(
-                        "ROTATED_TOKEN".to_string(),
-                        "out-of-order".to_string(),
-                    )]),
-                ),
-                Response::ProviderEnvironmentUpdated { revision: 1 },
-                "a stale expected revision must not overwrite current state"
-            );
-            assert_eq!(
-                boundary.update_provider_environment(1, 1, std::collections::HashMap::new()),
-                Response::ProviderEnvironmentUpdated { revision: 1 },
-                "a duplicate update must be idempotent"
+                released.configuration.provider_env_revision, 1,
+                "opaque provider revisions may decrease"
             );
 
             assert!(matches!(
@@ -4929,15 +6501,12 @@ mod linux {
                     wire_policy,
                     None,
                     None,
-                    99,
-                    std::collections::HashMap::from([(
-                        "ROTATED_TOKEN".to_string(),
-                        "replacement-control-snapshot".to_string(),
-                    )]),
+                    test_active_receipt(&boundary),
                 ),
                 Response::Started {
                     process_id: process.process_id(),
                     provider_env_revision: 1,
+                    activation: test_active_receipt(&boundary),
                 },
                 "a replacement control must resume from the boundary's current revision"
             );
@@ -4951,6 +6520,7 @@ mod linux {
             };
             let sleep_request = RequestEnvelope::new(Request::Exec {
                 spec: sleep_spec.clone(),
+                activation: test_active_receipt(&boundary),
             })
             .expect("build retained exec request");
             let started = boundary
@@ -4958,6 +6528,7 @@ mod linux {
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
                     sleep_spec.clone(),
+                    &test_active_receipt(&boundary),
                 )
                 .expect("start exec whose response is disconnected");
             let retained_id = started.process_id.clone();
@@ -4967,6 +6538,7 @@ mod linux {
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
                     sleep_spec.clone(),
+                    &test_active_receipt(&boundary),
                 )
                 .expect("reattach exec after response loss");
             assert_eq!(replayed.process_id, retained_id);
@@ -4992,6 +6564,7 @@ mod linux {
                         &sleep_request.request_id,
                         &sleep_request.payload_digest,
                         sleep_spec,
+                        &test_active_receipt(&boundary),
                     )
                     .is_err(),
                 "an evicted exec request must never start a second process"
@@ -5016,10 +6589,18 @@ mod linux {
                     workdir: None,
                     pty: false,
                 };
-                let request = RequestEnvelope::new(Request::Exec { spec: spec.clone() })
-                    .expect("build exec status request");
+                let request = RequestEnvelope::new(Request::Exec {
+                    spec: spec.clone(),
+                    activation: test_active_receipt(&boundary),
+                })
+                .expect("build exec status request");
                 let exec = boundary
-                    .start_exec(&request.request_id, &request.payload_digest, spec)
+                    .start_exec(
+                        &request.request_id,
+                        &request.payload_digest,
+                        spec,
+                        &test_active_receipt(&boundary),
+                    )
                     .expect("start exec after canonical exit");
                 for _ in 0..2 {
                     assert_eq!(

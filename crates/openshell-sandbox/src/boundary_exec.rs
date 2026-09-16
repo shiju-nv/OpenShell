@@ -320,7 +320,7 @@ impl SpawnedExec {
 impl Drop for SpawnedExec {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.process.deliver(Signal::SIGKILL);
+            let _ = self.process.deliver(BoundarySignal::Kill);
         }
     }
 }
@@ -374,7 +374,6 @@ struct LocalExecProcess {
     exited: Arc<tokio::sync::Notify>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
     terminal: Arc<std::sync::atomic::AtomicBool>,
-    signal_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl LocalExecProcess {
@@ -394,7 +393,9 @@ impl LocalExecProcess {
         let terminal_for_wait = terminal.clone();
         let registration_terminal = terminal.clone();
         #[cfg(target_os = "linux")]
-        let signal_lock_for_wait = signal_lock.clone();
+        let signal_lock_for_wait = signal_lock;
+        #[cfg(not(target_os = "linux"))]
+        drop(signal_lock);
         tokio::spawn(async move {
             let waited = tokio::task::spawn_blocking(move || {
                 let mut child = child;
@@ -451,21 +452,12 @@ impl LocalExecProcess {
             exited,
             runtime,
             terminal,
-            signal_lock,
         }
     }
 
-    fn deliver(&self, signal: Signal) -> Result<(), BackendError> {
-        self.runtime.ensure_active()?;
-        let _signal_guard = self
-            .signal_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.terminal.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(BackendError::Terminated("process has exited".to_string()));
-        }
-        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
-        killpg(Pid::from_raw(pid), signal).map_err(|error| BackendError::Process(error.to_string()))
+    fn deliver(&self, signal: BoundarySignal) -> Result<(), BackendError> {
+        self.runtime
+            .signal_process_group(self.pid, &self.terminal, signal)
     }
 }
 
@@ -487,16 +479,11 @@ impl BoundaryProcess for LocalExecProcess {
     }
 
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
-        self.deliver(match signal {
-            BoundarySignal::Term => Signal::SIGTERM,
-            BoundarySignal::Kill => Signal::SIGKILL,
-            BoundarySignal::Int => Signal::SIGINT,
-            BoundarySignal::Hup => Signal::SIGHUP,
-        })
+        self.deliver(signal)
     }
 
     async fn terminate(&self) -> Result<(), BackendError> {
-        self.deliver(Signal::SIGKILL)
+        self.deliver(BoundarySignal::Kill)
     }
 }
 
@@ -504,6 +491,83 @@ impl BoundaryProcess for LocalExecProcess {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn held_exec_signals_wait_for_release_and_reject_stale_handles() {
+        use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Cleanup owns this exact child even if a hold assertion fails.
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = OwnedChild(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn owned exec group"),
+        );
+        let pid = child.0.id();
+        let runtime = crate::boundary_io::BoundaryRuntimeState::new();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let signal_lock = Arc::new(std::sync::Mutex::new(()));
+        runtime
+            .register_process_group(pid, terminal.clone(), signal_lock.clone())
+            .expect("register owned exec group");
+        let process = LocalExecProcess {
+            pid,
+            result: Arc::new(std::sync::Mutex::new(None)),
+            exited: Arc::new(tokio::sync::Notify::new()),
+            runtime: runtime.clone(),
+            terminal: terminal.clone(),
+        };
+        runtime.freeze_confirmed().expect("confirm exec hold");
+
+        let stale_terminal = Arc::new(AtomicBool::new(false));
+        assert!(matches!(
+            runtime.signal_process_group(pid, &stale_terminal, BoundarySignal::Kill),
+            Err(BackendError::Terminated(_))
+        ));
+        assert_eq!(runtime.pending_signal_count(pid, &terminal), 0);
+        process
+            .signal(BoundarySignal::Kill)
+            .await
+            .expect("queue exec signal");
+        process
+            .terminate()
+            .await
+            .expect("coalesce exec termination");
+        assert_eq!(runtime.pending_signal_count(pid, &terminal), 1);
+        assert!(child.0.try_wait().expect("observe held exec").is_none());
+
+        assert!(runtime.resume(), "release held exec");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().expect("observe exec termination") {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued exec signal must terminate after release");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        {
+            let _guard = signal_lock.lock().expect("terminal ownership");
+            terminal.store(true, Ordering::Release);
+        }
+        runtime.unregister_process_group(pid, &terminal);
+        assert!(matches!(
+            process.terminate().await,
+            Err(BackendError::Terminated(_))
+        ));
+    }
 
     fn executor() -> LocalBoundaryExec {
         let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()

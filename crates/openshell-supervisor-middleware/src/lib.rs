@@ -1058,6 +1058,27 @@ fn validate_response_envelope(
 }
 
 impl MiddlewareRegistry {
+    /// Return immutable service manifests and operator registrations for configuration identity.
+    ///
+    /// These descriptors exclude live bearer credentials, connection state, and
+    /// admission permits, so credential refresh does not change configuration identity.
+    #[must_use]
+    pub fn configuration_descriptors(
+        &self,
+    ) -> (Vec<MiddlewareManifest>, Vec<SupervisorMiddlewareService>) {
+        let manifests = self
+            .services
+            .iter()
+            .filter_map(|service| service.manifest.get().cloned())
+            .collect();
+        let registrations = self
+            .registered_services
+            .iter()
+            .map(|service| service.registration.clone())
+            .collect();
+        (manifests, registrations)
+    }
+
     /// Describe in-process services, then connect and validate every
     /// operator-provided service registration.
     pub async fn connect_services(

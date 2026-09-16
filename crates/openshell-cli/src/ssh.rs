@@ -25,7 +25,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
@@ -1446,56 +1446,68 @@ pub async fn sandbox_ssh_proxy(
     .await
     .map_err(|_| miette::miette!("failed to initialize SSH forward stream"))?;
 
-    let mut response = client
+    let response = client
         .forward_tcp(ReceiverStream::new(rx))
         .await
         .into_diagnostic()?
         .into_inner();
 
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+    forward_ssh_proxy_stdio(tx, response).await
+}
 
-    let to_remote = tokio::spawn(async move {
-        let mut stdin = stdin;
-        let mut buf = vec![0u8; 64 * 1024];
-        while let Ok(n) = stdin.read(&mut buf).await {
-            if n == 0 {
-                break;
+/// Relay one `ProxyCommand` process's stdin and stdout until remote output ends.
+async fn forward_ssh_proxy_stdio(
+    tx: tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    mut response: impl futures::Stream<Item = std::result::Result<TcpForwardFrame, tonic::Status>>
+    + Unpin,
+) -> Result<()> {
+    use futures::StreamExt as _;
+    use std::io::Read as _;
+
+    // This process owns stdin for a single ProxyCommand invocation. A blocked
+    // stdin read cannot be cancelled, so keep it outside Tokio's blocking pool
+    // and never join it: remote EOF must let runtime shutdown close stdout even
+    // while SSH still holds the stdin pipe open. Process exit ends the reader.
+    let _stdin_reader = std::thread::Builder::new()
+        .name("ssh-proxy-stdin".to_string())
+        .spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n) = stdin.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if tx
+                    .blocking_send(TcpForwardFrame {
+                        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                            buf[..n].to_vec(),
+                        )),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
-            if tx
-                .send(TcpForwardFrame {
-                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
-                        buf[..n].to_vec(),
-                    )),
-                })
-                .await
-                .is_err()
-            {
-                break;
-            }
+        })
+        .into_diagnostic()
+        .wrap_err("failed to start SSH proxy stdin reader")?;
+
+    // Stdin EOF closes only the request stream. Continue draining remote bytes
+    // and flushing stdout before allowing this ProxyCommand process to return.
+    let mut stdout = tokio::io::stdout();
+    while let Some(Ok(frame)) = response.next().await {
+        let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
+        else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
         }
-    });
-    let from_remote = tokio::spawn(async move {
-        let mut stdout = stdout;
-        loop {
-            let Ok(Some(frame)) = response.message().await else {
-                break;
-            };
-            let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
-            else {
-                continue;
-            };
-            if data.is_empty() {
-                continue;
-            }
-            if stdout.write_all(&data).await.is_err() {
-                break;
-            }
-            let _ = stdout.flush().await;
+        if stdout.write_all(&data).await.is_err() {
+            break;
         }
-    });
-    let _ = from_remote.await;
-    to_remote.abort();
+        let _ = stdout.flush().await;
+    }
 
     Ok(())
 }
@@ -1748,6 +1760,151 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
+
+    const SSH_PROXY_TEST_MODE: &str = "OPENSHELL_TEST_SSH_PROXY_STDIO";
+    const SSH_PROXY_TEST_INPUT: &[u8] = b"ssh-proxy-input-sentinel\n";
+    const SSH_PROXY_TEST_OUTPUT: &[u8] = b"\0ssh-proxy-remote-bytes-before-close\0";
+    const SSH_PROXY_RUNTIME_DROPPED: &str = "ssh-proxy-runtime-dropped";
+
+    #[tokio::test]
+    async fn ssh_proxy_remote_end_exits_with_open_stdin() {
+        for mode in ["remote-eof", "remote-error"] {
+            assert_ssh_proxy_subprocess_exits(mode, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_proxy_stdin_eof_preserves_remote_output() {
+        assert_ssh_proxy_subprocess_exits("stdin-eof", false).await;
+    }
+
+    async fn assert_ssh_proxy_subprocess_exits(mode: &str, keep_stdin_open: bool) {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut child = TokioCommand::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "ssh::tests::ssh_proxy_stdio_subprocess",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SSH_PROXY_TEST_MODE, mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn SSH proxy subprocess");
+        let mut stdin = child.stdin.take().expect("child stdin");
+        let mut stdout = child.stdout.take().expect("child stdout");
+        let output = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        });
+        stdin
+            .write_all(SSH_PROXY_TEST_INPUT)
+            .await
+            .expect("write input sentinel");
+        let held_stdin = keep_stdin_open.then_some(stdin);
+
+        // Keep the input pipe open while observing both process exit and output
+        // EOF. A proxy future returning before runtime destruction is not enough.
+        let status =
+            if let Ok(status) = tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                status.expect("wait for SSH proxy subprocess")
+            } else {
+                child.start_kill().expect("kill timed-out SSH proxy child");
+                tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .expect("timed-out SSH proxy child was not reaped")
+                    .expect("reap timed-out SSH proxy child");
+                panic!("SSH proxy subprocess did not exit with mode {mode}");
+            };
+        assert!(status.success(), "SSH proxy subprocess failed: {mode}");
+        let bytes = tokio::time::timeout(Duration::from_secs(2), output)
+            .await
+            .expect("SSH proxy stdout did not reach EOF")
+            .expect("join stdout reader")
+            .expect("read SSH proxy stdout");
+        // Libtest also writes its progress to stdout; the binary payload must
+        // survive intact exactly once among those harness messages.
+        assert_eq!(
+            bytes
+                .windows(SSH_PROXY_TEST_OUTPUT.len())
+                .filter(|window| *window == SSH_PROXY_TEST_OUTPUT)
+                .count(),
+            1,
+            "remote bytes were not drained exactly once: {bytes:?}"
+        );
+        assert!(
+            bytes
+                .windows(SSH_PROXY_RUNTIME_DROPPED.len())
+                .any(|window| window == SSH_PROXY_RUNTIME_DROPPED.as_bytes()),
+            "subprocess did not finish runtime destruction"
+        );
+        drop(held_stdin);
+    }
+
+    #[test]
+    fn ssh_proxy_stdio_subprocess() {
+        let Ok(mode) = std::env::var(SSH_PROXY_TEST_MODE) else {
+            return;
+        };
+        assert!(matches!(
+            mode.as_str(),
+            "remote-eof" | "remote-error" | "stdin-eof"
+        ));
+        // The input sender has spare channel capacity. On a current-thread
+        // runtime an async stdin sender reaches its next pending read before
+        // the awakened receiver can finish the remote stream. This makes the
+        // shutdown regression observable without a timing-based handshake.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build child runtime");
+        runtime.block_on(async move {
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(16);
+            let (remote_tx, remote_rx) = tokio::sync::mpsc::channel(16);
+            let remote = tokio::spawn(async move {
+                let mut input = Vec::new();
+                while input.len() < SSH_PROXY_TEST_INPUT.len() {
+                    let frame: TcpForwardFrame = input_rx.recv().await.expect("forwarded input");
+                    let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
+                        frame.payload
+                    else {
+                        panic!("stdin did not forward a data frame");
+                    };
+                    input.extend(data);
+                }
+                assert_eq!(input, SSH_PROXY_TEST_INPUT);
+                if mode == "stdin-eof" {
+                    // Input half-close must preserve the opposite direction:
+                    // produce remote output only after observing request EOF.
+                    assert!(input_rx.recv().await.is_none());
+                }
+                remote_tx
+                    .send(Ok(TcpForwardFrame {
+                        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                            SSH_PROXY_TEST_OUTPUT.to_vec(),
+                        )),
+                    }))
+                    .await
+                    .expect("send remote bytes");
+                if mode == "remote-error" {
+                    remote_tx
+                        .send(Err(tonic::Status::unavailable("remote relay ended")))
+                        .await
+                        .expect("send remote error");
+                }
+            });
+            forward_ssh_proxy_stdio(input_tx, ReceiverStream::new(remote_rx))
+                .await
+                .expect("relay proxy stdio");
+            remote.await.expect("join controlled remote");
+        });
+        drop(runtime);
+        println!("{SSH_PROXY_RUNTIME_DROPPED}");
+    }
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
