@@ -3152,7 +3152,7 @@ network_policies:
             );
             assert!(message.ends_with("additional violations omitted"));
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 30);
+        assert_eq!(calls.load(Ordering::Relaxed), 40);
         let accept = |_: &str, _: &prost_types::Struct| Ok(());
         assert!(
             OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, Some(&accept))
