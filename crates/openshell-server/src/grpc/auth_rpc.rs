@@ -129,7 +129,7 @@ pub async fn handle_refresh_sandbox_token(
 
     // Only callers already holding a gateway-minted JWT may refresh; the
     // K8s bootstrap path must use `IssueSandboxToken`.
-    let SandboxIdentitySource::BootstrapJwt { .. } = &sandbox.source else {
+    let SandboxIdentitySource::LaunchSession { .. } = &sandbox.source else {
         debug!(
             sandbox_id = %sandbox.sandbox_id,
             "RefreshSandboxToken rejected: non-gateway-JWT principal source"
@@ -217,6 +217,7 @@ pub async fn handle_refresh_sandbox_token(
     } else {
         let mut config_request = Request::new(GetSandboxConfigRequest {
             sandbox_id: sandbox.sandbox_id.clone(),
+            ..Default::default()
         });
         config_request
             .extensions_mut()
@@ -486,8 +487,12 @@ mod tests {
         use crate::auth::principal::SandboxIdentitySource;
         Principal::Sandbox(SandboxPrincipal {
             sandbox_id: sandbox_id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test-gateway".to_string(),
+            source: SandboxIdentitySource::LaunchSession {
+                runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                    "generation-1",
+                )
+                .unwrap(),
+                auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
             },
             trust_domain: Some("openshell".to_string()),
         })
@@ -568,6 +573,103 @@ mod tests {
         assert!(!resp.token.is_empty());
         assert!(resp.expiration_time.is_some());
         assert!(resp.sandbox_expiration_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_rotation_preserves_configuration_identity_and_limits_predecessor_to_replay() {
+        use crate::auth::authenticator::Authenticator as _;
+        use crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator;
+
+        let state = state_with_issuer().await;
+        let authority = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .expect("session authority");
+        let authenticator =
+            SandboxSessionJwtAuthenticator::new(Arc::clone(authority), Arc::clone(&state.store));
+        let headers = |token: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("bearer header"),
+            );
+            headers
+        };
+        let mut request = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        let previous_token = authorize_refresh(&state, &mut request).await;
+        let previous = authority
+            .verify_gateway_token(&previous_token)
+            .expect("original gateway token");
+        let principal = authenticator
+            .authenticate(
+                &headers(&previous_token),
+                "/openshell.v1.OpenShell/RefreshSandboxToken",
+            )
+            .await
+            .expect("authenticate original bearer")
+            .expect("sandbox principal");
+        request.extensions_mut().insert(principal);
+        let response = handle_refresh_sandbox_token(&state, request)
+            .await
+            .expect("rotate bearer")
+            .into_inner();
+        let successor = authority
+            .verify_gateway_token(&response.token)
+            .expect("successor gateway token");
+        assert_eq!(successor.runtime_generation, previous.runtime_generation);
+        assert_eq!(successor.auth_epoch, previous.auth_epoch);
+        assert_ne!(successor.token_id, previous.token_id);
+
+        let principal = authenticator
+            .authenticate(
+                &headers(&response.token),
+                "/openshell.v1.OpenShell/ReportSandboxConfiguration",
+            )
+            .await
+            .expect("authenticate successor for configuration reporting")
+            .expect("sandbox principal");
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .expect("load sandbox")
+            .expect("sandbox");
+        let durable = crate::grpc::policy::authorize_configuration_identity(&principal, &sandbox)
+            .expect("refreshed principal preserves the signed launch identity");
+        assert_eq!(durable.gateway_token_id, successor.token_id);
+        let error = authenticator
+            .authenticate(
+                &headers(&previous_token),
+                "/openshell.v1.OpenShell/ReportSandboxConfiguration",
+            )
+            .await
+            .expect_err("consumed bearer cannot authorize configuration reporting");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+
+        // The predecessor can recover this exact successor only through the
+        // refresh handler's bounded lineage check, never through an ordinary RPC.
+        let principal = authenticator
+            .authenticate(
+                &headers(&previous_token),
+                "/openshell.v1.OpenShell/RefreshSandboxToken",
+            )
+            .await
+            .expect("authenticate replay bearer signature")
+            .expect("sandbox principal");
+        let mut retry = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        retry.extensions_mut().insert(principal);
+        set_refresh_authorization(&mut retry, &previous_token);
+        let replayed = handle_refresh_sandbox_token(&state, retry)
+            .await
+            .expect("replay committed refresh")
+            .into_inner();
+        assert_eq!(replayed.token, response.token);
+        assert_eq!(replayed.sandbox_token, response.sandbox_token);
+        assert_eq!(replayed.expiration_time, response.expiration_time);
     }
 
     #[tokio::test]

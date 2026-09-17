@@ -238,6 +238,19 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 	for i := range s.EndpointStatuses {
 		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
 	}
+	// Returned snapshots must not let callers mutate the fake store's activation state.
+	if s.ConfigurationAdmission != nil {
+		admission := *s.ConfigurationAdmission
+		s.ConfigurationAdmission = &admission
+	}
+	if s.ConfigurationDesired != nil {
+		desired := *s.ConfigurationDesired
+		s.ConfigurationDesired = &desired
+	}
+	if s.ConfigurationActivationAuthorized != nil {
+		authorized := *s.ConfigurationActivationAuthorized
+		s.ConfigurationActivationAuthorized = &authorized
+	}
 	return s
 }
 

@@ -320,6 +320,9 @@ message NetworkBinary {
 message GetSandboxConfigRequest {
   // The sandbox ID.
   string sandbox_id = 1;
+  // Nonempty only for an authoritative poll by the registered control process.
+  // Empty observer requests never replace the delivered activation snapshot.
+  string configuration_instance_id = 2;
 }
 
 // Request to get gateway-global settings.
@@ -399,6 +402,18 @@ message GetSandboxConfigResponse {
   // False also covers older gateways that do not advertise this capability;
   // supervisors preserve their legacy unauthenticated connection behavior.
   bool extension_authentication_enabled = 12;
+  // True only after validating this complete policy/provider composition.
+  // Missing (older gateway) is deliberately not admission.
+  bool configuration_admitted = 13;
+  // Bounded, credential-free admission diagnostic. Empty for admitted policy.
+  string configuration_error = 14;
+  // Registration fence for a new supervisor; capture once and retain on retry.
+  string configuration_instance_id = 15;
+  string runtime_generation = 16;
+  string configuration_boundary_instance_id = 17;
+  string configuration_snapshot = 18;
+  uint64 configuration_registration_revision = 19;
+  uint64 configuration_delivery_revision = 20;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

@@ -161,7 +161,7 @@ openshell logs <sandbox-name> --tail --source sandbox
 
 The middleware service must start before the gateway and be reachable from both the gateway and sandbox supervisors. Gateway startup fails if `Describe` is unavailable, a manifest exposes duplicate operation/phase bindings, the registration claims the reserved `openshell/` namespace, or payload and timeout limits are invalid. Supported V1 bindings are `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. When gateway JWT signing is disabled, supervisors preserve the legacy unauthenticated connector and do not request extension credentials. When signing is enabled, credential acquisition and verification failures are fail closed: check HTTPS trust and hostname validation, audience and issuer agreement, the token `kid`, gateway `RefreshSandboxToken` errors, and middleware logs. Changing a registration requires a gateway restart. A policy update can also fail before persistence if the selected implementation rejects its `network_middlewares` config.
 
-At request time, distinguish attachment, binding selection, coverage, denial, and failure. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; the connection proceeds under either `on_error` mode and emits `binding_not_selected` coverage. A selected WebSocket stage receives text messages only. Binary messages pass under both modes, emit `unsupported_message_type` coverage, and consume a session sequence without an RPC. An explicit `middleware_denied` result is always enforced. WebSocket preflight returns `INSPECT`, voluntary `SKIP`, or authoritative `DENY`; `DENY` rejects the upgrade before upstream contact under both `on_error` modes. A selected-stage failure follows the policy-local `on_error`: `fail_closed` blocks the HTTP request or closes the WebSocket, while `fail_open` bypasses only that stage and emits a detection finding. A fail-open per-message capacity failure bypasses that message without disabling the stage. A timeout, transport failure, stream closure, missing or invalid response, duplicate or regressed sequence, or other failure that makes an established WebSocket stream unreliable disables that stage for later messages on the connection and emits `openshell.middleware.websocket_stage_disabled`. Confirm preflight, session-start, and session-end in service logs. OpenShell best-effort sends at most one session-end to each still-writable opened stage, including a preflight that terminates before session start; distinguish `MIDDLEWARE_DENIAL` from `MIDDLEWARE_FAILURE`. WebSocket message sequences are allocated session-wide; each stage receives a strictly increasing subset, so gaps are valid when binary messages or other units are not delivered to that stage. Zero, duplicate, or regressed sequences are protocol errors. If a running supervisor cannot install a new registry, it preserves its last-known-good generation and emits a configuration failure event.
+At request time, distinguish attachment, binding selection, coverage, denial, and failure. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; the connection proceeds under either `on_error` mode and emits `binding_not_selected` coverage. A selected WebSocket stage receives text messages only. Binary messages pass under both modes, emit `unsupported_message_type` coverage, and consume a session sequence without an RPC. An explicit `middleware_denied` result is always enforced. WebSocket preflight returns `INSPECT`, voluntary `SKIP`, or authoritative `DENY`; `DENY` rejects the upgrade before upstream contact under both `on_error` modes. A selected-stage failure follows the policy-local `on_error`: `fail_closed` blocks the HTTP request or closes the WebSocket, while `fail_open` bypasses only that stage and emits a detection finding. A fail-open per-message capacity failure bypasses that message without disabling the stage. A timeout, transport failure, stream closure, missing or invalid response, duplicate or regressed sequence, or other failure that makes an established WebSocket stream unreliable disables that stage for later messages on the connection and emits `openshell.middleware.websocket_stage_disabled`. Confirm preflight, session-start, and session-end in service logs. OpenShell best-effort sends at most one session-end to each still-writable opened stage, including a preflight that terminates before session start; distinguish `MIDDLEWARE_DENIAL` from `MIDDLEWARE_FAILURE`. WebSocket message sequences are allocated session-wide; each stage receives a strictly increasing subset, so gaps are valid when binary messages or other units are not delivered to that stage. Zero, duplicate, or regressed sequences are protocol errors. If a running supervisor cannot install a new registry, it emits a configuration failure event and applies the configured policy validation failure mode described below.
 
 For network policy validation failures, first distinguish a gateway mutation
 rejection from a supervisor runtime rejection. Direct policy updates,
@@ -179,13 +179,24 @@ Runtime rejection behavior is configured only in `gateway.toml`:
 policy_validation_failure_mode = "fail_closed"
 ```
 
-The default `fail_closed` mode deactivates the previous generation, closes
-pinned relays, and quarantines new egress until a valid generation loads.
-`retain_last_valid` explicitly keeps the previous valid policy active; without
-one it still fails closed. Restart the gateway after changing this field.
-Inspect sandbox OCSF configuration and finding events for the validation
-rationale, configured and effective modes, active generation, and the explicit
-`previous_policy_active` state.
+The default `fail_closed` mode deactivates the previous generation, closes pinned relays, and quarantines new egress until a valid generation loads. In a gateway-managed control/boundary sandbox, workload execution and readiness are also held until the matching policy and provider configuration is activated. `retain_last_valid` permits a verified previous accepted configuration to remain active; without one it still fails closed. It cannot release an uncertain policy/provider combination. Restart the gateway after changing this field. Inspect sandbox OCSF configuration and finding events for the validation rationale, configured and effective modes, active generation, and the explicit `previous_policy_active` state.
+
+For a sandbox that remains `Starting` or loses readiness, inspect configuration status alongside driver and Pod status:
+
+```fish
+openshell sandbox get my-sandbox
+openshell sandbox get my-sandbox --output json
+openshell policy list my-sandbox
+openshell sandbox provider list my-sandbox
+```
+
+`configuration_desired` records the latest delivered candidate; `configuration_admission` records runtime installation status. Gateway validation (`admitted: true`) and an accepted installation are intermediate states. Readiness also requires `activation_confirmed: true` for the current runtime. A rejected desired candidate can coexist with a previous accepted configuration under `retain_last_valid`. Follow the desired error to repair policy with `openshell policy set`, or correct provider credentials, profile coverage, and attachments. A policy revision becomes `loaded` only after the matching final activation report. Its history alone cannot prove that a replacement runtime is ready.
+
+A rejected initial configuration remains repairable without launching a workload. Static fields can be replaced only while the durable `configuration_activation_authorized` value is explicitly `false` and admission is pending or rejected. The first authorization to release the workload consumes this permission before the workload may run. Missing evidence, a lost response, or a restart does not restore it. After authorization, changing filesystem, Landlock, or process policy requires a new sandbox. A successful initial repair launches the waiting workload once.
+
+During recovery, an authenticated control/boundary connection and isolation `Confirm` leave the workload held. A replacement supervisor must obtain a fresh gateway-signed registration grant, reinstall the selected configuration, and complete matching activation before readiness returns. Do not try to repair a stale grant by replaying an old runtime identity. A surviving main process resumes without another initial launch. Destruction of its boundary makes the old runtime generation terminal; another launch requires a new driver-authorized generation.
+
+These admission and workload-release checks apply to gateway-managed control/boundary sandboxes. A standalone network proxy continues to load its local policy file and has no sandbox admission or workload-release record to inspect.
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -636,16 +647,7 @@ kubectl -n <sandbox-namespace> get pod -l openshell.ai/sandbox-id=<sandbox-id>,o
 kubectl -n <sandbox-namespace> get networkpolicy -l openshell.ai/sandbox-id=<sandbox-id> -o yaml
 ```
 
-Creation and recovery fail closed. A missing Secret leaves both pods inert; a
-missing or unobserved workload fence must prevent the driver from releasing the
-Sandbox; and readiness requires both Agent Sandbox readiness and an Available
-supervisor Pod. Its exec readiness check succeeds only after the
-supervisor has attached, confirmed enforcement, started or resumed the
-workload, and registered the gateway access plane. Use both Pod logs for
-bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked
-a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
-capabilities, gateway egress, or credentials to the workload Pod as a
-workaround.
+Creation and recovery fail closed. A missing Secret leaves both pods inert; a missing or unobserved workload fence must prevent the driver from releasing the Sandbox. Readiness requires Agent Sandbox readiness, an Available supervisor Pod, and confirmed activation of the matching effective configuration. Isolation confirmation alone leaves the workload held. The exec readiness check succeeds after the supervisor installs the matching policy and providers, receives release authorization, starts or resumes the workload, and registers the gateway access plane. Use both Pod logs for bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked a required unprivileged seccomp, task-memory, or Landlock operation. Do not add capabilities, gateway egress, or credentials to the workload Pod as a workaround.
 
 #### Corporate upstream proxy
 

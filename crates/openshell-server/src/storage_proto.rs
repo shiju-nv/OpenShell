@@ -118,11 +118,11 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "574bf5fcff731bd6e3fd84ed3f124161035bd236ef0fb7e32b4d8a8c55ceba5e";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "d323fdd0c989049950ed3bf9cc2cbae9f05e1ae83b13fa2a65a2f5db1ebab95f";
+        "d5070e93734155b180a61d8411d92b888b9fa284da7857ce712bd263bcd9bfe1";
     const DURABLE_SCHEMA_SHA256: &str =
-        "65066c0b0eef57a4c708f20fcbbb8e8f47376da9f4bf73dfc3bca0b3df174ba8";
+        "f0e5fc47d9acdf46582bd4e244d0646c9e2fdb0400dc1ce4c6372c50cd82d4ea";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "39e8aaf0d1fbc86906c49a9e7f60641a3ce203d3130799c8065e09acf9d53ddf";
+        "cdcd7149fe51b53c3521fe12128cdc87748de538c52bc58d2bdac71c237c9290";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -495,14 +495,14 @@ mod tests {
             }
         }
         methods.sort();
-        assert_eq!(compiled_method_count, 101, "classify every compiled RPC");
-        assert_eq!(methods.len(), 75, "inventory every public gateway RPC");
+        assert_eq!(compiled_method_count, 102, "classify every compiled RPC");
+        assert_eq!(methods.len(), 76, "inventory every public gateway RPC");
         assert_eq!(
             methods
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            75
+            76
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -535,26 +535,58 @@ mod tests {
 
         assert_eq!(
             (public_closure.messages.len(), public_closure.enums.len()),
-            (283, 14)
+            (287, 15)
         );
         assert_eq!(
             (durable_closure.messages.len(), durable_closure.enums.len()),
-            (83, 9)
+            (85, 11)
         );
-        assert_eq!((overlap_messages.len(), overlap_enums.len()), (73, 9));
+        assert_eq!((overlap_messages.len(), overlap_enums.len()), (75, 11));
 
         assert_eq!(
-            public_inventory_hash, PUBLIC_RPC_SCHEMA_SHA256,
-            "the public RPC schema closure changed; review API compatibility and update the inventory and architecture/gateway.md"
+            (
+                public_inventory_hash.as_str(),
+                durable_inventory_hash.as_str(),
+                overlap_hash.as_str()
+            ),
+            (
+                PUBLIC_RPC_SCHEMA_SHA256,
+                DURABLE_SCHEMA_SHA256,
+                PUBLIC_DURABLE_OVERLAP_SHA256
+            ),
+            "the public/durable schema changed; review API and storage compatibility, update architecture/gateway.md, and record prior-version fixture behavior before updating the inventory"
         );
+    }
+
+    #[test]
+    fn configuration_activation_prior_status_bytes_do_not_authorize_readiness_or_static_repair() {
+        // Pre-admission status encoded Ready, policy version 1, and process
+        // instance "old". Missing release evidence must remain absent on decode.
+        let prior = legacy_bytes("3002380142036f6c64");
+        let status = openshell_core::proto::SandboxStatus::decode(prior.as_slice())
+            .expect("prior status bytes decode");
         assert_eq!(
-            durable_inventory_hash, DURABLE_SCHEMA_SHA256,
-            "a durable protobuf root or transitive dependency changed; record migration handling and a prior-version fixture before updating this fingerprint"
+            status.phase,
+            i32::from(openshell_core::proto::SandboxPhase::Ready)
         );
+        assert_eq!(status.current_policy_version, 1);
+        assert_eq!(status.main_process_instance_id, "old");
+        assert_eq!(status.configuration_activation_authorized, None);
+        assert!(status.configuration_admission.is_none());
+        let mut sandbox = openshell_core::proto::Sandbox {
+            status: Some(status),
+            ..Default::default()
+        };
+        crate::compute::apply_configuration_readiness(&mut sandbox);
+        let status = sandbox.status.expect("status is retained");
         assert_eq!(
-            overlap_hash, PUBLIC_DURABLE_OVERLAP_SHA256,
-            "the public/durable protobuf overlap changed; review both API and storage compatibility before updating this inventory"
+            status.phase,
+            i32::from(openshell_core::proto::SandboxPhase::Provisioning)
         );
+        assert_eq!(status.configuration_activation_authorized, None);
+        assert!(status.conditions.iter().any(
+            |condition| condition.r#type == "ConfigurationReady" && condition.status == "False"
+        ));
     }
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {

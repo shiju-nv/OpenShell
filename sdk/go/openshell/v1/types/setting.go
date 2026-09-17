@@ -72,6 +72,22 @@ type SandboxConfig struct {
 	// PolicyValidationFailureMode is the gateway-configured posture for rejected
 	// policy generations ("fail_closed" or "retain_last_valid").
 	PolicyValidationFailureMode string
+	// ConfigurationAdmitted reports gateway validation of this policy/provider composition.
+	// Runtime activation is reported by SandboxStatus.ConfigurationAdmission.
+	ConfigurationAdmitted bool
+	// ConfigurationError is the credential-free diagnostic for a rejected composition.
+	ConfigurationError string
+	// ConfigurationSnapshot identifies the delivered composition when control is registered.
+	ConfigurationSnapshot string
+	// ConfigurationInstanceID and ConfigurationBoundaryInstanceID identify registered processes.
+	ConfigurationInstanceID         string
+	ConfigurationBoundaryInstanceID string
+	// RuntimeGeneration identifies the authenticated sandbox launch.
+	RuntimeGeneration string
+	// ConfigurationRegistrationRevision fences control and boundary registration changes.
+	ConfigurationRegistrationRevision uint64
+	// ConfigurationDeliveryRevision orders deliveries within the current registration.
+	ConfigurationDeliveryRevision uint64
 }
 
 // GatewayConfig represents gateway-global settings.

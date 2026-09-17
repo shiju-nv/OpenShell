@@ -4462,6 +4462,7 @@ dependencies = [
  "noyalib",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4532,6 +4533,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4711,8 +4713,8 @@ dependencies = [
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
- "prost",
  "prost-types",
+ "rcgen",
  "rustix 1.1.4",
  "rustls",
  "serde",
@@ -4725,7 +4727,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -4786,6 +4787,7 @@ dependencies = [
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-policy-schema",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "prost-types",

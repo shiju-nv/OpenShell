@@ -158,6 +158,8 @@ Blocks until the sandbox reaches the `Ready` phase, returning the final sandbox 
 
 If the sandbox enters the `Error` phase, WaitReady returns immediately with a `StatusError`.
 
+A rejected configuration remains available for repair and does not by itself put the sandbox in the terminal `Error` phase. Inspect `Status.ConfigurationDesired` and `Status.ConfigurationAdmission` for the desired and reported revisions, validation errors, and runtime activation confirmation. `ConfigurationAdmission.State == v1.ConfigurationAdmissionAccepted` means validation succeeded; `ActivationConfirmed` records the runtime acknowledgment. `WaitReady` continues waiting while the gateway reports the sandbox as unready, so use a context deadline while another operation repairs the configuration.
+
 ```go
 // Wait with a 30-second timeout
 ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

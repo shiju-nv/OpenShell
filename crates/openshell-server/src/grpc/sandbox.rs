@@ -477,6 +477,19 @@ async fn handle_create_sandbox_inner(
         created_from_workload_template,
     };
     sandbox.set_phase(SandboxPhase::Provisioning as i32);
+    sandbox
+        .status
+        .get_or_insert_with(Default::default)
+        .configuration_admission = Some(openshell_core::proto::SandboxConfigurationAdmission {
+        state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
+        ..Default::default()
+    });
+    sandbox
+        .status
+        .as_mut()
+        .expect("status initialized")
+        .configuration_activation_authorized = Some(false);
+    crate::compute::apply_configuration_readiness(&mut sandbox);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
@@ -504,6 +517,11 @@ async fn handle_create_sandbox_inner(
     let runtime_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
         .map_err(|error| Status::internal(error.to_string()))?;
     if let Some(metadata) = sandbox.metadata.as_mut() {
+        // Registration retirement is gateway-owned authority, so user-supplied
+        // create annotations cannot clear or pre-populate its tombstones.
+        metadata
+            .annotations
+            .remove(super::policy::CONFIGURATION_REGISTRATION_HISTORY);
         runtime_identity.write(&mut metadata.annotations);
     }
     let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
@@ -1444,27 +1462,13 @@ async fn handle_start_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-    let current = sandbox_by_name(state, &workspace, &req.name).await?;
-    let current_phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
-    let launch_authentication = if current_phase == SandboxPhase::Ready {
-        Vec::new()
-    } else if state.sandbox_session_jwt_authority.is_some() {
-        let authentication = if matches!(
-            current_phase,
-            SandboxPhase::Stopped | SandboxPhase::Completed
-        ) {
-            mint_next_runtime_authentication(state, &current).await?
-        } else {
-            mint_persisted_authentication(state, &current)?
-        };
-        serde_json::to_vec(&authentication)
-            .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?
-    } else {
-        Vec::new()
-    };
     let mut sandbox = state
         .compute
-        .start_sandbox_authenticated(&workspace, &req.name, launch_authentication)
+        .start_sandbox_authenticated(
+            &workspace,
+            &req.name,
+            state.sandbox_session_jwt_authority.as_deref(),
+        )
         .await?;
     state
         .supervisor_sessions
@@ -1491,50 +1495,6 @@ pub fn mint_persisted_authentication(
         crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
     authority.mint_persisted_launch(sandbox.object_id(), &identity)
-}
-
-async fn mint_next_runtime_authentication(
-    state: &Arc<ServerState>,
-    sandbox: &Sandbox,
-) -> Result<openshell_core::jwt::SandboxLaunchAuthentication, Status> {
-    let authority = state
-        .sandbox_session_jwt_authority
-        .as_ref()
-        .ok_or_else(|| Status::failed_precondition("sandbox session authority is unavailable"))?;
-    let metadata = sandbox
-        .metadata
-        .as_ref()
-        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
-    let current =
-        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    let next_epoch = current
-        .auth_epoch
-        .get()
-        .checked_add(1)
-        .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
-        .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
-    let next = crate::auth::sandbox_session::PersistedSandboxIdentity {
-        runtime_generation: current.runtime_generation,
-        auth_epoch: next_epoch,
-        gateway_token_id: uuid::Uuid::new_v4(),
-        refresh_replay: None,
-    };
-    let authentication = authority.mint_persisted_launch(sandbox.object_id(), &next)?;
-    state
-        .store
-        .update_message_cas::<Sandbox, _>(
-            sandbox.object_id(),
-            metadata.resource_version,
-            |updated| {
-                if let Some(metadata) = updated.metadata.as_mut() {
-                    next.write(&mut metadata.annotations);
-                }
-            },
-        )
-        .await
-        .map_err(|error| Status::aborted(format!("persist sandbox runtime identity: {error}")))?;
-    Ok(authentication)
 }
 
 async fn sandbox_by_name(
@@ -4259,7 +4219,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "collision".to_string(),
@@ -4273,7 +4233,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .unwrap_err();
 
@@ -4287,7 +4247,7 @@ mod tests {
     async fn create_sandbox_uses_configured_provider_profile_sources() {
         let state = test_server_state_with_user_only_github_profile().await;
 
-        let response = handle_create_sandbox(
+        let response = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "user-catalog".to_string(),
@@ -4298,7 +4258,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .expect("user-only profile catalog should not include the builtin github profile")
         .into_inner();
@@ -4321,7 +4281,7 @@ mod tests {
             },
         );
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "reserved-policy-key".to_string(),
@@ -4335,7 +4295,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .unwrap_err();
 
@@ -4428,7 +4388,7 @@ mod tests {
     async fn create_sandbox_canonicalizes_mcp_versions_before_persistence() {
         let state = test_server_state().await;
 
-        handle_create_sandbox(
+        Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "mcp-canonical".to_string(),
@@ -4441,7 +4401,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 ..Default::default()
             }),
-        )
+        ))
         .await
         .expect("supported MCP versions must be accepted");
 
@@ -4485,7 +4445,7 @@ mod tests {
         let mut expected_bytes = None;
 
         for (sandbox_name, mcp) in cases {
-            handle_create_sandbox(
+            Box::pin(handle_create_sandbox(
                 &state,
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
@@ -4498,7 +4458,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 }),
-            )
+            ))
             .await
             .expect("defaultable MCP versions must be accepted");
 
@@ -4584,7 +4544,7 @@ mod tests {
                     .expect("defaultable MCP policy must be canonicalizable");
                 assert_eq!(canonical.encoded_len(), target_size, "{sandbox_name}");
 
-                let result = handle_create_sandbox(
+                let result = Box::pin(handle_create_sandbox(
                     &state,
                     authed_request(CreateSandboxRequest {
                         name: sandbox_name.clone(),
@@ -4597,7 +4557,7 @@ mod tests {
                         workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                         ..Default::default()
                     }),
-                )
+                ))
                 .await;
 
                 if should_accept {
@@ -4652,7 +4612,7 @@ mod tests {
         ];
 
         for &(sandbox_name, versions) in cases {
-            let error = handle_create_sandbox(
+            let error = Box::pin(handle_create_sandbox(
                 &state,
                 authed_request(CreateSandboxRequest {
                     name: sandbox_name.to_string(),
@@ -4665,7 +4625,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 }),
-            )
+            ))
             .await
             .expect_err("invalid MCP versions must reject sandbox creation");
 
@@ -4683,28 +4643,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_persists_long_metadata_annotations() {
+    async fn configuration_activation_create_preserves_user_annotations_but_discards_forged_history()
+     {
         let state = test_server_state().await;
         let annotation_key = "openshell.nvidia.com/policy-signature".to_string();
         let annotation_value = "x".repeat(512);
 
-        let response = handle_create_sandbox(
+        let response = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "annotated".to_string(),
                 spec: Some(SandboxSpec::default()),
                 labels: HashMap::new(),
-                annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
+                annotations: HashMap::from([
+                    (annotation_key.clone(), annotation_value.clone()),
+                    (
+                        super::super::policy::CONFIGURATION_REGISTRATION_HISTORY.to_string(),
+                        "forged-retirement-history".to_string(),
+                    ),
+                ]),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .expect("long annotations should be accepted")
         .into_inner();
 
         let created = response.sandbox.expect("created sandbox");
+        assert!(
+            !created
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .contains_key(super::super::policy::CONFIGURATION_REGISTRATION_HISTORY)
+        );
         assert_eq!(
             created
                 .metadata
@@ -4746,7 +4721,7 @@ mod tests {
             ..Default::default()
         };
 
-        let response = handle_create_sandbox(
+        let response = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "partial-id".to_string(),
@@ -4760,7 +4735,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .expect("partial process identity should be accepted")
         .into_inner();
@@ -4811,7 +4786,7 @@ mod tests {
             ..Default::default()
         };
 
-        let response = handle_create_sandbox(
+        let response = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "kube-partial-id".to_string(),
@@ -4825,7 +4800,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .expect("partial Kubernetes process identity should be accepted")
         .into_inner();
@@ -4846,7 +4821,7 @@ mod tests {
     #[tokio::test]
     async fn create_sandbox_still_rejects_long_label_values() {
         let state = test_server_state().await;
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "bad-label".to_string(),
@@ -4857,7 +4832,7 @@ mod tests {
                 await_main_process_attachment: false,
                 workload_template_name: String::new(),
             }),
-        )
+        ))
         .await
         .unwrap_err();
 
@@ -4877,7 +4852,7 @@ mod tests {
         let guard = state.compute.sandbox_sync_guard().await;
         let task_state = state.clone();
         let task = tokio::spawn(async move {
-            handle_create_sandbox(
+            Box::pin(handle_create_sandbox(
                 &task_state,
                 authed_request(CreateSandboxRequest {
                     name: "guarded-create".to_string(),
@@ -4891,7 +4866,7 @@ mod tests {
                     await_main_process_attachment: false,
                     workload_template_name: String::new(),
                 }),
-            )
+            ))
             .await
         });
 
@@ -5452,7 +5427,7 @@ mod tests {
             },
         );
 
-        let created = handle_create_sandbox(
+        let created = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "from-template".to_string(),
@@ -5471,7 +5446,7 @@ mod tests {
                 workload_template_name: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect("sandbox create from template should succeed")
         .into_inner()
@@ -5544,7 +5519,7 @@ mod tests {
         .await
         .expect("template create should succeed");
 
-        let created = handle_create_sandbox(
+        let created = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "from-template".to_string(),
@@ -5557,7 +5532,7 @@ mod tests {
                 workload_template_name: "default-image".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect("sandbox create from template should succeed")
         .into_inner()
@@ -5595,7 +5570,7 @@ mod tests {
         .await
         .expect("template create should succeed");
 
-        let created = handle_create_sandbox(
+        let created = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "from-template".to_string(),
@@ -5608,7 +5583,7 @@ mod tests {
                 workload_template_name: "default-gpu".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect("sandbox create from template should succeed")
         .into_inner()
@@ -5634,7 +5609,7 @@ mod tests {
         template.spec = None;
         state.store.put_message(&template).await.unwrap();
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "from-corrupt".to_string(),
@@ -5647,7 +5622,7 @@ mod tests {
                 workload_template_name: "corrupt-template".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect_err("corrupted stored template should fail as server data corruption");
 
@@ -5670,7 +5645,7 @@ mod tests {
         .await
         .expect("template create should succeed");
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "bad-template-create".to_string(),
@@ -5686,7 +5661,7 @@ mod tests {
                 workload_template_name: "gpu-kata".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect_err("inline workload overrides should be rejected");
 
@@ -5698,7 +5673,7 @@ mod tests {
     async fn create_sandbox_from_workload_template_rejects_malformed_template_name() {
         let state = test_server_state().await;
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "bad-template-create".to_string(),
@@ -5711,7 +5686,7 @@ mod tests {
                 workload_template_name: "Invalid_Template_Name".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect_err("malformed template name should be rejected before lookup");
 
@@ -5723,7 +5698,7 @@ mod tests {
     async fn create_sandbox_from_workload_template_rejects_oversized_governance_before_lookup() {
         let state = test_server_state().await;
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "bad-template-create".to_string(),
@@ -5739,7 +5714,7 @@ mod tests {
                 workload_template_name: "missing-template".to_string(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect_err("oversized governance spec should be rejected before template lookup");
 
@@ -5751,7 +5726,7 @@ mod tests {
     async fn create_sandbox_rejects_oversized_direct_spec_before_workspace_lookup() {
         let state = test_server_state().await;
 
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             authed_request(CreateSandboxRequest {
                 name: "bad-direct-create".to_string(),
@@ -5767,7 +5742,7 @@ mod tests {
                 workload_template_name: String::new(),
                 await_main_process_attachment: false,
             }),
-        )
+        ))
         .await
         .expect_err("oversized direct spec should be rejected before workspace lookup");
 
@@ -6711,14 +6686,14 @@ mod tests {
         // --- handle_create_sandbox ---
         // Provide a spec so the handler passes the "spec is required" check
         // before reaching authorize_workspace.
-        let err = handle_create_sandbox(
+        let err = Box::pin(handle_create_sandbox(
             &state,
             non_member_request(CreateSandboxRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 spec: Some(SandboxSpec::default()),
                 ..Default::default()
             }),
-        )
+        ))
         .await
         .unwrap_err();
         assert_eq!(

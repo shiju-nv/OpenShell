@@ -266,7 +266,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        sandbox::handle_create_sandbox(&self.state, request).await
+        Box::pin(sandbox::handle_create_sandbox(&self.state, request)).await
     }
 
     async fn begin_rootfs_tar_staging(
@@ -613,6 +613,13 @@ impl OpenShell for OpenShellService {
         request: Request<ReportEndpointStatusRequest>,
     ) -> Result<Response<ReportEndpointStatusResponse>, Status> {
         policy::handle_report_endpoint_status(&self.state, request).await
+    }
+
+    async fn report_sandbox_configuration(
+        &self,
+        request: Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        policy::handle_report_sandbox_configuration(&self.state, request).await
     }
 
     // --- Sandbox logs ---

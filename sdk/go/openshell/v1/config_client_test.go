@@ -144,6 +144,8 @@ func TestConfigGetSandbox(t *testing.T) {
 	// Verify request was forwarded with resolved ID (stubSandboxResolver returns "sb-<name>").
 	mock.mu.Lock()
 	assert.Equal(t, "sb-my-sandbox", mock.lastSandboxReq.GetSandboxId())
+	// SDK observations must not issue authoritative deliveries for runtime control.
+	assert.Empty(t, mock.lastSandboxReq.GetConfigurationInstanceId())
 	mock.mu.Unlock()
 
 	// Scalar fields.

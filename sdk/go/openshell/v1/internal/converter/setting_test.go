@@ -269,11 +269,19 @@ func TestSandboxConfigFromProto(t *testing.T) {
 				Scope: sbv1.SettingScope_SETTING_SCOPE_GLOBAL,
 			},
 		},
-		ConfigRevision:              100,
-		PolicySource:                sbv1.PolicySource_POLICY_SOURCE_SANDBOX,
-		GlobalPolicyVersion:         5,
-		ProviderEnvRevision:         200,
-		PolicyValidationFailureMode: "fail_closed",
+		ConfigRevision:                    100,
+		PolicySource:                      sbv1.PolicySource_POLICY_SOURCE_SANDBOX,
+		GlobalPolicyVersion:               5,
+		ProviderEnvRevision:               200,
+		PolicyValidationFailureMode:       "fail_closed",
+		ConfigurationAdmitted:             false,
+		ConfigurationError:                "invalid provider binding",
+		ConfigurationSnapshot:             "snapshot-1",
+		ConfigurationInstanceId:           "control-1",
+		ConfigurationBoundaryInstanceId:   "boundary-1",
+		RuntimeGeneration:                 "runtime-1",
+		ConfigurationRegistrationRevision: 10,
+		ConfigurationDeliveryRevision:     11,
 	}
 
 	sc := SandboxConfigFromProto(resp)
@@ -290,6 +298,14 @@ func TestSandboxConfigFromProto(t *testing.T) {
 	assert.Equal(t, uint32(5), sc.GlobalPolicyVersion)
 	assert.Equal(t, uint64(200), sc.ProviderEnvRevision)
 	assert.Equal(t, "fail_closed", sc.PolicyValidationFailureMode)
+	assert.False(t, sc.ConfigurationAdmitted)
+	assert.Equal(t, "invalid provider binding", sc.ConfigurationError)
+	assert.Equal(t, "snapshot-1", sc.ConfigurationSnapshot)
+	assert.Equal(t, "control-1", sc.ConfigurationInstanceID)
+	assert.Equal(t, "boundary-1", sc.ConfigurationBoundaryInstanceID)
+	assert.Equal(t, "runtime-1", sc.RuntimeGeneration)
+	assert.Equal(t, uint64(10), sc.ConfigurationRegistrationRevision)
+	assert.Equal(t, uint64(11), sc.ConfigurationDeliveryRevision)
 
 	require.Len(t, sc.Settings, 2)
 
