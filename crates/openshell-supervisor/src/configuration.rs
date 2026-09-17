@@ -535,10 +535,9 @@ impl ConfigurationSession {
             .map_err(|error| {
                 preparation_operation_error(error, "Provider environment is unavailable")
             })?;
-        if self.startup_pending
-            && snapshot.configuration_admitted
-            && provider.provider_env_revision != snapshot.provider_env_revision
-        {
+        let provider_revision_changed =
+            provider.provider_env_revision != snapshot.provider_env_revision;
+        if self.startup_pending && snapshot.configuration_admitted && provider_revision_changed {
             // A concurrently rotated provider requires a fresh snapshot, not
             // an authored-policy rejection that resets the startup budget.
             return Err(openshell_core::grpc_client::grpc_status_error(

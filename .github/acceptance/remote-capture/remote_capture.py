@@ -18,7 +18,7 @@ import time
 import uuid
 
 
-CANDIDATE_TREE = "91ef9d67772e114d5aa2cea2964b7baa7cfd131d"
+CANDIDATE_TREE = "1a016bd8db9038dd830281c9b1074e2b2d0fb025"
 HISTORICAL_SOURCE_SHA256 = "41ab5ee8614cee7910b58ed5c5600036f3c32bbc3ae567446d9ec6c357c54030"
 HARNESSES = {"policy_activation", "configuration_composition_acceptance"}
 # No prefix-based expansion is allowed: hosted credentials may share familiar
@@ -287,7 +287,7 @@ def fingerprint_closure(root):
     return sorted(selected), nodes[root]
 
 
-def depfile_inputs(path, executable, source, target):
+def depfile_inputs(path, executable, source, target, workspace):
     """Resolve compiler paths and admit only inputs inside the selected roots."""
     text = path.read_text().replace("\\\n", "")
     rules = [line[len(str(executable)) + 2:] for line in text.splitlines()
@@ -295,11 +295,16 @@ def depfile_inputs(path, executable, source, target):
     require(len(rules) == 1, "Depfile lacks exactly one executable rule")
     values = []
     source, target = source.resolve(strict=True), target.resolve(strict=True)
+    require(workspace.is_absolute() and workspace.resolve(strict=True) == workspace
+            and workspace.is_dir() and workspace.is_relative_to(source),
+            "Cargo depfile workspace is outside the selected checkout")
     for name in shlex.split(rules[0]):
         path = Path(name.replace("$$", "$"))
         # include_str! and include_bytes! preserve lexical parent components
         # in rustc depfiles. Resolve them before containment, including symlinks.
-        path = (path if path.is_absolute() else source / path).resolve(strict=True)
+        # Cargo makes relative dep-info paths relative to its workspace root,
+        # which can be a nested standalone workspace inside the checkout.
+        path = (path if path.is_absolute() else workspace / path).resolve(strict=True)
         require(path.is_relative_to(source) or path.is_relative_to(target), "Depfile input escapes source/target roots")
         values.append(path)
     require(values and len(values) == len(set(values)), "Empty or duplicate executable dependencies")
@@ -329,7 +334,9 @@ def capture_provenance(original, directory, context, environment):
     require(len(packages) == 1, "Executed target is not one workspace package")
     package = packages[0]
     manifest = Path(package["manifest_path"])
-    require(manifest.is_relative_to(source) and Path.cwd() == manifest.parent,
+    workspace = Path(metadata["workspace_root"])
+    require(manifest.is_relative_to(workspace) and manifest.is_relative_to(source)
+            and Path.cwd() == manifest.parent,
             "Actual runner cwd differs from selected Cargo package")
     targets = []
     for row in package["targets"]:
@@ -363,7 +370,7 @@ def capture_provenance(original, directory, context, environment):
         retain(path.with_suffix(""), "fingerprint")
     depfile = original.with_suffix(".d")
     retain(depfile, "depfile")
-    dependencies = depfile_inputs(depfile, original, source, target)
+    dependencies = depfile_inputs(depfile, original, source, target, workspace)
     require(Path(targets[0]["src_path"]).resolve(strict=True) in dependencies, "Depfile lacks selected metadata source")
     source_inputs = []
     frozen = json.loads((evidence / "source-before.json").read_text())["files"]
@@ -385,7 +392,8 @@ def capture_provenance(original, directory, context, environment):
     save(directory / "artifacts.json", artifacts)
     return {"leaf": leaf, "package_id": package["id"], "package": package_name,
             "target_name": targets[0]["name"], "kind": targets[0]["kind"], "features": features,
-            "target_root": str(target), "executable_target_relative_path": str(original.relative_to(target)),
+            "target_root": str(target), "depfile_base": str(workspace),
+            "executable_target_relative_path": str(original.relative_to(target)),
             "source_inputs": source_inputs, "fingerprint_target_relative_path": str(fingerprint.relative_to(target)),
             "metadata": asset(metadata_directory / "metadata.json", evidence),
             "metadata_receipt": asset(metadata_directory / "metadata-receipt.json", evidence),

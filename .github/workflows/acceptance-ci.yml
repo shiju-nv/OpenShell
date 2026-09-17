@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ACCEPTANCE_PRODUCT_COMMIT: 64b5b2c49e206c124c2b089f146c81e7e0551570
+  ACCEPTANCE_PRODUCT_COMMIT: d3c7f52a1d86718de8a4525f2932273367b96ada
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_BUILD_JOBS: "2"
@@ -100,7 +100,9 @@ jobs:
         run: |
           args=(--suite "$SUITE")
           if [[ "$SUITE" == rust-tests ]]; then
-            args=(--suite command -- python3 .acceptance-control/remote-capture/remote_capture.py
+            args=(--suite command -- python3 .acceptance-control/linux-runner-assessment/runner-scripts/confined_task.py
+              --evidence "$RUNNER_TEMP/acceptance-evidence/confinement" --
+              python3 .acceptance-control/remote-capture/remote_capture.py
               run --mode native --evidence "$RUNNER_TEMP/acceptance-evidence/native-capture"
               -- mise run --jobs 1 test:rust)
           fi
@@ -146,11 +148,15 @@ jobs:
           version: v2026.9.9
       - name: Run exact shipping Linux feature coverage
         run: |
+          task=(python3 .acceptance-control/linux-runner-assessment/extras-scripts/extras.py
+            --scope '${{ matrix.scope }}' --evidence "$RUNNER_TEMP/acceptance-evidence/extras"
+            --target-dir "$CARGO_TARGET_DIR")
+          if [[ '${{ matrix.scope }}' == nextest ]]; then
+            task=(python3 .acceptance-control/linux-runner-assessment/runner-scripts/confined_task.py
+              --evidence "$RUNNER_TEMP/acceptance-evidence/confinement" -- "${task[@]}")
+          fi
           python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
-            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/outer" -- \
-            python3 .acceptance-control/linux-runner-assessment/extras-scripts/extras.py \
-            --scope '${{ matrix.scope }}' --evidence "$RUNNER_TEMP/acceptance-evidence/extras" \
-            --target-dir "$CARGO_TARGET_DIR"
+            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/outer" -- "${task[@]}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
