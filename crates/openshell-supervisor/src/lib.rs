@@ -21,6 +21,9 @@ mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
 
+#[cfg(test)]
+mod shutdown_tests;
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::io::Write as _;
@@ -87,6 +90,48 @@ where
         () = &mut phase => false,
         () = &mut shutdown => true,
     }
+}
+
+/// Shut down the complete boundary even when configuration holds defer process signals.
+async fn shutdown_boundary(
+    running: &dyn openshell_isolation_interface::contract::RunningBoundary,
+    grace_period: Duration,
+    request_timeout: Duration,
+) -> Result<i32> {
+    use openshell_isolation_interface::contract::{BoundaryExitStatus, BoundarySignal};
+
+    let agent = running.agent();
+    // Signal delivery and exit share one grace budget. A held process can
+    // acknowledge TERM without exiting, and an unavailable transport can stall
+    // signal delivery; neither may prevent terminal boundary teardown.
+    let graceful = timeout(grace_period, async {
+        let _ = agent.signal(BoundarySignal::Term).await;
+        agent.wait().await
+    })
+    .await;
+
+    // Whole-boundary termination closes retained exec children and can end a
+    // configuration hold. Individual KILL cannot, so do not wait for it first.
+    // Attempt cleanup even when the graceful wait returned an error.
+    timeout(request_timeout, running.terminate())
+        .await
+        .map_err(|_| miette::miette!("sandbox terminal acknowledgement timed out"))?
+        .map_err(|error| miette::miette!("sandbox did not acknowledge terminal state: {error}"))?;
+
+    let status = match graceful {
+        Ok(result) => result,
+        // The backend retains the main status from its terminal receipt;
+        // remote Wait authorization is already revoked. Bound this trait call
+        // even if a backend fails to complete its retained-status observation.
+        Err(_) => timeout(request_timeout, agent.wait()).await.map_err(|_| {
+            miette::miette!("main process exit status timed out after boundary termination")
+        })?,
+    }
+    .map_err(|error| miette::miette!("main process exit status unavailable: {error}"))?;
+    Ok(match status {
+        BoundaryExitStatus::Exited(code) => code,
+        BoundaryExitStatus::Signaled(signal) => 128_i32.saturating_add(signal),
+    })
 }
 
 struct ControlReadiness {
@@ -1053,28 +1098,13 @@ pub async fn run_sandbox(
                 ));
             }
             () = &mut shutdown_requested => {
-                let _ = agent
-                    .signal(openshell_isolation_interface::contract::BoundarySignal::Term)
-                    .await;
-                let status = if let Ok(result) = timeout(Duration::from_secs(5), agent.wait()).await {
-                    result
-                } else {
-                    let _ = agent.terminate().await;
-                    agent.wait().await
-                }
-                .map_err(|error| miette::miette!(error.to_string()))?;
-                let exit_code = match status {
-                    openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code) => code,
-                    openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(signal) => {
-                        128_i32.saturating_add(signal)
-                    }
-                };
-                running
-                    .terminate()
-                    .await
-                    .map_err(|error| miette::miette!(
-                        "sandbox did not acknowledge terminal state: {error}"
-                    ))?;
+                // Match the backend's ordinary control-request deadline while
+                // retaining the existing five-second application shutdown grace.
+                let exit_code = shutdown_boundary(
+                    running.as_ref(),
+                    Duration::from_secs(5),
+                    Duration::from_secs(30),
+                ).await?;
                 (exit_code, false)
             }
         };

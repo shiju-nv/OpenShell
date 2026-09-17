@@ -2216,14 +2216,19 @@ mod linux {
         }
 
         async fn terminate_boundary(&self) -> Response {
-            {
+            let already_terminal = {
                 let mut activation = lock(&self.activation);
                 let _ = self.hold_configuration(&mut activation);
                 let mut connection = lock(&self.supervisor_connection);
                 if *connection == SupervisorConnectionState::Terminal {
-                    return Response::BoundaryTerminated;
+                    true
+                } else {
+                    *connection = SupervisorConnectionState::Terminating;
+                    false
                 }
-                *connection = SupervisorConnectionState::Terminating;
+            };
+            if already_terminal {
+                return self.terminal_response();
             }
             // Revocation happens before process shutdown so no concurrent or
             // replacement connection can race the terminal transition.
@@ -2243,7 +2248,31 @@ mod linux {
                 return guest_error(BoundaryErrorKind::Process, error);
             }
             *lock(&self.supervisor_connection) = SupervisorConnectionState::Terminal;
-            Response::BoundaryTerminated
+            self.terminal_response()
+        }
+
+        fn terminal_response(&self) -> Response {
+            let state = lock(&self.state);
+            let main_exit_status = if let RuntimeState::Running(process) = &*state {
+                // Shutdown waits for the reaper's result as well as the owned
+                // tree. Never invent a status after revoking remote Wait.
+                let (exit, _) = &*process.exit;
+                match lock(exit).as_ref() {
+                    Some(Ok(status)) => Some(*status),
+                    Some(Err(error)) => {
+                        return guest_error(BoundaryErrorKind::Process, error.clone());
+                    }
+                    None => {
+                        return guest_error(
+                            BoundaryErrorKind::Process,
+                            "terminal boundary has no canonical process exit status",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            Response::BoundaryTerminated { main_exit_status }
         }
 
         async fn terminate_process_tree(
@@ -2271,12 +2300,14 @@ mod linux {
 
         async fn wait_for_process_tree_exit(process: &ManagedProcess, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
-            while process.boundary_runtime.has_registered_processes()
+            // The process registry can empty before the canonical reaper
+            // publishes its result. Both observations share this bounded wait.
+            while (process.boundary_runtime.has_registered_processes() || !process.has_exited())
                 && tokio::time::Instant::now() < deadline
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            !process.boundary_runtime.has_registered_processes()
+            !process.boundary_runtime.has_registered_processes() && process.has_exited()
         }
 
         fn shutdown(&self) {
@@ -4502,10 +4533,82 @@ mod linux {
             fn drop(&mut self) {
                 let response = self.runtime.block_on(self.boundary.terminate_boundary());
                 assert!(
-                    matches!(response, Response::BoundaryTerminated),
+                    matches!(
+                        response,
+                        Response::BoundaryTerminated {
+                            main_exit_status: Some(_)
+                        }
+                    ),
                     "workload cleanup failed: {response:?}"
                 );
             }
+        }
+
+        #[test]
+        fn configuration_activation_shutdown_receipt_preserves_main_status_after_hold() {
+            if isolated_activation_test(
+                "configuration_activation_shutdown_receipt_preserves_main_status_after_hold",
+            ) {
+                return;
+            }
+            let fixture = RunningActivationFixture::new();
+            let receipt = test_active_receipt(&fixture.boundary);
+            fixture
+                .boundary
+                .quiesce_configuration(&receipt.identity)
+                .unwrap();
+            assert!(matches!(
+                fixture
+                    .boundary
+                    .signal(&fixture.process_id, SignalWire::Term),
+                Response::Signaled
+            ));
+            assert!(matches!(
+                fixture.boundary.terminate(&fixture.process_id),
+                Response::Terminated
+            ));
+            fixture.assert_held(&receipt);
+            let wait = Request::Wait {
+                process_id: fixture.process_id.clone(),
+            };
+            fixture
+                .boundary
+                .authorize_request(&fixture.principal, &wait)
+                .expect("Wait authorized before terminal teardown");
+
+            let response = fixture
+                .runtime
+                .block_on(fixture.boundary.terminate_boundary());
+            let Response::BoundaryTerminated {
+                main_exit_status: Some(status),
+            } = response
+            else {
+                panic!("launched main requires an observed status: {response:?}");
+            };
+            let process = fixture
+                .boundary
+                .running_process(&fixture.process_id)
+                .unwrap();
+            assert_eq!(
+                process.exit_status(),
+                Some(status),
+                "receipt must retain the real reaper result"
+            );
+            assert!(!process.boundary_runtime.has_registered_processes());
+            assert!(
+                fixture
+                    .boundary
+                    .authorize_request(&fixture.principal, &wait)
+                    .is_err(),
+                "terminal status receipt must not reopen remote Wait authorization"
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .block_on(fixture.boundary.terminate_boundary()),
+                response,
+                "terminal receipt remains stable for repeated teardown"
+            );
         }
 
         #[test]
@@ -5529,7 +5632,9 @@ mod linux {
 
             assert_eq!(
                 runtime.terminate_boundary().await,
-                Response::BoundaryTerminated
+                Response::BoundaryTerminated {
+                    main_exit_status: None
+                }
             );
             assert_eq!(
                 *lock(&runtime.supervisor_connection),
@@ -5538,6 +5643,13 @@ mod linux {
             assert_eq!(
                 runtime.connections.require_active(&principal),
                 Err(openshell_sandbox_backend::sandbox_auth::SandboxAuthError::TerminalSession)
+            );
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated {
+                    main_exit_status: None
+                },
+                "a never-launched boundary has no fabricated main exit status"
             );
         }
 

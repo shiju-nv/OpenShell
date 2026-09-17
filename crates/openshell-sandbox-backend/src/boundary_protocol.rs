@@ -793,7 +793,11 @@ pub enum Response {
     },
     Signaled,
     Terminated,
-    BoundaryTerminated,
+    /// Terminal acknowledgement retains the canonical main's observed status;
+    /// a boundary that never launched a main reports `None`.
+    BoundaryTerminated {
+        main_exit_status: Option<ExitStatusWire>,
+    },
     ExecStarted {
         process_id: String,
         pty: bool,

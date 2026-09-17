@@ -35,8 +35,8 @@ use tokio::net::UnixStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::boundary_protocol::{
-    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, MAX_CONTROL_FRAME_BYTES, Request,
-    RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
+    AgentSpecWire, DnsQueryResultWire, ExecSpecWire, ExitStatusWire, MAX_CONTROL_FRAME_BYTES,
+    Request, RequestEnvelope, Response, ResponseEnvelope, STREAM_EXIT, STREAM_STDERR, STREAM_STDIN,
     STREAM_STDIN_CLOSED, STREAM_STDOUT, SandboxPolicyWire, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTransport, SignalWire, decode_frame, encode_frame,
     read_stream_frame, validate_resource_claims, write_stream_frame,
@@ -530,9 +530,11 @@ impl ReadyBoundary for RemoteReady {
         let process = Arc::new(RemoteProcess {
             client: self.client.clone(),
             process_id,
+            exit_status: std::sync::Mutex::new(None),
         });
         Ok(Box::new(RemoteRunning {
             process,
+            terminated: tokio::sync::Mutex::new(false),
             exec: Arc::new(RemoteExec {
                 client: self.client.clone(),
                 provider_credentials: self.provider_credentials,
@@ -546,6 +548,7 @@ impl ReadyBoundary for RemoteReady {
 
 struct RemoteRunning {
     process: Arc<RemoteProcess>,
+    terminated: tokio::sync::Mutex<bool>,
     exec: Arc<RemoteExec>,
     loopback_connector: Arc<RemoteLoopbackConnector>,
 }
@@ -565,18 +568,57 @@ impl RunningBoundary for RemoteRunning {
     }
 
     async fn terminate(&self) -> Result<(), BackendError> {
+        let mut terminated = self.terminated.lock().await;
+        if *terminated {
+            return Ok(());
+        }
         let response = self
             .process
             .client
             .call_idempotent(Request::TerminateBoundary)
             .await?;
-        expect_response(response, "boundary_terminated")
+        let Response::BoundaryTerminated { main_exit_status } = response else {
+            return Err(unexpected_response("boundary_terminated", &response));
+        };
+        let status = main_exit_status.ok_or_else(|| {
+            BackendError::Process("terminated boundary omitted the launched main's status".into())
+        })?;
+        // Terminal acknowledgement revokes remote Wait authorization. Retain
+        // its observed status before success so all later waits remain local.
+        self.process.record_exit_status(status.into())?;
+        *terminated = true;
+        Ok(())
     }
 }
 
 struct RemoteProcess {
     client: Arc<BoundaryClient>,
     process_id: String,
+    exit_status: std::sync::Mutex<Option<ExitStatusWire>>,
+}
+
+impl RemoteProcess {
+    fn cached_exit_status(&self) -> Option<BoundaryExitStatus> {
+        self.exit_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(Into::into)
+    }
+
+    fn record_exit_status(&self, status: BoundaryExitStatus) -> Result<(), BackendError> {
+        let status = ExitStatusWire::from(status);
+        let mut cached = self
+            .exit_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cached.is_some_and(|previous| previous != status) {
+            return Err(BackendError::Process(
+                "boundary returned conflicting canonical process exit status".into(),
+            ));
+        }
+        *cached = Some(status);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -586,25 +628,37 @@ impl BoundaryProcess for RemoteProcess {
     }
 
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
+        if let Some(status) = self.cached_exit_status() {
+            return Ok(status);
+        }
         let response = self
             .client
             .call_wait(Request::Wait {
                 process_id: self.process_id.clone(),
             })
-            .await
-            .map_err(|error| match error {
-                // A wait that can no longer reach the boundary leaf means the
-                // boundary is gone, not that a retry could still observe the
-                // exit status; report boundary loss per the contract.
-                BackendError::Unavailable(message) => {
-                    BackendError::Terminated(format!("boundary lost during wait: {message}"))
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                // A concurrent terminal receipt may arrive after this wait
+                // starts but before remote authorization rejects it.
+                if let Some(status) = self.cached_exit_status() {
+                    return Ok(status);
                 }
-                error => error,
-            })?;
+                return Err(match error {
+                    BackendError::Unavailable(message) => {
+                        BackendError::Terminated(format!("boundary lost during wait: {message}"))
+                    }
+                    error => error,
+                });
+            }
+        };
         let Response::Exited { status } = response else {
             return Err(unexpected_response("exited", &response));
         };
-        Ok(status.into())
+        let status = status.into();
+        self.record_exit_status(status)?;
+        Ok(status)
     }
 
     async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
@@ -750,6 +804,7 @@ impl BoundaryProcess for RemoteExecProcess {
         RemoteProcess {
             client: self.client.clone(),
             process_id: self.process_id.clone(),
+            exit_status: std::sync::Mutex::new(None),
         }
         .wait()
         .await
@@ -2594,7 +2649,6 @@ fn expect_response(response: Response, expected: &str) -> Result<(), BackendErro
             | (Response::Confirmed { .. }, "confirmed")
             | (Response::Signaled, "signaled")
             | (Response::Terminated, "terminated")
-            | (Response::BoundaryTerminated, "boundary_terminated")
     );
     if matches {
         Ok(())
@@ -2633,7 +2687,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
-    use crate::boundary_protocol::{ExitStatusWire, generate_sandbox_tls_material};
+    use crate::boundary_protocol::generate_sandbox_tls_material;
     use crate::proto::{
         BoundaryChunk,
         isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
@@ -2733,6 +2787,93 @@ mod tests {
         });
         client.activation.lock().unwrap().identity = Some(test_activation().identity);
         (client, server)
+    }
+
+    fn shutdown_test_running(client: Arc<BoundaryClient>) -> RemoteRunning {
+        RemoteRunning {
+            process: Arc::new(RemoteProcess {
+                client: client.clone(),
+                process_id: "test-generation:main:0".to_string(),
+                exit_status: std::sync::Mutex::new(None),
+            }),
+            terminated: tokio::sync::Mutex::new(false),
+            exec: Arc::new(RemoteExec {
+                client: client.clone(),
+                provider_credentials: openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(1, HashMap::new()),
+            }),
+            loopback_connector: Arc::new(RemoteLoopbackConnector { client }),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_receipt_caches_main_status_without_post_terminal_rpc() {
+        for status in [ExitStatusWire::Exited(7), ExitStatusWire::Signaled(15)] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (client, server) = configuration_client_with_service(TestGrpcBoundary {
+                wait_for_half_close: false,
+                expected_token: "a".repeat(32),
+                requests: requests.clone(),
+                mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                mediation_ready: false,
+                response_override: Some(Response::BoundaryTerminated {
+                    main_exit_status: Some(status),
+                }),
+                response_permits: None,
+            })
+            .await;
+            let running = shutdown_test_running(client);
+            let retained_agent = running.agent();
+            running.terminate().await.expect("terminal receipt");
+            // A new remote Wait would receive the wrong response kind here.
+            // Stable status and repeat termination must use the received proof.
+            for _ in 0..2 {
+                assert_eq!(
+                    ExitStatusWire::from(retained_agent.wait().await.unwrap()),
+                    status
+                );
+                running
+                    .terminate()
+                    .await
+                    .expect("repeat acknowledged teardown");
+            }
+            assert_eq!(
+                requests.load(Ordering::Acquire),
+                1,
+                "terminal receipt must eliminate later RPCs"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_receipt_rejects_missing_or_conflicting_main_status() {
+        for main_exit_status in [None, Some(ExitStatusWire::Exited(8))] {
+            let (client, server) =
+                configuration_client(Some(Response::BoundaryTerminated { main_exit_status })).await;
+            let running = shutdown_test_running(client);
+            running
+                .process
+                .record_exit_status(BoundaryExitStatus::Exited(7))
+                .unwrap();
+            let error = running
+                .terminate()
+                .await
+                .expect_err("running main requires a matching observed status");
+            assert!(error.to_string().contains(if main_exit_status.is_none() {
+                "omitted"
+            } else {
+                "conflicting"
+            }));
+            assert!(
+                !*running.terminated.lock().await,
+                "invalid receipt is not terminal proof"
+            );
+            assert_eq!(
+                ExitStatusWire::from(running.agent().wait().await.unwrap()),
+                ExitStatusWire::Exited(7)
+            );
+            server.abort();
+        }
     }
 
     async fn assert_mediation_waits_and_reopens(dns: bool) {
@@ -3724,7 +3865,9 @@ mod tests {
                                 Response::Signaled
                             }
                             Request::Terminate { .. } => Response::Terminated,
-                            Request::TerminateBoundary => Response::BoundaryTerminated,
+                            Request::TerminateBoundary => Response::BoundaryTerminated {
+                                main_exit_status: Some(ExitStatusWire::Exited(23)),
+                            },
                             Request::Resize { .. } => Response::Resized,
                             Request::LoopbackConnect { .. } => Response::PortConnected,
                             Request::StartAgent { activation, .. } => Response::Started {

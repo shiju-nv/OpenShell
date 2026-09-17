@@ -132,6 +132,14 @@ struct PolicyCommitPause {
     resume: Arc<tokio::sync::Semaphore>,
 }
 
+/// Per-request synchronization after a setting update reads its sandbox baseline.
+#[cfg(test)]
+#[derive(Clone)]
+struct SettingBaselinePause {
+    entered: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Semaphore>,
+}
+
 // Private wire-only compatibility types for policy history written before
 // 0.1.0. Public generated bindings intentionally reserve NetworkBinary tag 2,
 // but stored policies still need its former advisor-provenance value migrated
@@ -3551,18 +3559,16 @@ async fn handle_update_config_inner(
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     #[cfg(test)]
     let commit_pause = request.extensions().get::<PolicyCommitPause>().cloned();
+    #[cfg(test)]
+    let setting_baseline_pause = request.extensions().get::<SettingBaselinePause>().cloned();
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
     // Runtime identity and retirement are gateway activation authority. User
     // and sandbox metadata updates must not alter those trusted inputs.
-    if [
-        CONFIGURATION_REGISTRATION_HISTORY,
-        crate::auth::sandbox_session::RUNTIME_GENERATION_ANNOTATION,
-        crate::auth::sandbox_session::AUTH_EPOCH_ANNOTATION,
-    ]
-    .iter()
-    .any(|key| req.annotations.contains_key(*key))
-    {
+    if req.annotations.keys().any(|key| {
+        key == CONFIGURATION_REGISTRATION_HISTORY
+            || crate::auth::sandbox_session::is_runtime_identity_annotation(key)
+    }) {
         return Err(Status::invalid_argument(
             "runtime identity and control registration history are gateway-owned metadata",
         ));
@@ -3831,10 +3837,10 @@ async fn handle_update_config_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
-    // Validation below may await external middleware and provider sources.
-    // Fence every commit to the sandbox baseline actually observed, even when
-    // the caller omitted an optimistic-concurrency version.
-    let expected_resource_version = if req.expected_resource_version == 0 {
+    // Policy validation may await middleware and providers, so policy commits
+    // must fence the observed sandbox baseline. Settings retain the caller's
+    // version: zero allows annotations to follow the serialized settings write.
+    let expected_resource_version = if !has_setting && req.expected_resource_version == 0 {
         sandbox
             .metadata
             .as_ref()
@@ -3847,6 +3853,16 @@ async fn handle_update_config_inner(
     let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
+        #[cfg(test)]
+        if let Some(pause) = setting_baseline_pause {
+            pause.entered.notify_one();
+            pause
+                .resume
+                .acquire()
+                .await
+                .map_err(|_| Status::internal("setting baseline test pause closed"))?
+                .forget();
+        }
         let _settings_guard = state.settings_mutex.lock().await;
 
         if key == POLICY_SETTING_KEY {
@@ -7829,6 +7845,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
 
+    include!("policy/auth_metadata_tests.rs");
+
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
     /// user-facing behavior and should not trip sandbox equality checks.
@@ -8177,6 +8195,142 @@ mod tests {
         admission.config_revision = config.config_revision;
         admission.provider_env_revision = config.provider_env_revision;
         (state, sandbox_id, admission)
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_default_setting_updates_do_not_inherit_policy_baseline_cas() {
+        let state = test_server_state().await;
+        let id = uuid::Uuid::new_v4().to_string();
+        state
+            .store
+            .put_message(&test_sandbox(
+                &id,
+                "race",
+                openshell_policy::restrictive_default_policy(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let baseline = state
+            .store
+            .get_message::<Sandbox>(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !load_global_settings(state.store.as_ref())
+                .await
+                .unwrap()
+                .settings
+                .contains_key(settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY)
+        );
+        let pauses = std::array::from_fn::<_, 2, _>(|_| SettingBaselinePause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            resume: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let start_update = |value, writer: &str, pause: &SettingBaselinePause| {
+            let mut request = with_user(Request::new(UpdateConfigRequest {
+                name: "race".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                setting_key: settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::BoolValue(value)),
+                }),
+                expected_resource_version: 0,
+                annotations: HashMap::from([("writer".to_string(), writer.to_string())]),
+                ..Default::default()
+            }));
+            request.extensions_mut().insert(pause.clone());
+            let state = state.clone();
+            tokio::spawn(async move { handle_update_config(&state, request).await })
+        };
+        let first = start_update(false, "a", &pauses[0]);
+        let second = start_update(true, "b", &pauses[1]);
+
+        // Both real handlers read the same sandbox before either can acquire
+        // the settings lock or persist annotations. Release their writes in order.
+        for pause in &pauses {
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+                .await
+                .expect("setting handler captured the sandbox baseline");
+        }
+        assert_eq!(
+            state
+                .store
+                .get_message::<Sandbox>(&id)
+                .await
+                .unwrap()
+                .unwrap(),
+            baseline
+        );
+        pauses[0].resume.add_permits(1);
+        let first_response = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("first setting update completes")
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert_eq!(first_response.annotations.get("writer").unwrap(), "a");
+        let first_sandbox = state
+            .store
+            .get_message::<Sandbox>(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            first_sandbox.metadata.as_ref().unwrap().resource_version
+                > baseline.metadata.as_ref().unwrap().resource_version
+        );
+
+        pauses[1].resume.add_permits(1);
+        let second_result = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("second setting update completes")
+            .unwrap();
+        let saved_settings = load_sandbox_settings(state.store.as_ref(), "default", "race")
+            .await
+            .unwrap();
+        assert_eq!(
+            saved_settings
+                .settings
+                .get(settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY),
+            Some(&StoredSettingValue::Bool(true))
+        );
+        let saved_sandbox = state
+            .store
+            .get_message::<Sandbox>(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            second_result.is_ok(),
+            "default-version update persisted true but rejected annotations: status={:?}, annotations={:?}",
+            second_result.as_ref().err(),
+            saved_sandbox.metadata.as_ref().unwrap().annotations
+        );
+        assert_eq!(
+            second_result
+                .unwrap()
+                .into_inner()
+                .annotations
+                .get("writer")
+                .unwrap(),
+            "b"
+        );
+        assert_eq!(
+            saved_sandbox
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("writer")
+                .unwrap(),
+            "b"
+        );
+        assert!(
+            saved_sandbox.metadata.as_ref().unwrap().resource_version
+                > first_sandbox.metadata.as_ref().unwrap().resource_version
+        );
     }
 
     #[tokio::test]
