@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-TREE = "1a016bd8db9038dd830281c9b1074e2b2d0fb025"
+TREE = "f935a3eb7b6dbd9071c851bc63a8e9f1cd6791f8"
 ROLES = {
     "host": {"cli": ("openshell-cli", "openshell"),
              "gateway": ("openshell-gateway", "openshell-gateway"),

@@ -339,5 +339,5 @@
     ]
   },
   "source": "crates/openshell-supervisor/src/configuration_protocol_runtime_tests.rs",
-  "source_sha256": "fd9b1aa71021a4c6afc4b5d5e6ddc81e0e44d1fdd39befcb9f6b4f6694be6a00"
+  "source_sha256": "b9a1eacf4b3df2f9f92535843c4fad87e55063240b433d07b7c85214c9918b8f"
 }

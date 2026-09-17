@@ -4887,7 +4887,10 @@ mod linux {
                 discover_image_policy(&path),
                 ImagePolicyDiscovery::Invalid { .. }
             ));
-            std::fs::write(&path, vec![b'x'; MAX_IMAGE_POLICY_BYTES as usize + 1]).unwrap();
+            let oversized_length = usize::try_from(MAX_IMAGE_POLICY_BYTES)
+                .expect("image policy byte limit fits usize")
+                + 1;
+            std::fs::write(&path, vec![b'x'; oversized_length]).unwrap();
             assert!(matches!(
                 discover_image_policy(&path),
                 ImagePolicyDiscovery::Invalid { .. }
@@ -5995,7 +5998,7 @@ mod linux {
                 ca_bundle: None,
                 activation: ActivatedBoundaryConfiguration {
                     transition_id: "stale-transition".to_string(),
-                    ..revision.clone()
+                    ..revision
                 },
             })
             .unwrap();

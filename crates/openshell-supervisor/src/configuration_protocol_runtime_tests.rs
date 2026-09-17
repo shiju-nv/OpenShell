@@ -51,7 +51,7 @@ fn protocol_runtime_endpoint_mut(
 
 fn protocol_runtime_policy(
     base: &openshell_core::proto::SandboxPolicy,
-    case: &ProtocolRuntimeCase,
+    case: ProtocolRuntimeCase,
 ) -> openshell_core::proto::SandboxPolicy {
     use openshell_core::proto::{GraphqlOperation, L7Allow, L7QueryMatcher, L7Rule, McpOptions};
 
@@ -74,7 +74,7 @@ fn protocol_runtime_policy(
                 },
             );
             endpoint.allow_encoded_slash = true;
-            if *case == ProtocolRuntimeCase::Rest {
+            if case == ProtocolRuntimeCase::Rest {
                 endpoint.websocket_credential_rewrite = true;
                 endpoint.request_body_credential_rewrite = true;
             }
@@ -434,11 +434,13 @@ fn protocol_runtime_workload_pids(directory: &std::path::Path) -> Vec<u32> {
     clippy::too_many_lines,
     reason = "keeps rejected deliveries and their one eventual prepared result on the same startup future"
 )]
+// Retain ownership across validation awaits: the ready boundary is Send,
+// but need not be Sync. Return the same startup state for launch afterward.
 async fn protocol_runtime_validate_startup(
     case: ProtocolRuntimeCase,
     validate_faults: bool,
-    input: &ProtocolRuntimeStartup,
-) -> ProtocolRuntimePrepared {
+    input: ProtocolRuntimeStartup,
+) -> (ProtocolRuntimePrepared, ProtocolRuntimeStartup) {
     let actual = input.ready.configuration();
     let identity = actual.identity();
     let mut policy = input
@@ -561,12 +563,15 @@ async fn protocol_runtime_validate_startup(
             .is_none()
     );
     assert!(protocol_runtime_workload_pids(input.process.directory.path()).is_empty());
-    ProtocolRuntimePrepared {
-        session,
-        gateway,
-        configuration,
-        observations,
-    }
+    (
+        ProtocolRuntimePrepared {
+            session,
+            gateway,
+            configuration,
+            observations,
+        },
+        input,
+    )
 }
 
 #[allow(
@@ -576,14 +581,17 @@ async fn protocol_runtime_validate_startup(
 async fn protocol_runtime_start_fixture(
     case: ProtocolRuntimeCase,
     validate_faults: bool,
-    mut input: ProtocolRuntimeStartup,
+    input: ProtocolRuntimeStartup,
 ) -> RuntimeProcessFixture {
-    let ProtocolRuntimePrepared {
-        session,
-        gateway,
-        mut configuration,
-        observations,
-    } = protocol_runtime_validate_startup(case, validate_faults, &input).await;
+    let (
+        ProtocolRuntimePrepared {
+            session,
+            gateway,
+            mut configuration,
+            observations,
+        },
+        mut input,
+    ) = protocol_runtime_validate_startup(case, validate_faults, input).await;
     input
         .ready
         .update_startup_policy(configuration.policy.clone())
@@ -798,7 +806,7 @@ async fn configuration_activation_protocol_update_matrix() {
             );
             let valid = protocol_runtime_policy(
                 fixture.candidate.policy.as_ref().expect("candidate policy"),
-                &case,
+                case,
             );
             fixture.candidate.policy = Some(valid.clone());
             let retains = mode == openshell_core::PolicyValidationFailureMode::RetainLastValid;
