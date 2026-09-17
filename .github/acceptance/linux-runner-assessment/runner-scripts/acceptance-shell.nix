@@ -12,14 +12,14 @@ let
     else if builtins.currentSystem == "aarch64-linux" then pkgs.pkgsCross.aarch64-multiplatform
     else throw "Only standard Linux x64/ARM runners are supported";
   buildInputs = { pkgs, stdenv }: [
-    (pkgs.callPackage (source + /nix/pkgs/z3.nix) { inherit stdenv; })
-    (pkgs.callPackage (source + /nix/pkgs/aws-lc.nix) { inherit stdenv; })
+    (pkgs.callPackage (source + "/nix/pkgs/z3.nix") { inherit stdenv; })
+    (pkgs.callPackage (source + "/nix/pkgs/aws-lc.nix") { inherit stdenv; })
   ];
-  toolchain = (import (source + /nix/toolchain)).mkToolchain {
+  toolchain = (import (source + "/nix/toolchain")).mkToolchain {
     pkgs = selected;
     inherit buildInputs;
   };
-  rust = (pkgs.rust-bin.fromRustupToolchainFile (source + /rust-toolchain.toml)).override {
+  rust = (pkgs.rust-bin.fromRustupToolchainFile (source + "/rust-toolchain.toml")).override {
     targets = [ toolchain.target ];
     extensions = [ "clippy" ];
   };
