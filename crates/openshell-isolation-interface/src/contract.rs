@@ -10,8 +10,9 @@
 //! chain of boxed states:
 //!
 //! ```text
-//! attach backend descriptor + sandbox context -> Bound -> confirm -> Ready
-//!     -> start_agent -> Running
+//! discover workload -> admit configuration -> attach -> Bound -> confirm -> Ready
+//!     -> prepare -> commit (held) -> gateway acceptance -> release -> start_agent
+//!     -> Running
 //! ```
 //!
 //! Each transition consumes the prior state by value (`self: Box<Self>`).
@@ -44,6 +45,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
 pub use openshell_core::SandboxSessionId;
+pub use openshell_core::configuration::{ConfigurationActivationIdentity, ConfigurationRevision};
 pub use openshell_core::policy::SandboxPolicy;
 
 // ============================================================================
@@ -55,6 +57,8 @@ pub use openshell_core::policy::SandboxPolicy;
 /// An error never advances the lifecycle or authorizes an operation.
 #[derive(Debug)]
 pub enum BackendError {
+    /// Authored configuration rejected before installation; operators can repair it.
+    Configuration(String),
     /// Descriptor missing, malformed, unsupported, or mismatched against admission.
     Descriptor(String),
     /// No backend registered for the resolved `backend_name`.
@@ -101,7 +105,9 @@ impl BackendError {
     #[must_use]
     pub fn kind(&self) -> BackendErrorKind {
         match self {
-            Self::Descriptor(_) | Self::NotRegistered(_) => BackendErrorKind::Invalid,
+            Self::Configuration(_) | Self::Descriptor(_) | Self::NotRegistered(_) => {
+                BackendErrorKind::Invalid
+            }
             Self::Denied(_) => BackendErrorKind::Denied,
             Self::Unavailable(_) => BackendErrorKind::Unavailable,
             Self::Unsupported(_) => BackendErrorKind::Unsupported,
@@ -114,6 +120,7 @@ impl BackendError {
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Configuration(m) => write!(f, "configuration rejected: {m}"),
             Self::Descriptor(m) => write!(f, "descriptor error: {m}"),
             Self::NotRegistered(m) => write!(f, "backend not registered: {m}"),
             Self::Denied(m) => write!(f, "attachment denied: {m}"),
@@ -258,6 +265,156 @@ pub struct SandboxContext {
     pub agent: AgentSpec,
     /// Immutable identity already applied by the driver to sandbox and agent.
     pub identity: ResolvedWorkloadIdentity,
+    /// Gateway-signed permission for this exact control/boundary registration.
+    pub registration_grant: openshell_core::jwt::SecretJwt,
+    /// Monotonic revision bound into the signed registration grant.
+    pub registration_revision: u64,
+}
+
+/// Workload image policy bytes discovered before selecting the effective policy.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImagePolicyDiscovery {
+    /// The image does not contain a policy; admission selects a restrictive default.
+    Missing,
+    /// Bounded authored policy bytes; parsing and validation remain admission work.
+    Present { yaml: String },
+    /// A policy exists but could not be read safely; do not substitute a default.
+    Invalid { message: String },
+}
+
+impl fmt::Debug for ImagePolicyDiscovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Present { yaml } => formatter
+                .debug_struct("Present")
+                .field("bytes", &yaml.len())
+                .finish(),
+            Self::Invalid { .. } => formatter.write_str("Invalid"),
+        }
+    }
+}
+
+/// Existing workload filesystem paths needed by the boundary's runtime features.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryFilesystemBaseline {
+    /// Existing paths that need read and traversal access.
+    pub read_only: Vec<String>,
+    /// Existing paths that need read and write access.
+    pub read_write: Vec<String>,
+}
+
+/// Authenticated workload facts available before policy admission or attachment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryBootstrap {
+    /// Exact boundary process and requesting control identity, not yet registered.
+    pub identity: ConfigurationActivationIdentity,
+    /// Driver-resolved immutable numeric workload identity.
+    pub workload_identity: ResolvedWorkloadIdentity,
+    /// Image-local policy discovery without control-filesystem interpretation.
+    pub image_policy: ImagePolicyDiscovery,
+    /// Baseline paths discovered in the workload filesystem.
+    pub filesystem_baseline: BoundaryFilesystemBaseline,
+}
+
+/// Boundary-owned installation state observed after attach or reconnection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryConfigurationSnapshot {
+    /// Fresh identity of the responding boundary and registered control.
+    pub identity: ConfigurationActivationIdentity,
+    /// Last completely installed child environment/configuration tuple.
+    pub installed: Option<ConfigurationRevision>,
+    /// True only after explicit release of the current installed tuple.
+    pub active: bool,
+}
+
+/// Validated candidate held behind the boundary's execution barrier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedBoundaryConfiguration {
+    /// Runtime and registration to which this preparation belongs.
+    pub identity: ConfigurationActivationIdentity,
+    /// Unique boundary-issued token retained for an exact retry after transport
+    /// reconnect within the same signed registration. Cancellation, replacement
+    /// registration/incarnation, or a superseding candidate/policy invalidates it.
+    pub transition_id: String,
+    /// Previously installed tuple against which preparation performed CAS.
+    pub expected: Option<ConfigurationRevision>,
+    /// Complete candidate that passed boundary preparation.
+    pub configuration: ConfigurationRevision,
+}
+
+/// Installed candidate that remains held until the gateway accepts its identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledBoundaryConfiguration {
+    /// Runtime and registration that installed the candidate.
+    pub identity: ConfigurationActivationIdentity,
+    /// Transition that produced this installation.
+    pub transition_id: String,
+    /// Exact installed policy/provider tuple.
+    pub configuration: ConfigurationRevision,
+}
+
+/// Exact released configuration required on workload start and exec requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivatedBoundaryConfiguration {
+    /// Runtime and registration that released the candidate.
+    pub identity: ConfigurationActivationIdentity,
+    /// Transition whose installation was accepted before release.
+    pub transition_id: String,
+    /// Exact released policy/provider tuple.
+    pub configuration: ConfigurationRevision,
+}
+
+/// Serializes configuration installation with workload execution and recovery.
+///
+/// Preparation validates before holding workloads. Commit installs while held;
+/// callers must obtain gateway acceptance before release. Authentication and
+/// repair operations remain available while readiness is false.
+#[async_trait]
+pub trait BoundaryConfiguration: Send + Sync {
+    /// Last verified registered runtime identity.
+    fn identity(&self) -> ConfigurationActivationIdentity;
+    /// Observe activation loss immediately on hold or transport replacement.
+    fn readiness(&self) -> tokio::sync::watch::Receiver<bool>;
+    /// Read fresh boundary identity and installation state without releasing work.
+    async fn snapshot(&self) -> Result<BoundaryConfigurationSnapshot, BackendError>;
+    /// Validate and stage a complete candidate against the last installed tuple.
+    async fn prepare(
+        &self,
+        expected: Option<ConfigurationRevision>,
+        candidate: ConfigurationRevision,
+        child_env: HashMap<String, String>,
+    ) -> Result<PreparedBoundaryConfiguration, BackendError>;
+    /// Install staged child credentials while keeping every workload held.
+    async fn commit(
+        &self,
+        prepared: &PreparedBoundaryConfiguration,
+    ) -> Result<InstalledBoundaryConfiguration, BackendError>;
+    /// Release an installed tuple after the caller obtains exact gateway acceptance.
+    async fn release(
+        &self,
+        installed: &InstalledBoundaryConfiguration,
+    ) -> Result<ActivatedBoundaryConfiguration, BackendError>;
+    /// Discard a staged candidate without implicitly restoring execution.
+    async fn abort(&self, prepared: &PreparedBoundaryConfiguration) -> Result<(), BackendError>;
+    /// Hold workloads and invalidate outstanding transition/release receipts.
+    async fn quiesce(&self) -> Result<(), BackendError>;
+    /// Replace an expired signed grant for the same registered runtime identity.
+    ///
+    /// The grant is verified by the boundary on the next authenticated attach;
+    /// updating it never releases workloads or changes the registration fence.
+    async fn refresh_registration(
+        &self,
+        grant: openshell_core::jwt::SecretJwt,
+        registration_revision: u64,
+    ) -> Result<(), BackendError>;
 }
 
 /// The agent workload to run inside the boundary.
@@ -340,6 +497,12 @@ pub trait IsolationBackend: Send + Sync {
     /// The stable registered backend name.
     fn backend_name(&self) -> &str;
 
+    /// Read authenticated image/identity facts without attaching or executing work.
+    async fn discover(
+        &self,
+        descriptor: &VerifiedBackendDescriptor,
+    ) -> Result<BoundaryBootstrap, BackendError>;
+
     /// Validate the opaque payload, establish any boundary-local resources,
     /// and atomically bind them to the trusted sandbox context: returns `Bound`
     /// or fails closed. Never binds a resource already bound to an active
@@ -358,11 +521,15 @@ pub trait IsolationBackend: Send + Sync {
 // Lifecycle states
 // ============================================================================
 
-/// Bound: the backend descriptor and trusted sandbox context are bound to the
-/// same resource, and the mediation source is available. No untrusted workload
-/// code is running.
+/// Bound: the backend descriptor and trusted sandbox context refer to the same
+/// resource, and mediation is available.
+///
+/// Initial work has not started; any surviving workload remains held until
+/// explicit configuration release.
 #[async_trait]
 pub trait BoundBoundary: Send {
+    /// Retain the configuration controller across confirmation and workload start.
+    fn configuration(&self) -> Arc<dyn BoundaryConfiguration>;
     /// The mediation service's backend-neutral source of workload network
     /// requests. TCP and DNS remain typed operations so consumers cannot mix
     /// their framing, decisions, or response semantics.
@@ -619,15 +786,29 @@ impl ConfirmedBoundary {
     }
 }
 
-/// Ready: standing enforcement is confirmed, and the backend is prepared to
-/// ensure the admitted launch-time controls are in force
-/// before untrusted execution. Only agent activation is possible from here.
+/// Ready: standing enforcement is confirmed. The configuration controller must
+/// install and release a gateway-accepted tuple before initial workload start
+/// or resumption of a surviving workload.
 #[async_trait]
 pub trait ReadyBoundary: Send {
+    /// Retain the controller that must release the exact installed configuration.
+    fn configuration(&self) -> Arc<dyn BoundaryConfiguration>;
+
+    /// Replace the initial launch policy while configuration is held and no
+    /// main workload has launched. Validate the selected process identity and
+    /// static policy inside the workload boundary before updating retained
+    /// launch inputs. A rejected replacement leaves those inputs unchanged.
+    ///
+    /// Success never releases work. Replacing the policy invalidates previous
+    /// preparation, so the caller must prepare and admit the replacement.
+    /// A surviving workload may retain its identical policy after control
+    /// reconnect, but its launch-time controls cannot be changed by this API.
+    async fn update_startup_policy(&mut self, policy: SandboxPolicy) -> Result<(), BackendError>;
+
     /// Make the admitted agent runnable behind the boundary and return its
-    /// handle. `start_agent` is the sole operation that may make the admitted
-    /// agent runnable, and it fails closed if any `Ready` condition no longer
-    /// holds. Whether the backend creates the agent process or releases a held,
+    /// handle. `start_agent` is the sole operation that starts the initial
+    /// agent, and it fails closed unless its exact installed configuration has
+    /// been released. Whether the backend creates the agent process or starts a held,
     /// driver-provisioned execution object is backend-specific; every
     /// applicable launch-time control is in force before the first untrusted
     /// instruction.

@@ -21,6 +21,23 @@ type SandboxTemplate = types.SandboxTemplate
 // SandboxStatus holds the observed state of a sandbox.
 type SandboxStatus = types.SandboxStatus
 
+// ConfigurationAdmissionState describes validation of an effective configuration.
+type ConfigurationAdmissionState = types.ConfigurationAdmissionState
+
+// Configuration admission states reported by the gateway.
+const (
+	ConfigurationAdmissionUnknown  = types.ConfigurationAdmissionUnknown
+	ConfigurationAdmissionPending  = types.ConfigurationAdmissionPending
+	ConfigurationAdmissionAccepted = types.ConfigurationAdmissionAccepted
+	ConfigurationAdmissionRejected = types.ConfigurationAdmissionRejected
+)
+
+// SandboxConfigurationAdmission identifies configuration validation and runtime activation.
+type SandboxConfigurationAdmission = types.SandboxConfigurationAdmission
+
+// SandboxConfigurationSnapshot identifies an immutable gateway configuration delivery.
+type SandboxConfigurationSnapshot = types.SandboxConfigurationSnapshot
+
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition = types.SandboxCondition
 

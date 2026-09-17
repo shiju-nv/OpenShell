@@ -10,6 +10,7 @@ struct RenewingGrpcBoundary {
     expected_token: Arc<std::sync::RwLock<String>>,
     failures: Arc<std::sync::atomic::AtomicUsize>,
     failure_code: tonic::Code,
+    response_override: Arc<std::sync::Mutex<Option<Response>>>,
 }
 
 #[tonic::async_trait]
@@ -35,6 +36,7 @@ impl IsolationBoundary for RenewingGrpcBoundary {
         }
         let mut inner = self.inner.clone();
         inner.expected_token = self.expected_token.read().unwrap().clone();
+        inner.response_override = self.response_override.lock().unwrap().clone();
         inner.exchange(request).await
     }
 
@@ -65,10 +67,13 @@ async fn renewing_boundary_client(
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
+            response_override: None,
+            response_permits: None,
         },
         expected_token: Arc::new(std::sync::RwLock::new("a".repeat(32))),
         failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         failure_code,
+        response_override: Arc::new(std::sync::Mutex::new(None)),
     };
     let server_service = service.clone();
     let server_accepted = accepted.clone();
@@ -98,16 +103,20 @@ async fn renewing_boundary_client(
     let client = Arc::new(BoundaryClient::new(
         tls_runtime_descriptor(address, certificate.client_tls),
         test_bearer(&"a".repeat(32)),
+        test_supervisor_instance_id(),
     ));
     client
         .call_idempotent(Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
+            registration_grant: "test-grant".to_string(),
+            registration_revision: 1,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
             resource_claims: std::collections::BTreeMap::new(),
         })
         .await
         .unwrap();
     client.call_idempotent(Request::Confirm).await.unwrap();
+    client.activation.lock().unwrap().identity = Some(test_activation().identity);
     (client, service, accepted, server)
 }
 
@@ -115,6 +124,8 @@ async fn renewing_boundary_client(
 async fn same_epoch_renewal_reauthenticates_without_closing_pending_stream() {
     let (client, service, accepted, server) =
         renewing_boundary_client(tonic::Code::Unavailable).await;
+    let active = test_activation();
+    client.publish_activation(0, &active).unwrap();
     // Authenticate a stream that remains open across both bearer renewals.
     let mut pending = client
         .open_grpc_stream(GrpcStreamKind::Exchange)
@@ -147,6 +158,9 @@ async fn same_epoch_renewal_reauthenticates_without_closing_pending_stream() {
             1,
             "renewal must reuse the physical connection"
         );
+        assert_eq!(client.active_configuration(1).unwrap(), active);
+        assert_eq!(client.configuration_attempt_epoch(0).unwrap(), 0);
+        assert!(*client.readiness().borrow());
     }
     let request = BoundaryClient::prepare_request(Request::Wait {
         process_id: "pending".into(),
@@ -242,6 +256,144 @@ async fn confirmation_authenticates_captured_bearer_after_slot_changes() {
         .unwrap();
     assert!(matches!(response, Response::Confirmed { .. }));
     assert_eq!(service.inner.requests.load(Ordering::Acquire), 3);
+    assert_eq!(accepted.load(Ordering::Acquire), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn attachment_replay_uses_one_captured_bearer_after_slot_changes() {
+    let (client, service, accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    let credential = BoundaryCredential::capture(&client.sandbox_bearer).unwrap();
+    let attach = client.attach_request.lock().unwrap().clone().unwrap();
+    let confirm = client.confirm_request.lock().unwrap().clone().unwrap();
+    let channel = client
+        .grpc_channel
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .channel
+        .clone();
+    // The peer still accepts only the captured bearer, so rereading the slot
+    // during discovery, attachment or confirmation must fail this replay.
+    client
+        .sandbox_bearer
+        .update(
+            SecretJwt::parse("b".repeat(32)).unwrap(),
+            i64::MAX,
+            openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+    client
+        .replay_attachment(channel, &attach, Some(&confirm), &credential)
+        .await
+        .unwrap();
+    assert_eq!(service.inner.requests.load(Ordering::Acquire), 5);
+    assert_eq!(accepted.load(Ordering::Acquire), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn replacement_connections_hold_activation_without_cancelling_pending_configuration() {
+    for transport_recovery in [false, true] {
+        let (client, service, accepted, server) =
+            renewing_boundary_client(tonic::Code::Unavailable).await;
+        client.publish_activation(0, &test_activation()).unwrap();
+        let original = client.grpc_channel.lock().await.clone().unwrap();
+        let renewed_token = "b".repeat(32);
+        *service.expected_token.write().unwrap() = renewed_token.clone();
+        let credential_epoch =
+            openshell_core::jwt::CredentialEpoch::new(if transport_recovery { 1 } else { 2 })
+                .unwrap();
+        client
+            .sandbox_bearer
+            .update(
+                SecretJwt::parse(renewed_token).unwrap(),
+                i64::MAX,
+                credential_epoch,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if transport_recovery {
+                client.recover_after_unavailable().await
+            } else {
+                client.ensure_current_credential_connection().await
+            }
+        })
+        .await
+        .expect("authenticated replacement must complete")
+        .unwrap();
+
+        let replaced = client.grpc_channel.lock().await.clone().unwrap();
+        assert_eq!(replaced.credential_epoch, credential_epoch);
+        assert_eq!(
+            replaced.bearer_fingerprint,
+            BoundaryCredential::capture(&client.sandbox_bearer)
+                .unwrap()
+                .fingerprint
+        );
+        assert_ne!(replaced.generation, original.generation);
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+        assert_eq!(service.inner.requests.load(Ordering::Acquire), 5);
+        assert!(!*client.readiness().borrow());
+        assert!(client.active_configuration(1).is_err());
+        // Transport repair preserves the pending transaction, but its old
+        // acknowledgement cannot release execution on the replacement channel.
+        assert_eq!(client.configuration_attempt_epoch(0).unwrap(), 1);
+        assert!(client.publish_activation(0, &test_activation()).is_err());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn same_epoch_renewal_rejects_changed_resource_evidence() {
+    let (client, service, accepted, server) =
+        renewing_boundary_client(tonic::Code::Unavailable).await;
+    client.publish_activation(0, &test_activation()).unwrap();
+    let original = client.grpc_channel.lock().await.clone().unwrap();
+    let renewed_token = "b".repeat(32);
+    *service.expected_token.write().unwrap() = renewed_token.clone();
+    client
+        .sandbox_bearer
+        .update(
+            SecretJwt::parse(renewed_token).unwrap(),
+            i64::MAX,
+            openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+    let mut evidence = test_confirmation_evidence();
+    evidence
+        .resource_claims
+        .insert("unexpected-device".into(), "changed".into());
+    *service.response_override.lock().unwrap() = Some(Response::Confirmed {
+        evidence: Box::new(evidence),
+    });
+
+    assert!(matches!(
+        client.ensure_current_credential_connection().await,
+        Err(BackendError::Confirm(_))
+    ));
+    let refused = client.grpc_channel.lock().await.clone().unwrap();
+    assert_eq!(refused.generation, original.generation);
+    assert_eq!(refused.bearer_fingerprint, original.bearer_fingerprint);
+    assert_eq!(client.active_configuration(1).unwrap(), test_activation());
+    assert_eq!(client.configuration_attempt_epoch(0).unwrap(), 0);
+
+    // A rejected acknowledgement never suppresses a later authenticated retry.
+    *service.response_override.lock().unwrap() = None;
+    client.ensure_current_credential_connection().await.unwrap();
+    assert_ne!(
+        client
+            .grpc_channel
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .bearer_fingerprint,
+        original.bearer_fingerprint
+    );
+    assert_eq!(service.inner.requests.load(Ordering::Acquire), 4);
     assert_eq!(accepted.load(Ordering::Acquire), 1);
     server.abort();
 }

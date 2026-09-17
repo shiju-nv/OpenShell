@@ -16,7 +16,9 @@ use openshell_core::policy::{
 use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol, PolicyViolation};
+use openshell_policy_schema::{ParseLimits, RawValueParseError, RawValueParseErrorKind};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
@@ -348,18 +350,20 @@ impl OpaEngine {
     ) -> Result<Self> {
         // File paths and parser errors can contain policy contents. Discard the
         // original error, including its source chain, at the load boundary.
-        let yaml_str = std::fs::read_to_string(data_path)
-            .map_err(|_| miette::miette!("failed to read YAML policy data file"))?;
+        let data = openshell_policy_schema::parse_raw_value_file(data_path, ParseLimits::default())
+            .map_err(|error| match error.kind() {
+                RawValueParseErrorKind::Io | RawValueParseErrorKind::NotRegularFile => {
+                    miette::miette!("failed to read YAML policy data file")
+                }
+                _ => redacted_raw_parse_error(error),
+            })?;
         let mut engine = regorus::Engine::new();
         engine
             .add_policy_from_file(policy_path)
             .map_err(|_| miette::miette!("failed to load Rego policy"))?;
         emit_binary_identity_mode(require_binary_identity, "files");
-        let data_json = preprocess_yaml_data(
-            &yaml_str,
-            require_binary_identity,
-            validate_middleware_config,
-        )?;
+        let data_json =
+            preprocess_raw_data(data, require_binary_identity, validate_middleware_config)?;
         engine
             .add_data_json(&data_json)
             .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
@@ -371,6 +375,46 @@ impl OpaEngine {
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
         Self::from_strings_with_options(policy, data_yaml, true, None)
+    }
+
+    /// Load Rego rules and a bounded YAML/JSON policy data stream.
+    ///
+    /// The stream uses the same decoding limits and schema as file and string
+    /// loads. Invalid input is rejected before an engine becomes available.
+    ///
+    /// # Errors
+    ///
+    /// Returns a payload-free error if reading, decoding, schema validation,
+    /// middleware validation, or Rego compilation fails.
+    pub fn from_reader(policy: &str, data: impl Read) -> Result<Self> {
+        Self::from_reader_with_middleware_config(policy, data, None)
+    }
+
+    /// Load a bounded policy stream and validate middleware through its catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded, payload-free failures as [`Self::from_reader`],
+    /// including rejection by the implementation-owned middleware validator.
+    pub fn from_reader_with_middleware_config(
+        policy: &str,
+        data: impl Read,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
+        let data = openshell_policy_schema::parse_raw_value_reader(data, ParseLimits::default())
+            .map_err(redacted_raw_parse_error)?;
+        let require_binary_identity = true;
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("policy.rego".into(), policy.into())
+            .map_err(|_| miette::miette!("failed to load Rego policy"))?;
+        let data_json =
+            preprocess_raw_data(data, require_binary_identity, validate_middleware_config)?;
+        engine
+            .add_data_json(&data_json)
+            .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
+        emit_binary_identity_mode(require_binary_identity, "reader");
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Load policy strings and validate middleware config through the supplied catalog.
@@ -689,7 +733,14 @@ impl OpaEngine {
     /// preprocessing pipeline (port normalization, L7 validation, preset
     /// expansion) to maintain consistency with `from_strings()`.
     pub fn reload(&self, policy: &str, data_yaml: &str) -> Result<()> {
-        let new = Self::from_strings(policy, data_yaml)?;
+        // Binary identity mode belongs to the runtime topology and must stay
+        // stable across raw policy replacements.
+        let new = Self::from_strings_with_options(
+            policy,
+            data_yaml,
+            self.binary_identity_required,
+            None,
+        )?;
         let new_engine = new
             .engine
             .into_inner()
@@ -727,44 +778,43 @@ impl OpaEngine {
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
     ) -> Result<()> {
-        // Build a complete new engine through the same validated pipeline.
-        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
-        let new_engine = new
-            .engine
-            .into_inner()
-            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let mut engine = self
-            .engine
-            .lock()
-            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        *engine = new_engine;
-        *self
-            .fail_closed_reason
-            .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, None, || {})
     }
 
     /// Reload the policy and middleware registry as one runtime generation.
-    ///
-    /// Both replacements are prepared before the live locks are acquired. The
-    /// engine and runner are then swapped while holding both locks, followed by
-    /// a single generation increment. A preparation or lock failure leaves the
-    /// live pair and generation untouched.
     pub fn reload_policy_and_middleware_from_proto_with_pid(
         &self,
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
         registry: MiddlewareRegistry,
     ) -> Result<()> {
-        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, Some(registry), || {})
+    }
+
+    /// Validate a complete candidate before publishing policy, middleware, and
+    /// prepared credentials together. A validation or lock failure leaves the
+    /// active configuration untouched and never invokes `commit_credentials`.
+    ///
+    /// The callback must be infallible and must not call back into this engine.
+    /// Existing policy guards become stale before credentials change; new
+    /// policy readers remain blocked until the complete configuration is live.
+    pub fn reload_configuration_from_proto_with_pid(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        registry: Option<MiddlewareRegistry>,
+        commit_credentials: impl FnOnce(),
+    ) -> Result<()> {
+        let new = Self::from_proto_with_pid_and_binary_identity_required(
+            proto,
+            entrypoint_pid,
+            self.binary_identity_required,
+        )?;
         let new_engine = new
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        // Match clone_engine_for_tunnel's lock order (engine, then runner) so
-        // readers can observe only the old pair or the new pair.
+        // Match clone_engine_for_tunnel's lock order (engine, then runner).
         let mut engine = self
             .engine
             .lock()
@@ -773,14 +823,18 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        let new_runner = runner.with_replacement_registry(registry);
-        *engine = new_engine;
-        *runner = new_runner;
-        *self
+        let mut fail_closed_reason = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
+        let new_runner = registry.map(|registry| runner.with_replacement_registry(registry));
         self.advance_generation();
+        commit_credentials();
+        *engine = new_engine;
+        if let Some(new_runner) = new_runner {
+            *runner = new_runner;
+        }
+        *fail_closed_reason = None;
         Ok(())
     }
 
@@ -1566,33 +1620,35 @@ fn preprocess_yaml_data(
     require_binary_identity: bool,
     validate_middleware_config: Option<&MiddlewareConfigValidator>,
 ) -> Result<String> {
-    let mut data: serde_json::Value = serde_yml::from_str(yaml_str).map_err(|error| {
-        // Parser text and source chains can include keys, values, and snippets.
-        // Numeric source positions are safe and help locate the authored error.
-        let category = match error.kind() {
-            serde_yml::ErrorKind::Syntax => "invalid syntax",
-            serde_yml::ErrorKind::Io => "input read failure",
-            serde_yml::ErrorKind::Budget => "parser limit exceeded",
-            serde_yml::ErrorKind::Policy => "unsupported YAML construct",
-            serde_yml::ErrorKind::KeyCollision => "key collision",
-            serde_yml::ErrorKind::DuplicateKey => "duplicate key",
-            serde_yml::ErrorKind::EndOfStream => "unexpected end of input",
-            serde_yml::ErrorKind::Data => "invalid data",
-            // ErrorKind is non-exhaustive; future kinds stay payload-free.
-            _ => "invalid YAML",
-        };
-        error.location().map_or_else(
-            || miette::miette!("failed to parse YAML data: {category}"),
-            |location| {
-                miette::miette!(
-                    "failed to parse YAML data: {category} at line {}, column {}",
-                    location.line(),
-                    location.column(),
-                )
-            },
-        )
-    })?;
+    let data =
+        openshell_policy_schema::parse_raw_value(yaml_str).map_err(redacted_raw_parse_error)?;
+    preprocess_raw_data(data, require_binary_identity, validate_middleware_config)
+}
+
+/// Keep only the shared parser's fixed category and numeric source position.
+/// Rebuilding the diagnostic prevents source chains from crossing the boundary.
+fn redacted_raw_parse_error(error: RawValueParseError) -> miette::Report {
+    error.location().map_or_else(
+        || miette::miette!("failed to parse YAML data: {error}"),
+        |(line, column)| {
+            miette::miette!("failed to parse YAML data: {error} at line {line}, column {column}")
+        },
+    )
+}
+
+/// Validate decoded policy data without replacing its OPA-specific fields.
+/// The canonical schema checks authored scalar types and defaults on a separate
+/// projection, preserving runtime provenance and matcher semantics in the data.
+fn preprocess_raw_data(
+    raw: serde_yml::Value,
+    require_binary_identity: bool,
+    validate_middleware_config: Option<&MiddlewareConfigValidator>,
+) -> Result<String> {
+    let data: serde_json::Value = serde_json::to_value(raw)
+        .map_err(|_| miette::miette!("failed to convert YAML policy data to JSON"))?;
     validate_opa_data_structure(&data)?;
+    let mut data = openshell_policy_schema::opa::normalize_opa_policy(data)
+        .map_err(|error| miette::miette!("OPA policy schema validation failed: {error}"))?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
     normalize_endpoint_protocols(&mut data);
 
@@ -1765,6 +1821,13 @@ fn normalize_l7_config_aliases(data: &mut serde_json::Value) -> Vec<String> {
             let Some(ep_obj) = ep.as_object_mut() else {
                 continue;
             };
+            // Both nested blocks have passed canonical schema validation.
+            // The authored adapter gives a present MCP stanza precedence over
+            // JSON-RPC, including its zero/default body limit. Keep separately
+            // lowered OPA fields intact; schema validation owns their conflicts.
+            if ep_obj.contains_key("mcp") {
+                ep_obj.remove("json_rpc");
+            }
             let loc = format!("network_policies.{policy_name}.endpoints[{index}]");
             for stanza in L7ConfigStanza::ALL {
                 normalize_l7_config_alias(&mut errors, ep_obj, &loc, stanza);
@@ -2577,6 +2640,351 @@ mod tests {
     }
 
     #[test]
+    fn bounded_raw_loaders_enforce_shared_limits_and_preserve_rejected_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("private-data.yaml");
+        std::fs::write(&policy_path, TEST_POLICY).unwrap();
+        let limits = ParseLimits::default();
+        let cases = [
+            " ".repeat(limits.max_bytes + 1),
+            format!(
+                "private-payload: {}0{}",
+                "[".repeat(limits.max_depth + 1),
+                "]".repeat(limits.max_depth + 1),
+            ),
+            "private-payload: one\nprivate-payload: two\n".to_owned(),
+            format!(
+                "private-payload: &private-anchor value\nother: [{}]\n",
+                std::iter::repeat_n("*private-anchor", limits.max_alias_expansions + 1)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            "private-payload: { <<: { private-secret: value } }\n".to_owned(),
+            "private-payload: first\n---\nprivate-payload: second\n".to_owned(),
+            format!(
+                "private-payload: [{}]",
+                std::iter::repeat_n("0", limits.max_sequence_elements + 1)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+        let engine = l7_engine();
+        let generation = engine.current_generation();
+        let guard = engine.generation_guard(generation).unwrap();
+        let allowed = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        let denied = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
+        for data in cases {
+            std::fs::write(&data_path, &data).unwrap();
+            for error in [
+                OpaEngine::from_strings(TEST_POLICY, &data).err().unwrap(),
+                OpaEngine::from_reader(TEST_POLICY, data.as_bytes())
+                    .err()
+                    .unwrap(),
+                OpaEngine::from_files(&policy_path, &data_path)
+                    .err()
+                    .unwrap(),
+                engine.reload(TEST_POLICY, &data).unwrap_err(),
+            ] {
+                assert!(error.to_string().starts_with("failed to parse YAML data"));
+                assert_safe_load_error(&error, &["private-", directory.path().to_str().unwrap()]);
+            }
+            assert_eq!(engine.current_generation(), generation);
+            assert!(!guard.is_stale());
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+        }
+
+        // A complete document at the byte ceiling must be accepted through
+        // every entrypoint; the limit is inclusive and independent of shape.
+        let mut exact = "{}".to_owned();
+        exact.extend(std::iter::repeat_n(' ', limits.max_bytes - exact.len()));
+        std::fs::write(&data_path, &exact).unwrap();
+        assert!(OpaEngine::from_strings(TEST_POLICY, &exact).is_ok());
+        assert!(OpaEngine::from_reader(TEST_POLICY, exact.as_bytes()).is_ok());
+        assert!(OpaEngine::from_files(&policy_path, &data_path).is_ok());
+    }
+
+    #[test]
+    fn bounded_reader_stops_at_byte_ceiling_and_redacts_io_and_utf8_errors() {
+        struct EndlessWhitespace(usize);
+        impl Read for EndlessWhitespace {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b' ');
+                self.0 += buffer.len();
+                Ok(buffer.len())
+            }
+        }
+        struct PrivateReadFailure;
+        impl Read for PrivateReadFailure {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("private-reader-secret-秘密"))
+            }
+        }
+        let mut input = EndlessWhitespace(0);
+        let error = OpaEngine::from_reader(TEST_POLICY, &mut input)
+            .err()
+            .unwrap();
+        assert_eq!(input.0, ParseLimits::default().max_bytes + 1);
+        assert!(error.to_string().contains("input byte limit"));
+        assert_safe_load_error(&error, &[]);
+
+        for error in [
+            OpaEngine::from_reader(TEST_POLICY, PrivateReadFailure)
+                .err()
+                .unwrap(),
+            OpaEngine::from_reader(TEST_POLICY, &[0xff][..])
+                .err()
+                .unwrap(),
+        ] {
+            assert_safe_load_error(&error, &["private-reader", "秘密"]);
+        }
+    }
+
+    #[test]
+    fn canonical_schema_rejects_scalar_and_closed_field_errors_across_loaders() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("data.yaml");
+        std::fs::write(&policy_path, TEST_POLICY).unwrap();
+        let engine =
+            OpaEngine::from_strings(TEST_POLICY, &opa_container_policy().to_string()).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let allowed = l7_input("admin.example.test", 443, "GET", "/public");
+        let denied = l7_input("admin.example.test", 443, "DELETE", "/admin/users");
+        for (pointer, invalid) in [
+            (
+                "/filesystem_policy",
+                serde_json::json!({"include_workdir": "private-secret"}),
+            ),
+            (
+                "/filesystem_policy",
+                serde_json::json!({"read_only": [false]}),
+            ),
+            ("/landlock", serde_json::json!({"compatibility": false})),
+            ("/process", serde_json::json!({"run_as_user": 42})),
+            (
+                "/process",
+                serde_json::json!({"private-field": "private-secret"}),
+            ),
+            (
+                "/network_policies/admin/binaries/0/path",
+                serde_json::json!(false),
+            ),
+            (
+                "/network_policies/admin/endpoints/0/port",
+                serde_json::json!(443.5),
+            ),
+            (
+                "/network_policies/admin/endpoints/0/access",
+                serde_json::json!(false),
+            ),
+        ] {
+            let mut candidate = opa_container_policy();
+            *candidate.pointer_mut(pointer).unwrap() = invalid;
+            let data = candidate.to_string();
+            std::fs::write(&data_path, &data).unwrap();
+            for error in [
+                OpaEngine::from_strings(TEST_POLICY, &data).err().unwrap(),
+                OpaEngine::from_reader(TEST_POLICY, data.as_bytes())
+                    .err()
+                    .unwrap(),
+                OpaEngine::from_files(&policy_path, &data_path)
+                    .err()
+                    .unwrap(),
+                engine.reload(TEST_POLICY, &data).unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("OPA policy schema validation failed")
+                );
+                assert_safe_load_error(&error, &["private-", "admin.example.test"]);
+            }
+            assert_eq!(engine.current_generation(), 0);
+            assert!(!guard.is_stale());
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+        }
+    }
+
+    #[test]
+    fn canonical_defaults_preserve_presence_and_original_opa_data() {
+        for (source, include_workdir) in [
+            ("{}", true),
+            ("filesystem_policy: {}", false),
+            ("filesystem_policy: { include_workdir: true }", true),
+            ("filesystem_policy: { include_workdir: false }", false),
+        ] {
+            for engine in [
+                OpaEngine::from_strings(TEST_POLICY, source).unwrap(),
+                OpaEngine::from_reader(TEST_POLICY, source.as_bytes()).unwrap(),
+            ] {
+                assert_eq!(
+                    engine
+                        .query_sandbox_config()
+                        .unwrap()
+                        .filesystem
+                        .include_workdir,
+                    include_workdir
+                );
+            }
+        }
+
+        let mut data = opa_container_policy();
+        data["application_data"] = serde_json::json!({"private_payload": {"key": [1, true, null]}});
+        data["runtime"] = serde_json::json!({"require_binary_identity": false});
+        let endpoint = &mut data["network_policies"]["admin"]["endpoints"][0];
+        endpoint["provider_credentialed"] = true.into();
+        endpoint["advisor_proposed"] = true.into();
+        endpoint["rules"] = serde_json::json!([{"allow": {"method": "GET", "path": "/public", "query": {"token": "", "name": {"glob": "user-*"}}}}]);
+        endpoint.as_object_mut().unwrap().remove("access");
+        let prepared: serde_json::Value =
+            serde_json::from_str(&preprocess_yaml_data(&data.to_string(), true, None).unwrap())
+                .unwrap();
+        assert_eq!(prepared["application_data"], data["application_data"]);
+        assert_eq!(prepared["runtime"]["require_binary_identity"], true);
+        let endpoint = &prepared["network_policies"]["admin"]["endpoints"][0];
+        assert_eq!(endpoint["provider_credentialed"], true);
+        assert_eq!(endpoint["advisor_proposed"], true);
+        assert_eq!(endpoint["rules"][0]["allow"]["query"]["token"], "");
+        assert_eq!(
+            endpoint["rules"][0]["allow"]["query"]["name"]["glob"],
+            "user-*"
+        );
+        OpaEngine::from_strings_with_binary_identity_required(TEST_POLICY, &data.to_string(), true)
+            .unwrap();
+    }
+
+    #[test]
+    fn canonical_schema_rejects_object_landlock_compatibility_before_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("data.yaml");
+        std::fs::write(&policy_path, TEST_POLICY).unwrap();
+        let mut data = opa_container_policy();
+        data["landlock"] = serde_json::json!({"compatibility": "hard_requirement"});
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string()).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        for name in ["hard_requirement", "best_effort"] {
+            data["landlock"]["compatibility"] = serde_json::json!({name: null});
+            let source = data.to_string();
+            std::fs::write(&data_path, &source).unwrap();
+            for error in [
+                OpaEngine::from_strings(TEST_POLICY, &source).err().unwrap(),
+                OpaEngine::from_reader(TEST_POLICY, source.as_bytes())
+                    .err()
+                    .unwrap(),
+                OpaEngine::from_files(&policy_path, &data_path)
+                    .err()
+                    .unwrap(),
+                engine.reload(TEST_POLICY, &source).unwrap_err(),
+            ] {
+                assert!(error.to_string().contains("landlock.compatibility"));
+                assert_safe_load_error(&error, &[name]);
+            }
+            assert_eq!(engine.current_generation(), 0);
+            assert!(!guard.is_stale());
+            assert!(matches!(
+                engine
+                    .query_sandbox_config()
+                    .unwrap()
+                    .landlock
+                    .compatibility,
+                LandlockCompatibility::HardRequirement,
+            ));
+            assert!(eval_l7(
+                &engine,
+                &l7_input("admin.example.test", 443, "GET", "/public")
+            ));
+            assert!(!eval_l7(
+                &engine,
+                &l7_input("admin.example.test", 443, "DELETE", "/admin/users")
+            ));
+        }
+    }
+
+    #[test]
+    fn yaml_and_proto_mcp_body_limits_use_the_same_stanza_precedence() {
+        let data = r#"
+version: 1
+network_policies:
+  rpc:
+    endpoints:
+      - host: mcp.example.test
+        port: 443
+        protocol: mcp
+        json_rpc: { max_body_bytes: 1024 }
+        mcp: { max_body_bytes: 2048 }
+        rules:
+          - allow: { method: tools/list }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let input = NetworkInput {
+            host: "mcp.example.test".into(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: String::new(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let document: serde_json::Value = serde_yml::from_str(data).unwrap();
+        for (mcp, expected) in [
+            (
+                Some(serde_json::json!({"max_body_bytes": 2048})),
+                regorus::Value::from(2048),
+            ),
+            (
+                Some(serde_json::json!({"max_body_bytes": 0})),
+                regorus::Value::Undefined,
+            ),
+            (Some(serde_json::json!({})), regorus::Value::Undefined),
+            (None, regorus::Value::from(1024)),
+        ] {
+            let mut candidate = document.clone();
+            let endpoint = candidate["network_policies"]["rpc"]["endpoints"][0]
+                .as_object_mut()
+                .unwrap();
+            if let Some(mcp) = mcp {
+                endpoint.insert("mcp".to_owned(), mcp);
+            } else {
+                endpoint.remove("mcp");
+            }
+            let source = candidate.to_string();
+            let proto = openshell_policy::parse_sandbox_policy(&source).unwrap();
+            let yaml = OpaEngine::from_strings(TEST_POLICY, &source).unwrap();
+            let typed = OpaEngine::from_proto(&proto).unwrap();
+            let yaml_config = yaml.query_endpoint_config(&input).unwrap().unwrap();
+            let typed_config = typed.query_endpoint_config(&input).unwrap().unwrap();
+            assert_eq!(
+                yaml_config["json_rpc_max_body_bytes"], typed_config["json_rpc_max_body_bytes"],
+                "both ingress formats must select the canonical MCP body limit",
+            );
+            assert_eq!(typed_config["json_rpc_max_body_bytes"], expected);
+        }
+
+        // An explicitly lowered OPA limit is a different representation and
+        // must survive an MCP stanza that specifies no overlapping setting.
+        let mut candidate = document;
+        let endpoint = candidate["network_policies"]["rpc"]["endpoints"][0]
+            .as_object_mut()
+            .unwrap();
+        endpoint.remove("json_rpc");
+        endpoint.insert("mcp".to_owned(), serde_json::json!({}));
+        endpoint.insert("json_rpc_max_body_bytes".to_owned(), 1024.into());
+        let raw = OpaEngine::from_strings(TEST_POLICY, &candidate.to_string()).unwrap();
+        assert_eq!(
+            raw.query_endpoint_config(&input).unwrap().unwrap()["json_rpc_max_body_bytes"],
+            regorus::Value::from(1024),
+        );
+    }
+
+    #[test]
     fn load_diagnostics_enforce_item_and_byte_limits_with_omission() {
         const LONG_CATEGORY: &str = concat!(
             "固定診断固定診断固定診断固定診断固定診断固定診断固定診断固定診断",
@@ -2626,7 +3034,7 @@ mod tests {
             (
                 candidate(serde_json::json!({"host": "example.test", "port": 443,
                 "protocol": "mcp", "mcp": {"max_body_bytes": &secret}})),
-                "invalid L7 protocol configuration",
+                "OPA policy schema validation failed",
             ),
             (
                 candidate(serde_json::json!({"host": "example.test", "port": 443,
@@ -2638,7 +3046,7 @@ mod tests {
                     "middleware": &secret, "order": &secret
                 }}})
                 .to_string(),
-                "failed to parse or convert middleware policy configuration",
+                "OPA policy schema validation failed",
             ),
             (
                 serde_json::json!({"network_middlewares": {&secret: {
@@ -2728,6 +3136,13 @@ mod tests {
             )
             .err()
             .unwrap(),
+            OpaEngine::from_reader_with_middleware_config(
+                TEST_POLICY,
+                data.as_bytes(),
+                Some(&validate),
+            )
+            .err()
+            .unwrap(),
         ] {
             assert_safe_load_error(&error, &["private-", "秘密", "private.example.test"]);
             let message = error.to_string();
@@ -2737,7 +3152,7 @@ mod tests {
             );
             assert!(message.ends_with("additional violations omitted"));
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 30);
+        assert_eq!(calls.load(Ordering::Relaxed), 40);
         let accept = |_: &str, _: &prost_types::Struct| Ok(());
         assert!(
             OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, Some(&accept))
@@ -3218,7 +3633,9 @@ mod tests {
     #[test]
     fn yaml_containers_structural_errors_are_fixed_for_large_untrusted_input() {
         let mut data = opa_container_policy();
-        let marker = "sensitive-\u{1f980}".repeat(1024);
+        // Stay below the shared byte ceiling so this case reaches the
+        // structural boundary instead of the earlier input-size rejection.
+        let marker = "sensitive-\u{1f980}".repeat(128);
         data["network_policies"]["admin"]["endpoints"] =
             serde_json::Value::Array(vec![serde_json::json!({"deny_rules": marker}); 1024]);
         let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
@@ -3395,28 +3812,47 @@ mod tests {
     fn assert_endpoint_config_parity(
         yaml_config: &serde_json::Value,
         proto_config: &serde_json::Value,
-        canonical_policy: &ProtoSandboxPolicy,
+        proto: &ProtoSandboxPolicy,
         endpoint: &NetworkEndpoint,
+        context: &str,
     ) {
-        assert!(yaml_config.get("endpoint_id").is_none());
-        assert!(yaml_config.get("policy_hash").is_none());
+        // Standalone raw policy has no admitted gateway policy identity. The
+        // managed loader adds only these observation fields; every policy
+        // field and runtime provenance value must still match exactly.
+        for field in ["endpoint_id", "policy_hash"] {
+            assert!(
+                yaml_config.get(field).is_none(),
+                "{context}: standalone raw policy must not acquire managed {field}"
+            );
+        }
         let mut expected = yaml_config.clone();
         if is_mcp_protocol(&endpoint.protocol) {
-            // Gateway MCP observations carry canonical endpoint/policy identity.
-            // Derive only that metadata independently; compare every remaining
-            // configuration field without filtering actual runtime output.
-            expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
-            expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
-            assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
-            assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
+            let endpoint_id =
+                serde_json::Value::String(openshell_core::endpoint_status::endpoint_id(endpoint));
+            let policy_hash = serde_json::Value::String(deterministic_policy_hash(proto));
+            assert_eq!(
+                proto_config.get("endpoint_id"),
+                Some(&endpoint_id),
+                "{context}: managed endpoint identity must match the canonical endpoint"
+            );
+            assert_eq!(
+                proto_config.get("policy_hash"),
+                Some(&policy_hash),
+                "{context}: managed policy identity must match the full canonical policy"
+            );
+            expected["endpoint_id"] = endpoint_id;
+            expected["policy_hash"] = policy_hash;
         } else {
-            assert!(proto_config.get("endpoint_id").is_none());
-            assert!(proto_config.get("policy_hash").is_none());
+            for field in ["endpoint_id", "policy_hash"] {
+                assert!(
+                    proto_config.get(field).is_none(),
+                    "{context}: non-MCP endpoint must not carry observation {field}"
+                );
+            }
         }
         assert_eq!(
             &expected, proto_config,
-            "{}: endpoint configuration must match apart from verified gateway identity",
-            endpoint.protocol
+            "{context}: complete endpoint configuration must match the declared loader contract"
         );
     }
 
@@ -3484,7 +3920,7 @@ network_policies:
         let proto = openshell_policy::parse_sandbox_policy(data)
             .expect("protocol parity fixture must parse into the typed schema");
         let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
-            .expect("protocol parity fixture must canonicalize");
+            .expect("protocol parity fixture must have a canonical managed identity");
         let yaml_engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from YAML");
         let proto_engine = OpaEngine::from_proto(&proto).expect("engine from protobuf");
 
@@ -3597,8 +4033,8 @@ network_policies:
                 .endpoints
                 .iter()
                 .find(|endpoint| endpoint.host == host)
-                .expect("fixture contains the exact endpoint");
-            assert_endpoint_config_parity(&yaml_config, &proto_config, &proto, endpoint);
+                .expect("queried endpoint must exist in the canonical policy");
+            assert_endpoint_config_parity(&yaml_config, &proto_config, &proto, endpoint, protocol);
             assert_eq!(
                 yaml_config.get("mcp_versions").is_some(),
                 protocol == "MCP",
@@ -3678,7 +4114,7 @@ network_policies:
             endpoint.provider_credentialed = true;
             endpoint.advisor_proposed = true;
             let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
-                .expect("runtime provenance fixture must canonicalize");
+                .expect("matcher fixture must retain canonical managed identity and provenance");
             let mut data: serde_json::Value = serde_yml::from_str(&source).unwrap();
             let endpoint = &mut data["network_policies"]["matchers"]["endpoints"][0];
             endpoint["provider_credentialed"] = true.into();
@@ -3717,11 +4153,15 @@ network_policies:
                 }
                 let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap().unwrap();
                 let proto_config = proto_engine.query_endpoint_config(&input).unwrap().unwrap();
+                let yaml_json = serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap();
+                let proto_json =
+                    serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap();
                 assert_endpoint_config_parity(
-                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
-                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
+                    &yaml_json,
+                    &proto_json,
                     &proto,
                     &proto.network_policies["matchers"].endpoints[0],
+                    &format!("{protocol} {phase}"),
                 );
                 for engine in [&yaml_engine, &proto_engine] {
                     let snapshot = engine.authorize_egress(&input).unwrap();
@@ -3896,11 +4336,12 @@ network_policies:
                     let error = OpaEngine::from_strings(TEST_POLICY, &source)
                         .err()
                         .expect("non-map params must reject at startup");
-                    // A malformed rule may produce multiple safe categories.
+                    // The canonical schema rejects malformed matcher maps before
+                    // protocol-specific validation can lower tool aliases.
                     assert!(
                         error
                             .to_string()
-                            .contains("invalid L7 policy configuration"),
+                            .contains("OPA policy schema validation failed"),
                         "{error}"
                     );
                     assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
@@ -3910,7 +4351,7 @@ network_policies:
                     assert!(
                         error
                             .to_string()
-                            .contains("invalid L7 policy configuration"),
+                            .contains("OPA policy schema validation failed"),
                         "{error}"
                     );
                     assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
@@ -6442,7 +6883,7 @@ network_policies:
 
         let message = err.to_string();
         assert!(
-            message.contains("invalid L7 protocol configuration"),
+            message.contains("OPA policy schema validation failed"),
             "unexpected validation error: {message}"
         );
         for authored in [
@@ -6485,7 +6926,7 @@ network_policies:
 
         let message = err.to_string();
         assert!(
-            message.contains("invalid L7 protocol configuration"),
+            message.contains("OPA policy schema validation failed"),
             "unexpected validation error: {message}"
         );
         for authored in [
@@ -6942,10 +7383,14 @@ network_policies:
                 panic!("invalid MCP runtime metadata must reject activation: {case}");
             };
             let message = error.to_string();
-            assert!(
-                message.contains("invalid L7 policy configuration"),
-                "{case}: {message}"
-            );
+            // Canonical schema validation rejects invalid values first; a
+            // valid revision set in the wrong runtime order reaches L7 checks.
+            let expected = if case == "non-canonical" {
+                "invalid L7 policy configuration"
+            } else {
+                "OPA policy schema validation failed"
+            };
+            assert!(message.contains(expected), "{case}: {message}");
             assert!(!message.contains("2026-01-01"), "{case}: {message}");
         }
     }
@@ -6975,10 +7420,10 @@ network_policies:
         };
         let message = error.to_string();
         assert!(
-            message.contains("invalid L7 protocol configuration"),
+            message.contains("OPA policy schema validation failed"),
             "{message}"
         );
-        for authored in ["mcp_versions", "2025-03-26", "2025-11-25"] {
+        for authored in ["2025-03-26", "2025-11-25"] {
             assert!(
                 !message.contains(authored),
                 "diagnostic leaked {authored}: {message}"
@@ -7015,7 +7460,7 @@ network_policies:
             };
             let message = error.to_string();
             assert!(
-                message.contains("invalid L7 protocol configuration"),
+                message.contains("OPA policy schema validation failed"),
                 "{message}"
             );
             assert!(!message.contains("2025-11-25"), "{message}");
@@ -7051,7 +7496,7 @@ network_policies:
             };
             let message = error.to_string();
             assert!(
-                message.contains("invalid L7 policy configuration"),
+                message.contains("OPA policy schema validation failed"),
                 "{message}"
             );
             for authored in ["rpc.example.com", "ping", "2025-11-25"] {
@@ -8369,6 +8814,60 @@ process:
             matches!(action, NetworkAction::Deny { .. }),
             "relaxed identity must not allow undeclared endpoints"
         );
+    }
+
+    #[test]
+    fn public_file_raw_reload_preserves_binary_identity_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let rules = directory.path().join("policy.rego");
+        let data = directory.path().join("policy.yaml");
+        std::fs::write(&rules, TEST_POLICY).unwrap();
+        std::fs::write(&data, PROVIDER_ENDPOINT_TEST_DATA).unwrap();
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::new(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        for require_identity in [false, true] {
+            let engine = if require_identity {
+                OpaEngine::from_files(&rules, &data).unwrap()
+            } else {
+                OpaEngine::from_files_for_endpoint_only_proxy(&rules, &data, None).unwrap()
+            };
+            for generation in [0, 1] {
+                if generation == 1 {
+                    engine
+                        .reload(TEST_POLICY, PROVIDER_ENDPOINT_TEST_DATA)
+                        .unwrap();
+                }
+                assert_eq!(engine.binary_identity_required(), require_identity);
+                assert_eq!(engine.current_generation(), generation);
+                assert_eq!(
+                    matches!(
+                        engine.evaluate_network_action(&input).unwrap(),
+                        NetworkAction::Allow { .. }
+                    ),
+                    !require_identity,
+                    "raw reload must preserve the constructor's authorization mode"
+                );
+                let undeclared = NetworkInput {
+                    host: "api.openai.com".into(),
+                    port: 443,
+                    binary_path: PathBuf::new(),
+                    binary_sha256: String::new(),
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                };
+                assert!(matches!(
+                    engine.evaluate_network_action(&undeclared).unwrap(),
+                    NetworkAction::Deny { .. }
+                ));
+            }
+        }
     }
 
     #[test]
@@ -10586,6 +11085,124 @@ network_policies:
             .await
             .expect("describe chain");
         assert!(described[0].is_resolved());
+    }
+
+    #[test]
+    fn configuration_activation_rejection_preserves_policy_and_credentials() {
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        use std::collections::HashMap;
+
+        let mut proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let accepted = live.snapshot();
+        let prepared = ProviderCredentialState::from_environment(
+            2,
+            HashMap::from([("API_KEY".to_string(), "new-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        proto.network_middlewares.insert(
+            String::new(),
+            NetworkMiddlewareConfig {
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                ..Default::default()
+            },
+        );
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                live.install_prepared(&prepared);
+            })
+            .expect_err("invalid candidate");
+        assert_eq!(engine.current_generation(), 0);
+        assert_eq!(live.snapshot().revision, accepted.revision);
+        assert_eq!(live.snapshot().child_env, accepted.child_env);
+        assert_eq!(
+            live.resolver()
+                .unwrap()
+                .resolve_placeholder(&accepted.child_env["API_KEY"]),
+            Some("old-secret")
+        );
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&input).unwrap().allowed);
+    }
+
+    #[test]
+    fn configuration_activation_invalidates_guards_before_credentials_change() {
+        use openshell_core::provider_credentials::ProviderCredentialState;
+        use std::collections::HashMap;
+
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        let old = engine.clone_engine_for_tunnel(0).unwrap();
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("API_KEY".to_string(), "old-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let prepared = ProviderCredentialState::from_environment(
+            2,
+            HashMap::from([("API_KEY".to_string(), "new-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        // Even a provider-only update must revoke old policy guards while
+        // preventing new readers from capturing half of the configuration.
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                assert!(old.generation_guard().is_stale());
+                assert!(engine.engine.try_lock().is_err());
+                assert!(engine.middleware_runner.try_read().is_err());
+                assert_eq!(live.snapshot().revision, 1);
+                live.install_prepared(&prepared);
+            })
+            .unwrap();
+        assert_eq!(engine.current_generation(), 1);
+        assert_eq!(live.snapshot().revision, 2);
+        assert_eq!(
+            live.resolver()
+                .unwrap()
+                .resolve_placeholder(&live.snapshot().child_env["API_KEY"]),
+            Some("new-secret")
+        );
+        assert!(engine.clone_engine_for_tunnel(0).is_err());
+        assert!(engine.clone_engine_for_tunnel(1).is_ok());
+    }
+
+    #[test]
+    fn configuration_activation_repairs_fail_closed_and_keeps_identity_mode() {
+        let proto = test_proto();
+        let engine =
+            OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false).unwrap();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {})
+            .unwrap();
+        assert!(engine.fail_closed_reason().is_none());
+        assert!(!engine.binary_identity_required());
+        assert!(engine.clone_engine_for_tunnel(2).is_ok());
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::new(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&input).unwrap().allowed);
     }
 
     #[tokio::test]

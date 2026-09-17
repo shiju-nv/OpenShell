@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, Policy, Schema, YAML, Reference, Securi
 position: 3
 ---
 
-Complete field reference for the sandbox policy YAML. Each field is documented with its type, whether it is required, and whether it is static (locked at sandbox creation) or dynamic (hot-reloadable on a running sandbox).
+Complete field reference for authored sandbox policy YAML and JSON. Each field is documented with its type, whether it is required, and whether it is static (locked at the first authorization to release the workload) or dynamic (updatable on a running sandbox).
 
 ## Top-Level Structure
 
@@ -34,51 +34,43 @@ network_middlewares: { ... }
 
 The YAML root and each present top-level section listed as an object or map must be mappings. Each named network policy or middleware entry must also be a mapping. The OPA loader rejects the first malformed container before normalization or access preset expansion, with a structural error that excludes authored keys and values.
 
-Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+Static fields can be repaired while configuration admission is pending or rejected and the gateway's durable `configuration_activation_authorized` value is explicitly `false`. The first authorization to release the workload locks those fields before execution may begin; a missing value or restart does not restore repair permission. After authorization, static changes require a new sandbox. Dynamic fields can be updated with `openshell policy update` for incremental merges or `openshell policy set` for full replacement when the selected compute driver supports live policy updates. Policy and provider state activate together; gateway admission alone does not establish that the workload is ready. See [Sandbox Policies](/sandboxes/policies) for repair and activation checks.
 
-For query parameters and MCP tool names, the OPA loader normalizes nonempty string matchers to explicit `glob` objects after validation. For example, `query: { status: "active*" }` becomes `query: { status: { glob: "active*" } }` in runtime endpoint data. The same normalization applies to allow and deny rules and to MCP `tool` aliases. Matchers supported by both YAML and protobuf use the same runtime representation; `any` matchers retain their listed values. Raw OPA data also accepts empty scalar query matchers, which match empty query values and remain unchanged during loading. An empty protobuf glob cannot represent that OPA-only matcher.
+## Parsing and Representation
 
-## Parsing and representation
+Authored policies and raw OPA runtime data share bounded YAML/JSON decoding. The parser rejects duplicate mapping keys and YAML merge keys, and accepts one document of at most 4 MiB. Its default limits are 64 nesting levels, 100,000 document nodes, 300,000 parser events, 4 MiB of cumulative scalar data, 100 alias expansions, a 5:1 alias-to-anchor ratio, and 10,000 entries per mapping or sequence. Reader loading retains at most the byte budget before decoding and consumes at most one extra byte to detect overflow. Regular-file loading checks metadata and also enforces the bound while reading, so file growth cannot bypass it.
 
-OpenShell uses one canonical authored-policy representation for YAML and JSON.
-Runtime policy loading and the policy prover both decode through the same
-bounded parser before projecting the document into their runtime-specific
-models. The parser requires `version: 1`, rejects duplicate mapping keys and
-YAML merge keys, and accepts one document of at most 4 MiB. It limits nesting
-to 64 levels, total AST nodes to 100,000, parser events to 300,000, cumulative
-scalar data to 4 MiB, alias expansions to 100 with a 5:1 alias-to-anchor ratio,
-and each mapping or sequence to 10,000 entries.
+### Authored Policies
 
-Unknown keys in closed schema objects are rejected with their field path before
-the policy is converted or analyzed. The following maps are intentionally
-open user namespaces, so their keys are preserved as data: middleware `config`,
-query matcher names, GraphQL persisted-query names, and recursively nested MCP
-`params` names.
+Ordinary authored policy requires `version: 1`. The root and every section declared as an object or map must use named mappings. Booleans must be booleans, string fields must be strings, and path lists must contain strings. Explicit `null` values do not select omission defaults. Closed schema objects reject unknown fields.
 
-An absent `filesystem_policy` resolves to the runtime-effective
-`include_workdir: true`. An explicitly present `filesystem_policy: {}` keeps
-`include_workdir: false`. During protobuf conversion, `ports` takes precedence
-over scalar `port`, one effective port serializes in compact scalar form, empty
-rule names fall back to their map key, and runtime-only provenance fields are
-omitted. Because proto3 scalar fields do not preserve presence, protobuf `version: 0` means omission. Canonical serialization materializes
-`version: 1`; any other unsupported protobuf version is rejected. A protobuf port above
-65535 is rejected rather than clamped.
+Middleware `config`, query matcher names, GraphQL persisted-query names, and recursively nested MCP parameter names are open user-data namespaces. Their keys are data, while the surrounding policy objects and matcher operators remain closed. Schema parsing preserves nested parameter shapes; protocol-specific validation determines which matchers a runtime endpoint supports.
+
+The policy prover uses the same strict authored profile. The containment profile for maximum-policy tooling retains unknown closed-object fields, managed `metadata`, and endpoint or allow-rule `review` annotations for a support audit. Those annotations describe workflow and grant no policy authority. Ordinary runtime policies reject them, and schema acceptance alone does not establish containment support for a field.
+
+An absent `filesystem_policy` resolves to `include_workdir: true`. A present `filesystem_policy: {}` resolves to `include_workdir: false`. During protobuf conversion, nonempty `ports` takes precedence over scalar `port`, empty rule names fall back to their map key, and a single effective port serializes in compact scalar form. Authored serialization omits runtime-only provenance. Because proto3 scalar fields do not preserve presence, protobuf `version: 0` means omission; canonical serialization materializes `version: 1`. Other unsupported versions and ports above 65535 are rejected.
+
+### Raw OPA Runtime Data
+
+An operator-supplied OPA data document has a separate runtime representation. It may omit `version` and retain unrelated application data at the root. Governed policy sections still use the canonical scalar types, defaults, and closed-object rules. This raw representation preserves runtime endpoint provenance, resolved binary entries, lowered protocol settings, and explicit matcher objects. It does not turn those fields into authored-policy options, derive provenance for unstamped inputs, or let input select the trusted binary-identity mode. The loader validates the supplied data document; custom Rego code can produce additional values during evaluation.
+
+For query parameters and supported MCP parameter matchers, the OPA loader normalizes nonempty strings to explicit `glob` objects after validation. For example, `query: { status: "active*" }` becomes `query: { status: { glob: "active*" } }` in runtime endpoint data. This applies to allow and deny rules and MCP `tool` aliases. Matchers supported by YAML and protobuf use the same runtime representation; `any` matchers retain their listed values. Raw OPA data also accepts empty scalar query matchers, which match empty query values and remain unchanged. An empty protobuf glob cannot represent that OPA-only matcher.
 
 ## Policy Load Diagnostics
 
-When the supervisor's OPA engine rejects a policy load or reload, its error message identifies the validation category without copying policy or middleware names, hostnames, paths, values, or source text. The message also omits the original error chain. This applies to the engine's file, string, and protobuf loaders.
+When the supervisor's OPA engine rejects a load or reload from a file, reader, string, or protobuf, its returned error identifies the validation category without copying policy or middleware names, hostnames, paths, values, source text, or the original error chain.
 
-Each message contains at most eight error items and 512 UTF-8 bytes, including the heading, separators, and the `additional violations omitted` marker when more items cannot fit. Categories help you choose which part of the submitted policy to inspect:
+Each message contains at most eight error items and 512 UTF-8 bytes, including its heading, separators, and any `additional violations omitted` marker. Categories identify which part of the submitted input to inspect:
 
 - Typed validation distinguishes process identity, filesystem paths and limits, Landlock compatibility, endpoint hosts and ports, credential signing and rewriting, MCP configuration, and middleware configuration.
+- Shared raw-schema validation reports a fixed schema location and category for malformed values or closed-object fields.
 - L7 validation reports `invalid L7 policy configuration` for semantic errors and `invalid L7 protocol configuration` for protocol configuration or alias errors.
 - Endpoint conflicts report `ambiguous network endpoint selectors`.
-- YAML errors report a fixed parser category, with numeric line and column when the parser provides them.
-- File I/O, Rego loading, and internal policy-data failures return fixed messages.
+- Parser errors report a fixed category and numeric line and column when available. File I/O, Rego loading, and internal policy-data failures return fixed messages.
 
-A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor then applies the gateway's `policy_validation_failure_mode`; `fail_closed` can publish a quarantine generation that denies egress, while `retain_last_valid` keeps an existing valid generation active. See [Gateway Configuration](/reference/gateway-config) for that setting and startup behavior.
+A rejected engine reload preserves its previous policy and generation. The supervisor separately applies `policy_validation_failure_mode`. In a managed control/boundary sandbox, the default `fail_closed` posture holds workload execution and readiness, denies new egress, and invalidates old relays until matching policy and provider state activate. `retain_last_valid` permits only a verified previous accepted configuration to remain active; it cannot release an uncertain mixture or an initial sandbox without such a configuration. See [Gateway Configuration](/reference/gateway-config) for that setting and [Sandbox Policies](/sandboxes/policies) for repair.
 
-These bounds apply to returned OPA load errors. Warnings for accepted policies, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting behavior.
+These bounds apply to returned OPA load errors. Accepted-policy warnings, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting contracts.
 
 ## Version
 
@@ -108,7 +100,7 @@ Controls filesystem access inside the sandbox. Paths not listed in either `read_
 - Each individual path must not exceed 4096 characters.
 - The combined total of `read_only` and `read_write` paths must not exceed 256.
 
-Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at creation or update time. Disk-loaded YAML policies that fail validation fall back to a restrictive default.
+Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at creation or update time. A malformed raw OPA filesystem section rejects the engine load; a failed reload preserves the installed engine. Managed runtime recovery follows the configuration admission and rejection posture described above.
 
 Example:
 
@@ -141,13 +133,13 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 | Value | No paths configured | Kernel ABI unavailable | Individual path inaccessible | All paths inaccessible |
 |---|---|---|---|---|
 | `best_effort` | Landlock skipped (no-op). | Warns and continues without Landlock. | Skips the path, applies remaining rules. | Warns and continues without Landlock (refuses to apply an empty ruleset). |
-| `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts sandbox startup, except in Kubernetes sidecar (current-user) mode where the inaccessible path is skipped. | Aborts sandbox startup. |
+| `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts privileged preparation; skips the path when the boundary opens paths as the workload user. | Aborts sandbox startup. |
 
 `best_effort` (the default) is appropriate for most deployments. It handles missing paths gracefully. For example, `/app` might not exist in every container image but is included in the baseline path set for containers that do have it. Individual missing paths are skipped while the remaining filesystem rules are still enforced.
 
-`hard_requirement` is for environments where any gap in filesystem isolation is unacceptable. If a listed path cannot be opened for any reason (missing, permission denied, symlink loop), sandbox startup fails immediately rather than running with reduced protection. Configuring `hard_requirement` with no filesystem paths is also a startup error.
+`hard_requirement` makes unavailable kernel support, empty configured path sets, and an entirely inaccessible path set fatal. During privileged preparation, an individual path-open failure also aborts startup.
 
-In Kubernetes sidecar (current-user) mode the sandbox cannot distinguish an intentionally denied path from a misconfigured one, so an individual inaccessible path is skipped and the remaining rules are applied instead of aborting. The other `hard_requirement` failures (kernel ABI unavailable, no paths configured, all paths inaccessible) still abort startup.
+The capability-free boundary opens policy paths as the workload user. A path that this user cannot open is already unavailable to the workload, so the boundary skips that path and applies the remaining rules. The other `hard_requirement` failures still abort startup. The boundary also installs a mandatory filesystem baseline protecting its private runtime files; failure to install that baseline aborts startup independently of the optional policy's compatibility setting.
 
 When a path is skipped under `best_effort`, the sandbox logs a warning that includes the path, the specific error, and a human-readable reason (for example, "path does not exist" or "permission denied").
 

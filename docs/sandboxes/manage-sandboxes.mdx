@@ -531,7 +531,7 @@ openshell sandbox list -o yaml
 Structured list output contains `sandboxes` and `next_page_token` fields.
 Pass the returned token to `--page-token` to continue.
 
-Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
+Get detailed information about a sandbox. The policy view shows the selected desired policy, its scope (`sandbox` or `global`), and its revision. It does not by itself prove that the workload installed that configuration:
 
 ```shell
 openshell sandbox get my-sandbox
@@ -543,7 +543,11 @@ For automation, use `--output json` or `--output yaml` to get machine-readable s
 openshell sandbox get my-sandbox --output json
 ```
 
-Print only the policy YAML for scripting (same effective policy, no metadata):
+Structured details separate `configuration_desired` from `configuration_admission`. The former names the delivered candidate; the latter records installation state and `activation_confirmed`. An accepted candidate may still be waiting for release confirmation. A desired rejection can also coexist with an older accepted configuration when the gateway permits retaining it. Use the configuration error and [Repair a Rejected Configuration](/sandboxes/policies#repair-a-rejected-configuration) to correct policy or providers without restarting a blocked initial workload.
+
+The repair wait applies after the gateway acknowledges a configuration rejection. Startup calls that receive no response or repeatedly fail terminate after bounded retries. For those failures, inspect gateway connectivity and authentication before retrying startup.
+
+Print only the desired effective policy YAML for scripting, without activation metadata:
 
 ```shell
 openshell sandbox get my-sandbox --policy-only
@@ -726,11 +730,18 @@ commands, transfer files, forward ports, or reach exposed services. Policies,
 provider attachments, settings, service definitions, and persistent workspace
 data remain associated with the sandbox.
 
-Stop and start are idempotent. You can also start a retained `Completed` or
-`Error/MainProcessFailed` sandbox to launch a fresh instance of its canonical
-command. Starting a fresh instance invalidates SSH sessions issued for the
-previous runtime generation. Delete an inactive sandbox normally when you no
-longer need its retained state.
+Stop and start are idempotent. You can also start a retained `Completed` or `Error/MainProcessFailed` sandbox to launch a fresh instance of its canonical command. Starting a fresh instance creates a new driver runtime generation, invalidates prior SSH sessions, and requires fresh configuration activation. Delete an inactive sandbox normally when you no longer need its retained state.
+
+If the control supervisor or container exits, first inspect `openshell sandbox get my-sandbox --output json`. For phase `Error` with a `Ready=False` condition whose reason is exactly `ControlSupervisorExited` or `ContainerExited`, explicitly stop the sandbox before starting it again. These conditions do not replace the driver's stop confirmation. The stop command waits for driver-confirmed `Stopped`; direct start from either failure state is refused. Start only after stop succeeds:
+
+```fish
+if openshell sandbox stop my-sandbox
+    openshell sandbox start my-sandbox
+end
+openshell sandbox get my-sandbox --output json
+```
+
+The new runtime generation must complete fresh configuration activation before readiness returns. This recovery path requires one of these exact failure conditions; other infrastructure errors need diagnosis of their reported reason and do not become restartable through this procedure.
 
 ## Delete Sandboxes
 
@@ -763,20 +774,17 @@ Every sandbox moves through a defined set of phases:
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Provisioning | The runtime is setting up the sandbox environment, or the gateway is waiting for the sandbox supervisor to establish its authenticated control session.       |
-| Ready        | The sandbox is running and its supervisor control session is connected. You can connect, execute commands, sync files, and view logs.                          |
+| Ready        | The current control session is connected and the accepted configuration has confirmed activation. You can connect, execute commands, sync files, and view logs. |
 | Stopping     | The gateway accepted a stop request and is stopping compute while retaining persistent state.                                                         |
 | Stopped      | Compute was stopped explicitly and access is unavailable.                                                                                 |
-| Starting     | Compute is starting. The sandbox becomes usable only after a fresh supervisor session connects.                                                       |
+| Starting     | Compute is starting. Access requires a fresh supervisor session and matching configuration activation. |
 | Completed    | The canonical main process exited with code 0. Its normalized result is available in `status.exit_code`.                                           |
 | Error        | The canonical main process failed, or sandbox infrastructure failed. Inspect the condition reason and `status.exit_code`.                  |
 | Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                                          |
 
-The compute backend can become ready before the sandbox supervisor connects to
-the gateway. During this interval, the sandbox remains in `Provisioning` and
-reports a `Ready=False` condition with the reason `SupervisorNotConnected`.
-After a gateway restart, an existing sandbox can return to `Provisioning`
-temporarily while its supervisor reconnects. Wait for the phase to return to
-`Ready` before you connect to the sandbox or execute commands.
+Compute readiness and a connected supervisor session are insufficient to make a sandbox usable. The gateway also requires an accepted configuration with `activation_confirmed: true` for the current runtime. A disconnected supervisor produces `SupervisorNotConnected`; incomplete or rejected activation produces configuration conditions such as `ConfigurationPending` or `ConfigurationInvalid`. Inspect `conditions`, `configuration_desired`, and `configuration_admission` with `openshell sandbox get my-sandbox --output json`.
+
+After a connection loss, OpenShell holds the workload while the supervisor recovers. A replacement supervisor must register with the gateway, attach with a current signed grant, and revalidate the configuration. Boundary confirmation alone cannot resume execution. If recovery expires or the boundary process is destroyed, the old runtime generation is terminal; launching again requires a new driver runtime generation. Wait for `Ready` before reconnecting or executing commands.
 
 The gateway records a successful canonical main-process exit as `Ready=False`
 with reason `MainProcessCompleted`. Nonzero and signal-normalized results use

@@ -883,6 +883,19 @@ pub async fn sandbox_create(
                     break;
                 }
 
+                if phase != SandboxPhase::Ready
+                    && let Some(message) = configuration_failure_message(&s)
+                {
+                    // Rejected configuration keeps the runtime alive for repair.
+                    // Finish the client wait without deleting the sandbox or
+                    // waiting for a terminal phase that will never be reported.
+                    let detail = configuration_repair_message(&s, message);
+                    if let Some(d) = display.as_interactive_mut() {
+                        d.finish_error(&detail);
+                    }
+                    return Err(miette!(detail));
+                }
+
                 // Capture infrastructure error reasons only after excluding a
                 // canonical-command result, which must attach and drain output.
                 if phase == SandboxPhase::Error
@@ -1560,11 +1573,26 @@ where
         sandbox.object_id().to_string()
     };
 
-    let config = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    let config_result = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id,
+            ..Default::default()
+        })
+        .await;
+    let config = match config_result {
+        Ok(response) => response.into_inner(),
+        Err(_) if !policy_only && configuration_failure_message(&sandbox).is_some() => {
+            // An invalid desired policy must not hide the status needed to
+            // repair it. Keep payload-only reads strict.
+            GetSandboxConfigResponse {
+                configuration_error: configuration_failure_message(&sandbox)
+                    .unwrap_or_default()
+                    .to_string(),
+                ..Default::default()
+            }
+        }
+        Err(error) => return Err(error).into_diagnostic(),
+    };
 
     if policy_only {
         let Some(ref policy) = config.policy else {
@@ -1598,6 +1626,22 @@ where
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(status) = sandbox.status.as_ref() {
+        for condition in &status.conditions {
+            if matches!(
+                condition.r#type.as_str(),
+                "ConfigurationReady" | "DesiredConfigurationReady"
+            ) && condition.status.eq_ignore_ascii_case("false")
+            {
+                println!(
+                    "  {} {}: {}",
+                    "Configuration:".dimmed(),
+                    condition.reason,
+                    condition.message
+                );
+            }
+        }
+    }
     if let Some(exit_code) = sandbox.status.as_ref().and_then(|status| status.exit_code) {
         println!("  {} {}", "Exit Code:".dimmed(), exit_code);
     }
@@ -2460,7 +2504,35 @@ pub async fn sandbox_list(
     Ok(())
 }
 
+fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
+    let status = sandbox.status.as_ref()?;
+    // Desired-generation rejection takes precedence over the installed
+    // generation, which may remain accepted under retain-last-valid policy.
+    status
+        .configuration_desired
+        .as_ref()
+        .map(|desired| desired.error.as_str())
+        .filter(|message| !message.is_empty())
+        .or_else(|| {
+            status
+                .configuration_admission
+                .as_ref()
+                .map(|admission| admission.error.as_str())
+                .filter(|message| !message.is_empty())
+        })
+}
+
+fn configuration_repair_message(sandbox: &Sandbox, message: &str) -> String {
+    format!(
+        "sandbox '{}' configuration rejected: {message}. Inspect it with 'openshell sandbox get {}' and repair its policy or providers",
+        sandbox.object_name(),
+        sandbox.object_name(),
+    )
+}
+
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
+    use openshell_core::proto::ConfigurationAdmissionState;
+
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
     let annotations = meta.map_or_else(
@@ -2500,6 +2572,58 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
             })
             .collect::<Vec<_>>()
     });
+    let admission = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .map(|admission| {
+            serde_json::json!({
+                "state": match ConfigurationAdmissionState::try_from(admission.state) {
+                    Ok(ConfigurationAdmissionState::Pending) => "pending",
+                    Ok(ConfigurationAdmissionState::Accepted) => "accepted",
+                    Ok(ConfigurationAdmissionState::Rejected) => "rejected",
+                    _ => "unknown",
+                },
+                "error": admission.error,
+                "policy_version": admission.policy_version,
+                "policy_hash": admission.policy_hash,
+                "config_revision": admission.config_revision,
+                "provider_env_revision": admission.provider_env_revision,
+                "activation_confirmed": admission.activation_confirmed,
+                "instance_id": admission.instance_id,
+                "runtime_generation": admission.runtime_generation,
+                "boundary_instance_id": admission.boundary_instance_id,
+                "boundary_session_id": admission.boundary_session_id,
+                "registration_revision": admission.registration_revision,
+                "configuration_snapshot": admission.configuration_snapshot,
+                "policy_source": configuration_policy_source(admission.policy_source),
+                "delivery_revision": admission.delivery_revision,
+            })
+        });
+    let desired = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_desired.as_ref())
+        .map(|desired| {
+            serde_json::json!({
+                "admitted": desired.admitted,
+                "error": desired.error,
+                "policy_version": desired.policy_version,
+                "policy_hash": desired.policy_hash,
+                "config_revision": desired.config_revision,
+                "provider_env_revision": desired.provider_env_revision,
+                "delivery_revision": desired.delivery_revision,
+                "snapshot_id": desired.snapshot_id,
+                "instance_id": desired.instance_id,
+                "runtime_generation": desired.runtime_generation,
+                "boundary_instance_id": desired.boundary_instance_id,
+                "boundary_session_id": desired.boundary_session_id,
+                "registration_revision": desired.registration_revision,
+                "policy_source": configuration_policy_source(desired.policy_source),
+                "policy_validation_failure_mode": desired.policy_validation_failure_mode,
+                "gateway_configuration_fingerprint": desired.gateway_configuration_fingerprint,
+            })
+        });
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
@@ -2513,6 +2637,10 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
+        "main_process_instance_id": sandbox.status.as_ref().map(|status| &status.main_process_instance_id),
+        "configuration_activation_authorized": sandbox.status.as_ref().and_then(|status| status.configuration_activation_authorized),
+        "configuration_admission": admission,
+        "configuration_desired": desired,
         "created_from_workload_template": created_from_workload_template,
     })
 }
@@ -2601,6 +2729,14 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         format!("Last result: {result}"),
         format!("Reported at (gateway acceptance): {reported_at}"),
     ]
+}
+
+fn configuration_policy_source(source: i32) -> &'static str {
+    match PolicySource::try_from(source) {
+        Ok(PolicySource::Sandbox) => "sandbox",
+        Ok(PolicySource::Global) => "global",
+        _ => "unspecified",
+    }
 }
 
 fn sandbox_detail_to_json(
@@ -3411,6 +3547,11 @@ async fn wait_for_lifecycle_phase(
     if current == target {
         return Ok(sandbox);
     }
+    if target == SandboxPhase::Ready
+        && let Some(message) = configuration_failure_message(&sandbox)
+    {
+        return Err(miette!(configuration_repair_message(&sandbox, message)));
+    }
     if current == SandboxPhase::Error {
         let detail = ready_false_condition_message(sandbox.status.as_ref())
             .unwrap_or_else(|| "sandbox entered Error".to_string());
@@ -3466,6 +3607,11 @@ async fn wait_for_lifecycle_phase(
             let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             if phase == target {
                 return Ok(sandbox);
+            }
+            if target == SandboxPhase::Ready
+                && let Some(message) = configuration_failure_message(&sandbox)
+            {
+                return Err(miette!(configuration_repair_message(&sandbox, message)));
             }
             if phase == SandboxPhase::Error {
                 let detail = ready_false_condition_message(sandbox.status.as_ref())
@@ -4483,6 +4629,7 @@ pub async fn sandbox_settings_get(
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox.object_id().to_string(),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -4938,7 +5085,10 @@ pub async fn sandbox_policy_update(
     };
 
     let current = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id,
+            ..Default::default()
+        })
         .await
         .into_diagnostic()?
         .into_inner();
@@ -5235,6 +5385,7 @@ where
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -7346,6 +7497,83 @@ mod tests {
         let json = super::sandbox_template_to_json(&template);
 
         assert_eq!(json["resources"]["gpu"], 2);
+    }
+
+    #[test]
+    fn configuration_activation_json_exposes_repair_diagnostic_and_accepted_generation() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let status = sandbox.status.as_mut().unwrap();
+        status.configuration_admission = Some(SandboxConfigurationAdmission {
+            state: ConfigurationAdmissionState::Rejected as i32,
+            error: "rule image_api requires L7 inspection".to_string(),
+            policy_hash: "candidate-hash".to_string(),
+            ..Default::default()
+        });
+        status.conditions.push(SandboxCondition {
+            r#type: "ConfigurationReady".to_string(),
+            status: "False".to_string(),
+            reason: "ConfigurationInvalid".to_string(),
+            message: "rule image_api requires L7 inspection".to_string(),
+            ..Default::default()
+        });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["configuration_admission"]["state"], "rejected");
+        assert_eq!(json["conditions"][0]["reason"], "ConfigurationInvalid");
+        assert_eq!(
+            super::configuration_failure_message(&sandbox),
+            Some("rule image_api requires L7 inspection")
+        );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .error
+            .clear();
+        assert_eq!(super::configuration_failure_message(&sandbox), None);
+
+        let status = sandbox.status.as_mut().unwrap();
+        status.configuration_admission.as_mut().unwrap().state =
+            ConfigurationAdmissionState::Accepted as i32;
+        status
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .activation_confirmed = true;
+        status.configuration_desired = Some(openshell_core::proto::SandboxConfigurationSnapshot {
+            error: "candidate provider is unavailable".into(),
+            policy_hash: "desired-hash".into(),
+            delivery_revision: 2,
+            policy_validation_failure_mode: "retain_last_valid".into(),
+            gateway_configuration_fingerprint: "gateway-settings-hash".into(),
+            ..Default::default()
+        });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["configuration_admission"]["state"], "accepted");
+        assert_eq!(
+            json["configuration_admission"]["activation_confirmed"],
+            true
+        );
+        assert_eq!(json["configuration_desired"]["admitted"], false);
+        assert_eq!(json["configuration_desired"]["policy_hash"], "desired-hash");
+        assert_eq!(json["configuration_desired"]["delivery_revision"], 2);
+        assert_eq!(
+            json["configuration_desired"]["policy_validation_failure_mode"],
+            "retain_last_valid"
+        );
+        assert_eq!(
+            json["configuration_desired"]["gateway_configuration_fingerprint"],
+            "gateway-settings-hash"
+        );
+        assert_eq!(
+            super::configuration_failure_message(&sandbox),
+            Some("candidate provider is unavailable")
+        );
     }
 
     #[test]

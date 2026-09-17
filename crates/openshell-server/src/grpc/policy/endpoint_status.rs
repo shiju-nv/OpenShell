@@ -19,7 +19,8 @@ use openshell_core::endpoint_status::initial_endpoint_status;
 use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::{
     EndpointResult, EndpointStatus, PolicySource, ReportEndpointStatusRequest,
-    ReportEndpointStatusResponse, Sandbox, SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
+    ReportEndpointStatusResponse, Sandbox, SandboxConfigurationAdmission,
+    SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -639,12 +640,13 @@ fn validate_endpoint_observation_markers(
     Ok(())
 }
 
-/// Build an endpoint reset only when the acknowledged policy changes observations' configuration.
-/// The caller commits any reset and the active policy version in one CAS.
+/// Derive endpoint evidence only for the exact confirmed policy/provider tuple.
+/// Mutable inputs must still match the receipt before the caller commits the
+/// reset, activation confirmation, and active policy version in one CAS.
 pub(super) async fn endpoint_status_reset_for_loaded_policy(
     state: &ServerState,
     sandbox: &Sandbox,
-    version: i64,
+    admission: &SandboxConfigurationAdmission,
 ) -> Result<Option<BTreeMap<String, EndpointStatus>>, Status> {
     // Both policy versions must use one provider/profile and global-policy view;
     // an external catalog can change between independent snapshot requests.
@@ -654,6 +656,17 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
         .await?;
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let global_policy = decode_policy_from_global_settings(&global_settings)?;
+    let source = if global_policy.is_some() {
+        PolicySource::Global
+    } else {
+        PolicySource::Sandbox
+    };
+    if admission.policy_source != i32::from(source) {
+        return Err(Status::aborted(
+            "endpoint configuration changed; poll and install again",
+        ));
+    }
+    let version = i64::from(admission.policy_version);
     let context = endpoint_context_for_loaded_policy_with_inputs(
         state,
         sandbox,
@@ -662,6 +675,16 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
         global_policy.as_ref(),
     )
     .await?;
+    // Policy delivery and confirmation are separate RPCs. A global policy,
+    // provider credential, or catalog change can occur between them; never
+    // persist an inventory derived from inputs the runtime did not confirm.
+    if context.policy_hash != admission.policy_hash
+        || context.provider_env_revision != admission.provider_env_revision
+    {
+        return Err(Status::aborted(
+            "endpoint configuration changed; poll and install again",
+        ));
+    }
     let current_version = i64::from(sandbox.current_policy_version());
     let same_configuration = if current_version == version {
         // An acknowledgement can be retried after endpoint reports have already

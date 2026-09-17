@@ -550,6 +550,12 @@ else
   GATEWAY_HOST_ALIAS_IP=""
 fi
 
+# An explicit route takes precedence over CI network discovery. The Docker
+# driver validates the literal and supplies the trusted runtime host alias.
+if [ -n "${OPENSHELL_E2E_HOST_GATEWAY_IP:-}" ]; then
+  GATEWAY_HOST_ALIAS_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP}"
+fi
+
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"

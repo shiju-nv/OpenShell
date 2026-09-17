@@ -55,9 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut client = OpenShellClient::new(InterceptedService::new(channel, interceptor));
 
+    // Observer reads must not register this client as the configuration control
+    // process or replace the workload's delivered activation snapshot.
     let before = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.clone(),
+            configuration_instance_id: String::new(),
         })
         .await?
         .into_inner();
@@ -120,7 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|status| format!("telemetry-only policy analysis was denied: {status}"))?;
 
     let after = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id,
+            configuration_instance_id: String::new(),
+        })
         .await?
         .into_inner();
     if after.version != before.version || after.policy_hash != before.policy_hash {

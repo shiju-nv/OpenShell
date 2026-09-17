@@ -200,7 +200,9 @@ pub struct DockerComputeConfig {
     /// Docker bridge network that sandbox containers join.
     pub network_name: String,
 
-    /// Host gateway IP used for sandbox host aliases.
+    /// Explicit container-visible host IP used for sandbox aliases and trusted DNS.
+    /// On macOS this address is not bound by the native gateway; on other hosts
+    /// it also selects the gateway's exact bridge callback listener address.
     pub host_gateway_ip: String,
 
     /// Unix socket path used for interactive sandbox access.
@@ -328,8 +330,14 @@ struct DockerGpuRuntimeCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DockerGatewayRoute {
-    Bridge { bind_address: SocketAddr },
-    HostGateway,
+    Bridge {
+        bind_address: SocketAddr,
+    },
+    /// The host listener is local; an explicit alias IP belongs to the
+    /// container's route to the host and must never become a native bind address.
+    HostGateway {
+        host_alias_ip: Option<IpAddr>,
+    },
 }
 
 #[derive(Clone)]
@@ -922,7 +930,7 @@ impl DockerComputeDriver {
         });
         let supervisor_grpc_endpoint = match &gateway_route {
             DockerGatewayRoute::Bridge { .. } => host_grpc_endpoint,
-            DockerGatewayRoute::HostGateway => docker_config.grpc_endpoint.clone(),
+            DockerGatewayRoute::HostGateway { .. } => docker_config.grpc_endpoint.clone(),
         };
         let supervisor_image = docker_config
             .supervisor_image
@@ -2311,8 +2319,7 @@ impl DockerComputeDriver {
         // Rotate launch-scoped credentials before either process starts.
         if !launch_authentication.is_empty() {
             refresh_docker_boundary_authentication(
-                resolved_sandbox_id,
-                &self.config,
+                &docker_boundary_state_dir_by_id(resolved_sandbox_id, &self.config)?,
                 launch_authentication,
             )
             .await?;
@@ -3075,7 +3082,9 @@ impl ComputeDriver for DockerComputeDriver {
                     vec![GatewayListenerRequirement {
                         reason: match self.config.gateway_route {
                             DockerGatewayRoute::Bridge { .. } => "docker managed bridge gateway",
-                            DockerGatewayRoute::HostGateway => "docker host-gateway IPv4 loopback",
+                            DockerGatewayRoute::HostGateway { .. } => {
+                                "docker host-gateway IPv4 loopback"
+                            }
                         }
                         .to_string(),
                         selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
@@ -4572,13 +4581,14 @@ async fn docker_supervisor_bundle_archive(
         .map_err(|error| Status::internal(format!("finish Docker supervisor archive: {error}")))
 }
 
+/// Refresh both stopped-runtime peers before either process is started.
+/// A failed write aborts launch; bootstrap, descriptor, and auth bundle
+/// must all carry the validated successor generation.
 async fn refresh_docker_boundary_authentication(
-    sandbox_id: &str,
-    config: &DockerDriverRuntimeConfig,
+    directory: &Path,
     encoded_authentication: &[u8],
 ) -> Result<(), Status> {
     let authentication = decode_docker_launch_authentication(encoded_authentication)?;
-    let directory = docker_boundary_state_dir_by_id(sandbox_id, config)?;
     let mut boundary_config = serde_json::from_slice::<BoundaryConfig>(
         &tokio::fs::read(directory.join(BOUNDARY_CONFIG_FILE))
             .await
@@ -4593,7 +4603,8 @@ async fn refresh_docker_boundary_authentication(
             "decode Docker sandbox bootstrap for authentication rotation: {error}"
         ))
     })?;
-    let Some(mut runtime_descriptor) = read_docker_runtime_descriptor(sandbox_id, config).await?
+    let Some(mut runtime_descriptor) =
+        read_docker_runtime_descriptor_file(&directory.join(RUNTIME_DESCRIPTOR_FILE)).await?
     else {
         return Err(Status::failed_precondition(
             "Docker sandbox runtime descriptor is missing during authentication rotation",
@@ -4609,6 +4620,9 @@ async fn refresh_docker_boundary_authentication(
     boundary_config.gateway_id = authentication.gateway_id;
     boundary_config.verification_keys =
         gateway_verification_keys(&authentication.verification_keys)?;
+    runtime_descriptor
+        .generation
+        .clone_from(&boundary_config.generation);
     runtime_descriptor.session_id = session_id;
     runtime_descriptor.tls = SandboxTlsClientConfig {
         server_name: tls.server_name,
@@ -4683,7 +4697,14 @@ async fn read_docker_runtime_descriptor(
     config: &DockerDriverRuntimeConfig,
 ) -> Result<Option<SandboxRuntimeDescriptor>, Status> {
     let path = docker_boundary_state_dir_by_id(sandbox_id, config)?.join(RUNTIME_DESCRIPTOR_FILE);
-    let bytes = match tokio::fs::read(&path).await {
+    read_docker_runtime_descriptor_file(&path).await
+}
+
+/// Read a protected descriptor, distinguishing absence from unreadable or malformed state.
+async fn read_docker_runtime_descriptor_file(
+    path: &Path,
+) -> Result<Option<SandboxRuntimeDescriptor>, Status> {
+    let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -5692,7 +5713,7 @@ fn docker_host_openshell_endpoint(
     }
     let host = match route {
         DockerGatewayRoute::Bridge { bind_address, .. } => bind_address.ip(),
-        DockerGatewayRoute::HostGateway => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        DockerGatewayRoute::HostGateway { .. } => IpAddr::V4(Ipv4Addr::LOCALHOST),
     };
     url.set_host(Some(&host.to_string())).map_err(|error| {
         Error::config(format!(
@@ -5705,17 +5726,19 @@ fn docker_host_openshell_endpoint(
 fn docker_supervisor_host_alias(route: &DockerGatewayRoute) -> String {
     match route {
         DockerGatewayRoute::Bridge { bind_address } => bind_address.ip().to_string(),
-        DockerGatewayRoute::HostGateway => "host-gateway".to_string(),
+        DockerGatewayRoute::HostGateway { host_alias_ip } => {
+            host_alias_ip.map_or_else(|| "host-gateway".to_string(), |ip| ip.to_string())
+        }
     }
 }
 
 fn docker_boundary_host_gateway_ip(route: &DockerGatewayRoute) -> Option<IpAddr> {
     match route {
         DockerGatewayRoute::Bridge { bind_address } => Some(bind_address.ip()),
-        // Docker resolves this special alias inside the supervisor container.
-        // Pinning it to loopback would target the daemon VM rather than the
-        // desktop host on Docker Desktop and compatible runtimes.
-        DockerGatewayRoute::HostGateway => None,
+        // Only an explicit container-visible address can authorize reserved-alias
+        // DNS. Docker's opaque host-gateway value supplies no trusted IP; native
+        // loopback would instead target the daemon VM from inside the container.
+        DockerGatewayRoute::HostGateway { host_alias_ip } => *host_alias_ip,
     }
 }
 
@@ -5761,14 +5784,23 @@ fn docker_gateway_route_for_host(
     host_gateway_ip: Option<IpAddr>,
     host_requires_host_gateway_alias: bool,
 ) -> DockerGatewayRoute {
+    if host_requires_host_gateway_alias {
+        // A desktop host cannot bind the daemon VM's container-visible address.
+        // Keep that explicit address solely as the alias and trusted DNS pin.
+        return DockerGatewayRoute::HostGateway {
+            host_alias_ip: host_gateway_ip,
+        };
+    }
     if let Some(host_alias_ip) = host_gateway_ip {
         return DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(host_alias_ip, port),
         };
     }
 
-    if host_requires_host_gateway_alias || uses_host_gateway_alias(info) {
-        DockerGatewayRoute::HostGateway
+    if uses_host_gateway_alias(info) {
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None,
+        }
     } else {
         DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(bridge_gateway_ip, port),
@@ -5782,7 +5814,7 @@ fn docker_gateway_callback_bind_address(
 ) -> Option<SocketAddr> {
     match route {
         DockerGatewayRoute::Bridge { bind_address, .. } => Some(*bind_address),
-        DockerGatewayRoute::HostGateway => match primary_bind_address.ip() {
+        DockerGatewayRoute::HostGateway { .. } => match primary_bind_address.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() || ip == Ipv4Addr::LOCALHOST => None,
             _ => Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),

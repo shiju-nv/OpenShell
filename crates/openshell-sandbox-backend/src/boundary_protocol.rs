@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use openshell_core::SandboxSessionId;
+use openshell_core::configuration::{ConfigurationActivationIdentity, ConfigurationRevision};
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkMode, NetworkPolicy,
     ProcessPolicy, ProxyPolicy, SandboxPolicy,
@@ -23,8 +24,10 @@ use openshell_core::policy::{
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, BinaryIdentity, BoundaryExitStatus, BoundarySignal,
-    DriverFenceEvidence, ExecSpec, ResolveError, SandboxConfirmEvidence,
+    ActivatedBoundaryConfiguration, BackendDescriptor, BackendError, BinaryIdentity,
+    BoundaryBootstrap, BoundaryConfigurationSnapshot, BoundaryExitStatus, BoundarySignal,
+    DriverFenceEvidence, ExecSpec, InstalledBoundaryConfiguration, PreparedBoundaryConfiguration,
+    ResolveError, SandboxConfirmEvidence,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::de::DeserializeOwned;
@@ -45,9 +48,9 @@ pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.
 ///
 /// The supervisor generates this value in memory and presents it on every
-/// attach, including transport reconnects. The sandbox pins the first value it
-/// accepts for its process lifetime, so a replacement supervisor cannot reuse
-/// launch credentials to take over an existing runtime generation.
+/// attach, including transport reconnects. The sandbox pins the accepted value
+/// until a newer gateway-signed registration authorizes a replacement; runtime
+/// launch credentials alone cannot transfer control ownership.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupervisorInstanceId(uuid::Uuid);
 
@@ -520,25 +523,47 @@ impl fmt::Debug for RequestEnvelope {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Request {
+    /// Read workload-local policy and identity without admitting executable work.
+    DescribeWorkload {
+        supervisor_instance_id: SupervisorInstanceId,
+        resource_claims: std::collections::BTreeMap<String, String>,
+    },
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
+        registration_grant: String,
+        registration_revision: u64,
         policy: Box<SandboxPolicyWire>,
         resource_claims: std::collections::BTreeMap<String, String>,
     },
     Confirm,
+    ConfigurationSnapshot {
+        identity: ConfigurationActivationIdentity,
+    },
+    PrepareConfiguration {
+        identity: ConfigurationActivationIdentity,
+        expected: Option<ConfigurationRevision>,
+        configuration: ConfigurationRevision,
+        provider_env: std::collections::HashMap<String, String>,
+    },
+    CommitConfiguration {
+        prepared: Box<PreparedBoundaryConfiguration>,
+    },
+    ReleaseConfiguration {
+        installed: Box<InstalledBoundaryConfiguration>,
+    },
+    AbortConfiguration {
+        prepared: Box<PreparedBoundaryConfiguration>,
+    },
+    QuiesceConfiguration {
+        identity: ConfigurationActivationIdentity,
+    },
     StartAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
         policy: Box<SandboxPolicyWire>,
         ca_cert: Option<Vec<u8>>,
         ca_bundle: Option<Vec<u8>>,
-        provider_env_revision: u64,
-        provider_env: std::collections::HashMap<String, String>,
-    },
-    UpdateProviderEnvironment {
-        expected_revision: u64,
-        revision: u64,
-        provider_env: std::collections::HashMap<String, String>,
+        activation: ActivatedBoundaryConfiguration,
     },
     AttachProcess {
         process_id: String,
@@ -558,6 +583,7 @@ pub enum Request {
     TerminateBoundary,
     Exec {
         spec: ExecSpecWire,
+        activation: ActivatedBoundaryConfiguration,
     },
     ExecSignal {
         process_id: String,
@@ -581,15 +607,15 @@ pub enum Request {
 impl Request {
     /// Whether this control-path request changes generation-owned sandbox
     /// state and therefore must be replayed from the idempotency ledger.
+    ///
+    /// Attach, confirmation, start, and configuration transitions validate live state
+    /// on every retry. Their snapshots and activation receipts cannot be served
+    /// from an old response after a disconnect or configuration hold.
     #[must_use]
     pub const fn is_replayable_mutation(&self) -> bool {
         matches!(
             self,
-            Self::Attach { .. }
-                | Self::Confirm
-                | Self::StartAgent { .. }
-                | Self::UpdateProviderEnvironment { .. }
-                | Self::Exec { .. }
+            Self::Exec { .. }
                 | Self::Signal { .. }
                 | Self::Terminate { .. }
                 | Self::TerminateBoundary
@@ -602,24 +628,67 @@ impl Request {
 impl fmt::Debug for Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DescribeWorkload {
+                supervisor_instance_id,
+                resource_claims,
+            } => formatter
+                .debug_struct("DescribeWorkload")
+                .field("supervisor_instance_id", supervisor_instance_id)
+                .field("resource_claims", resource_claims)
+                .finish(),
             Self::Attach {
                 supervisor_instance_id: _,
+                registration_grant: _,
+                registration_revision,
                 policy: _,
                 resource_claims,
             } => formatter
                 .debug_struct("Attach")
+                .field("registration_revision", registration_revision)
+                .field("registration_grant", &"<redacted>")
                 .field("policy", &"<redacted>")
                 .field("resource_claims", resource_claims)
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
+            Self::ConfigurationSnapshot { identity } => formatter
+                .debug_tuple("ConfigurationSnapshot")
+                .field(identity)
+                .finish(),
+            Self::PrepareConfiguration {
+                identity,
+                expected,
+                configuration,
+                provider_env,
+            } => formatter
+                .debug_struct("PrepareConfiguration")
+                .field("identity", identity)
+                .field("expected", expected)
+                .field("configuration", configuration)
+                .field("provider_env_count", &provider_env.len())
+                .finish(),
+            Self::CommitConfiguration { prepared } => formatter
+                .debug_tuple("CommitConfiguration")
+                .field(prepared)
+                .finish(),
+            Self::ReleaseConfiguration { installed } => formatter
+                .debug_tuple("ReleaseConfiguration")
+                .field(installed)
+                .finish(),
+            Self::AbortConfiguration { prepared } => formatter
+                .debug_tuple("AbortConfiguration")
+                .field(prepared)
+                .finish(),
+            Self::QuiesceConfiguration { identity } => formatter
+                .debug_tuple("QuiesceConfiguration")
+                .field(identity)
+                .finish(),
             Self::StartAgent {
                 sandbox_id,
                 spec,
                 policy: _,
                 ca_cert,
                 ca_bundle,
-                provider_env_revision,
-                provider_env,
+                activation,
             } => formatter
                 .debug_struct("StartAgent")
                 .field("sandbox_id", sandbox_id)
@@ -627,24 +696,7 @@ impl fmt::Debug for Request {
                 .field("policy", &"<redacted>")
                 .field("ca_cert_present", &ca_cert.is_some())
                 .field("ca_bundle_present", &ca_bundle.is_some())
-                .field("provider_env_revision", provider_env_revision)
-                .field(
-                    "provider_env_keys",
-                    &provider_env.keys().collect::<Vec<_>>(),
-                )
-                .finish(),
-            Self::UpdateProviderEnvironment {
-                expected_revision,
-                revision,
-                provider_env,
-            } => formatter
-                .debug_struct("UpdateProviderEnvironment")
-                .field("expected_revision", expected_revision)
-                .field("revision", revision)
-                .field(
-                    "provider_env_keys",
-                    &provider_env.keys().collect::<Vec<_>>(),
-                )
+                .field("activation", activation)
                 .finish(),
             Self::Wait { process_id } => formatter
                 .debug_struct("Wait")
@@ -664,7 +716,11 @@ impl fmt::Debug for Request {
                 .field("process_id", process_id)
                 .finish(),
             Self::TerminateBoundary => formatter.write_str("TerminateBoundary"),
-            Self::Exec { spec } => formatter.debug_tuple("Exec").field(spec).finish(),
+            Self::Exec { spec, activation } => formatter
+                .debug_struct("Exec")
+                .field("spec", spec)
+                .field("activation", activation)
+                .finish(),
             Self::ExecSignal { process_id, signal } => formatter
                 .debug_struct("ExecSignal")
                 .field("process_id", process_id)
@@ -700,6 +756,9 @@ pub struct ResponseEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
+    WorkloadDescribed {
+        bootstrap: Box<BoundaryBootstrap>,
+    },
     Attached {
         snapshot: SessionSnapshotWire,
     },
@@ -707,12 +766,24 @@ pub enum Response {
         /// Measured capability-free posture produced before workload launch.
         evidence: Box<SandboxConfirmEvidence>,
     },
+    ConfigurationSnapshot {
+        snapshot: BoundaryConfigurationSnapshot,
+    },
+    ConfigurationPrepared {
+        prepared: Box<PreparedBoundaryConfiguration>,
+    },
+    ConfigurationCommitted {
+        installed: Box<InstalledBoundaryConfiguration>,
+    },
+    ConfigurationReleased {
+        activated: Box<ActivatedBoundaryConfiguration>,
+    },
+    ConfigurationAborted,
+    ConfigurationQuiesced,
     Started {
         process_id: String,
         provider_env_revision: u64,
-    },
-    ProviderEnvironmentUpdated {
-        revision: u64,
+        activation: ActivatedBoundaryConfiguration,
     },
     ProcessAttached {
         terminal: bool,
@@ -726,6 +797,7 @@ pub enum Response {
     ExecStarted {
         process_id: String,
         pty: bool,
+        activation: ActivatedBoundaryConfiguration,
     },
     Resized,
     PortConnected,
@@ -754,6 +826,7 @@ pub struct MediationTimingWire {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshotWire {
     pub generation: String,
+    pub configuration: BoundaryConfigurationSnapshot,
     pub processes: Vec<ProcessSnapshotWire>,
 }
 
@@ -793,6 +866,7 @@ pub enum DnsQueryResultWire {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoundaryErrorKind {
+    Configuration,
     Invalid,
     Denied,
     Unavailable,
@@ -1244,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn request_round_trips_and_redacts_secrets() {
+    fn configuration_activation_request_round_trips_and_redacts_secrets() {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
@@ -1266,11 +1340,7 @@ mod tests {
                 })),
                 ca_cert: Some(b"test certificate".to_vec()),
                 ca_bundle: Some(b"test bundle".to_vec()),
-                provider_env_revision: 7,
-                provider_env: std::collections::HashMap::from([(
-                    "OPENAI_API_KEY".to_string(),
-                    "test credential".to_string(),
-                )]),
+                activation: test_activation(),
             },
         };
         let request = RequestEnvelope {
@@ -1285,21 +1355,66 @@ mod tests {
         assert!(!debug.contains("test credential"));
         assert!(!debug.contains("test certificate"));
         assert!(!debug.contains("test bundle"));
-        assert!(debug.contains("OPENAI_API_KEY"));
         assert!(request.validate_payload_digest().is_ok());
     }
 
+    fn test_activation() -> ActivatedBoundaryConfiguration {
+        ActivatedBoundaryConfiguration {
+            identity: ConfigurationActivationIdentity {
+                runtime_generation: "runtime-1".to_string(),
+                boundary_session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                supervisor_instance_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                boundary_instance_id: "33333333-3333-4333-8333-333333333333".to_string(),
+                registration_revision: 1,
+            },
+            transition_id: "44444444-4444-4444-8444-444444444444".to_string(),
+            configuration: ConfigurationRevision {
+                config_revision: 1,
+                policy_version: 1,
+                policy_hash: "test-policy".to_string(),
+                policy_source: 1,
+                provider_env_revision: 7,
+            },
+        }
+    }
+
     #[test]
-    fn request_digest_is_stable_across_map_order_and_detects_mutation() {
+    fn configuration_activation_preparation_and_discovery_redact_authored_payloads() {
+        let activation = test_activation();
+        let request = Request::PrepareConfiguration {
+            identity: activation.identity,
+            expected: None,
+            configuration: activation.configuration,
+            provider_env: std::collections::HashMap::from([(
+                "CREDENTIAL".to_string(),
+                "synthetic-secret".to_string(),
+            )]),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("synthetic-secret"));
+        assert!(!debug.contains("CREDENTIAL"));
+        assert!(
+            !request.is_replayable_mutation(),
+            "transition state must validate retries before returning an acknowledgement"
+        );
+        let policy = openshell_isolation_interface::contract::ImagePolicyDiscovery::Present {
+            yaml: "authored-sensitive-content".to_string(),
+        };
+        assert!(!format!("{policy:?}").contains("authored-sensitive-content"));
+    }
+
+    #[test]
+    fn configuration_activation_request_digest_is_stable_across_map_order_and_detects_mutation() {
         let mut first = std::collections::HashMap::new();
         first.insert("B".to_string(), "2".to_string());
         first.insert("A".to_string(), "1".to_string());
         let mut second = std::collections::HashMap::new();
         second.insert("A".to_string(), "1".to_string());
         second.insert("B".to_string(), "2".to_string());
-        let build = |provider_env| Request::UpdateProviderEnvironment {
-            expected_revision: 1,
-            revision: 2,
+        let build = |provider_env| Request::PrepareConfiguration {
+            identity: test_activation().identity,
+            expected: None,
+            configuration: test_activation().configuration,
             provider_env,
         };
         assert_eq!(

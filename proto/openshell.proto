@@ -484,6 +484,12 @@ service OpenShell {
     };
   }
 
+  // Register startup and acknowledge an exact validated runtime configuration.
+  rpc ReportSandboxConfiguration(ReportSandboxConfigurationRequest)
+      returns (ReportSandboxConfigurationResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse) {
@@ -1088,6 +1094,13 @@ message SandboxStatus {
   // Currently populated for MCP-over-HTTP endpoints. These passive results
   // remain separate from sandbox lifecycle conditions and readiness.
   repeated EndpointStatus endpoint_statuses = 10;
+  // Independent of infrastructure phase; retained across driver observations.
+  SandboxConfigurationAdmission configuration_admission = 11;
+  // Durable release-authorization marker. Once true, static restrictions cannot
+  // be repaired in place because a workload may have consumed them.
+  optional bool configuration_activation_authorized = 12;
+  // Last complete configuration delivered to the registered control instance.
+  SandboxConfigurationSnapshot configuration_desired = 13;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -2511,6 +2524,71 @@ message ReportPolicyStatusRequest {
 
 // Report policy status response.
 message ReportPolicyStatusResponse {}
+
+enum ConfigurationAdmissionState {
+  CONFIGURATION_ADMISSION_STATE_UNSPECIFIED = 0;
+  CONFIGURATION_ADMISSION_STATE_PENDING = 1;
+  CONFIGURATION_ADMISSION_STATE_ACCEPTED = 2;
+  CONFIGURATION_ADMISSION_STATE_REJECTED = 3;
+}
+
+message SandboxConfigurationAdmission {
+  string instance_id = 1;
+  ConfigurationAdmissionState state = 2;
+  uint32 policy_version = 3;
+  string policy_hash = 4;
+  uint64 config_revision = 5;
+  uint64 provider_env_revision = 6;
+  string error = 7;
+  // Existing authenticated launch generation, independent of configuration revisions.
+  string runtime_generation = 8;
+  string boundary_instance_id = 9;
+  string boundary_session_id = 10;
+  openshell.sandbox.v1.PolicySource policy_source = 11;
+  string configuration_snapshot = 12;
+  // True only after the boundary acknowledged release and initial process launch.
+  bool activation_confirmed = 13;
+  uint64 registration_revision = 14;
+  uint64 delivery_revision = 15;
+}
+
+// Immutable gateway-issued configuration identity. Independent provider and global
+// writes become desired when the next authoritative control poll delivers them.
+message SandboxConfigurationSnapshot {
+  string snapshot_id = 1;
+  string instance_id = 2;
+  string runtime_generation = 3;
+  string boundary_instance_id = 4;
+  string boundary_session_id = 5;
+  uint32 policy_version = 6;
+  string policy_hash = 7;
+  uint64 config_revision = 8;
+  uint64 provider_env_revision = 9;
+  openshell.sandbox.v1.PolicySource policy_source = 10;
+  bool admitted = 11;
+  string error = 12;
+  uint64 registration_revision = 13;
+  uint64 delivery_revision = 14;
+  // Failure posture used when this exact configuration was delivered.
+  string policy_validation_failure_mode = 15;
+  // Hash of immutable gateway policy services; changes require a fresh delivery.
+  string gateway_configuration_fingerprint = 16;
+}
+
+message ReportSandboxConfigurationRequest {
+  string sandbox_id = 1;
+  SandboxConfigurationAdmission admission = 2;
+  // Pending registration replaces only this previously observed instance.
+  string expected_instance_id = 3;
+  // The boundary half of the same registration fence.
+  string expected_boundary_instance_id = 4;
+}
+
+message ReportSandboxConfigurationResponse {
+  // Gateway-signed authority for this exact control and boundary registration.
+  string control_registration_grant = 1 [(openshell.options.v1.secret) = true];
+  uint64 registration_revision = 2;
+}
 
 // A versioned policy revision with metadata.
 message SandboxPolicyRevision {

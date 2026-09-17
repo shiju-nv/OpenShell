@@ -64,6 +64,11 @@ pub struct SandboxPrincipal {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SandboxIdentitySource {
+    /// Signed launch identity retained for activation-time authorization checks.
+    LaunchSession {
+        runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId,
+        auth_epoch: openshell_core::jwt::CredentialEpoch,
+    },
     /// Gateway-minted JWT validated against the gateway's signing key.
     /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
     BootstrapJwt { issuer: String },
