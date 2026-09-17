@@ -2507,7 +2507,107 @@ mod tests {
         assert!(!agent_proposals_enabled_from_settings(&settings));
     }
 
-    // ---- Policy disk discovery tests ----
+    // ---- Local-file policy startup tests ----
+
+    #[tokio::test]
+    async fn local_file_startup_normalizes_matchers_and_rejects_malformed_policy() {
+        use openshell_supervisor_network::opa::NetworkInput;
+
+        let files = tempfile::tempdir().expect("policy directory");
+        let rules_path = files.path().join("policy.rego");
+        let data_path = files.path().join("policy.yaml");
+        std::fs::write(
+            &rules_path,
+            include_str!("../../openshell-supervisor-network/data/sandbox-policy.rego"),
+        )
+        .expect("write policy rules");
+        std::fs::write(
+            &data_path,
+            r#"
+network_policies:
+  startup:
+    endpoints:
+      - host: startup.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**", query: { scope: "public-*" } }
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+        )
+        .expect("write raw policy");
+        let rules = rules_path.to_string_lossy().into_owned();
+        let data = data_path.to_string_lossy().into_owned();
+        let startup = || load_policy(&rules, &data);
+        let (_, engine) = startup().await.expect("load valid local policy");
+        assert!(!engine.binary_identity_required());
+        // The standalone proxy cannot observe callers. The ordinary file loader
+        // must still enforce binary identity for consumers that can observe it.
+        let identity_engine = OpaEngine::from_files(&rules_path, &data_path)
+            .expect("load identity-required local policy");
+        assert!(identity_engine.binary_identity_required());
+        // Installing the built-in registry creates the first active generation.
+        assert_eq!(engine.current_generation(), 1);
+
+        let mut input = NetworkInput {
+            host: "startup.example.com".into(),
+            port: 443,
+            binary_path: "/usr/bin/curl".into(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(
+            engine
+                .evaluate_network(&input)
+                .expect("allowed binary")
+                .allowed
+        );
+        assert!(
+            identity_engine
+                .evaluate_network(&input)
+                .expect("allowed binary with identity")
+                .allowed
+        );
+        let endpoint = engine
+            .query_endpoint_config(&input)
+            .expect("query startup endpoint")
+            .expect("startup endpoint must exist");
+        let endpoint: serde_json::Value =
+            serde_json::from_str(&endpoint.to_json_str().expect("serialize endpoint"))
+                .expect("endpoint JSON");
+        assert_eq!(
+            endpoint["rules"][0]["allow"]["query"]["scope"],
+            serde_json::json!({ "glob": "public-*" }),
+        );
+        input.binary_path = "/usr/bin/unlisted".into();
+        assert!(
+            !identity_engine
+                .evaluate_network(&input)
+                .expect("unlisted binary")
+                .allowed
+        );
+
+        assert!(
+            engine
+                .evaluate_network(&input)
+                .expect("endpoint-only proxy does not match binary identity")
+                .allowed
+        );
+
+        // A malformed new startup must fail before returning an active evaluator.
+        std::fs::write(&data_path, "network_policies: []\n").expect("write malformed policy");
+        let Err(error) = startup().await else {
+            panic!("malformed startup must reject");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("network_policies must be an object")
+        );
+    }
 
     #[tokio::test]
     async fn failed_external_startup_registry_build_preserves_installed_builtins() {

@@ -18,7 +18,7 @@ import time
 import uuid
 
 
-CANDIDATE_TREE = "f935a3eb7b6dbd9071c851bc63a8e9f1cd6791f8"
+CANDIDATE_TREE = "945721e3aad8d0b4fab3b93dcf999cebd4fa2bba"
 HISTORICAL_SOURCE_SHA256 = "41ab5ee8614cee7910b58ed5c5600036f3c32bbc3ae567446d9ec6c357c54030"
 HARNESSES = {"policy_activation", "configuration_composition_acceptance"}
 # No prefix-based expansion is allowed: hosted credentials may share familiar
@@ -306,8 +306,11 @@ def depfile_inputs(path, executable, source, target, workspace):
         # which can be a nested standalone workspace inside the checkout.
         path = (path if path.is_absolute() else workspace / path).resolve(strict=True)
         require(path.is_relative_to(source) or path.is_relative_to(target), "Depfile input escapes source/target roots")
-        values.append(path)
-    require(values and len(values) == len(set(values)), "Empty or duplicate executable dependencies")
+        # Rust may spell one include through several source-relative paths.
+        # Validate every spelling before retaining its canonical input once.
+        if path not in values:
+            values.append(path)
+    require(values, "Empty executable dependencies")
     return values
 
 

@@ -2986,8 +2986,6 @@ network_policies:
 
     #[test]
     fn load_diagnostics_enforce_item_and_byte_limits_with_omission() {
-        // A future long fixed category must hit the byte ceiling before the
-        // item ceiling, retain complete UTF-8 items, and always mark omission.
         const LONG_CATEGORY: &str = concat!(
             "固定診断固定診断固定診断固定診断固定診断固定診断固定診断固定診断",
             "固定診断固定診断固定診断固定診断固定診断固定診断固定診断固定診断",
@@ -3006,6 +3004,8 @@ network_policies:
             assert_eq!(message.contains("additional violations omitted"), count > 8);
         }
 
+        // A future long fixed category must hit the byte ceiling before the
+        // item ceiling, retain complete UTF-8 items, and always mark omission.
         let message =
             render_repeated_validation_diagnostic("policy validation failed", 8, LONG_CATEGORY);
         assert!(message.len() <= 512);
@@ -3077,6 +3077,9 @@ network_policies:
                 OpaEngine::from_files(&policy_path, &data_path)
                     .err()
                     .expect("invalid file load"),
+                OpaEngine::from_files_for_endpoint_only_proxy(&policy_path, &data_path, None)
+                    .err()
+                    .expect("invalid endpoint-only file load"),
                 engine
                     .reload(TEST_POLICY, &data)
                     .expect_err("invalid reload"),
@@ -3126,6 +3129,13 @@ network_policies:
             OpaEngine::from_files_with_middleware_config(&policy_path, &data_path, Some(&validate))
                 .err()
                 .unwrap(),
+            OpaEngine::from_files_for_endpoint_only_proxy(
+                &policy_path,
+                &data_path,
+                Some(&validate),
+            )
+            .err()
+            .unwrap(),
             OpaEngine::from_reader_with_middleware_config(
                 TEST_POLICY,
                 data.as_bytes(),
@@ -3148,6 +3158,14 @@ network_policies:
             OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, Some(&accept))
                 .is_ok()
         );
+        let required =
+            OpaEngine::from_files_with_middleware_config(&policy_path, &data_path, Some(&accept))
+                .unwrap();
+        let endpoint_only =
+            OpaEngine::from_files_for_endpoint_only_proxy(&policy_path, &data_path, Some(&accept))
+                .unwrap();
+        assert!(required.binary_identity_required());
+        assert!(!endpoint_only.binary_identity_required());
     }
 
     #[test]
@@ -3165,6 +3183,9 @@ network_policies:
                 .err()
                 .unwrap(),
             OpaEngine::from_files(&policy_path, &data_path)
+                .err()
+                .unwrap(),
+            OpaEngine::from_files_for_endpoint_only_proxy(&policy_path, &data_path, None)
                 .err()
                 .unwrap(),
             engine.reload(private_rego, TEST_DATA_YAML).unwrap_err(),
@@ -3266,6 +3287,8 @@ network_policies:
     #[test]
     fn load_diagnostics_rejected_l7_candidates_do_not_emit_authored_warnings() {
         use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        const CHILD: &str = "OPENSHELL_TEST_OPA_DIAGNOSTICS_CHILD";
         struct Capture(Arc<Mutex<Vec<String>>>);
         impl<S: tracing::Subscriber> Layer<S> for Capture {
             fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
@@ -3280,7 +3303,6 @@ network_policies:
         // Tracing callsite interest is process-wide, so concurrent tests with
         // other subscribers can disable this thread's capture. Exercise the
         // real loader in an isolated test process with the same executable.
-        const CHILD: &str = "OPENSHELL_TEST_OPA_DIAGNOSTICS_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "opa::tests::load_diagnostics_rejected_l7_candidates_do_not_emit_authored_warnings", "--nocapture"])
@@ -3601,11 +3623,11 @@ network_policies:
         let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
             .err()
             .expect("an empty deny-rule list remains semantically invalid");
-        assert!(
-            error
-                .to_string()
-                .contains("invalid L7 policy configuration")
+        assert_eq!(
+            error.to_string(),
+            "L7 policy validation failed: invalid L7 policy configuration"
         );
+        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"]);
     }
 
     #[test]
@@ -4222,6 +4244,149 @@ network_policies:
                     engine.evaluate_network_action(&input).unwrap(),
                     NetworkAction::Deny { .. }
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_mcp_params_maps_preserve_denials_and_reject_malformed_reload() {
+        let valid = serde_json::json!({
+            "network_policies": {
+                "tools": {
+                    "endpoints": [{
+                        "host": "mcp.params.test",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "enforcement": "enforce",
+                        "rules": [{"allow": {"method": "tools/call", "tool": "read_*"}}],
+                        "deny_rules": [{"method": "tools/call", "tool": "read_secret"}]
+                    }],
+                    "binaries": [{"path": "/usr/bin/curl"}]
+                }
+            }
+        });
+        let request = |name: &str| {
+            l7_jsonrpc_input_with_params(
+                "mcp.params.test",
+                443,
+                "/mcp",
+                "tools/call",
+                serde_json::json!({"name": name}),
+            )
+        };
+        let allowed = request("read_status");
+        let denied = request("read_secret");
+
+        for yaml in [true, false] {
+            let encode = |data: &serde_json::Value| {
+                if yaml {
+                    serde_yml::to_string(data).expect("serialize YAML policy")
+                } else {
+                    data.to_string()
+                }
+            };
+            let engine = OpaEngine::from_strings(TEST_POLICY, &encode(&valid))
+                .expect("omitted params must preserve tool aliases");
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+            let generation = engine.current_generation();
+
+            // Every raw rule shape must reject before normalization can remove
+            // an alias. Failed reloads must leave both allow and deny intact.
+            for (rule_pointer, flat_allow, diagnostic) in [
+                (
+                    "/rules/0/allow",
+                    false,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/rules/0",
+                    true,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/deny_rules/0",
+                    false,
+                    "deny_rules[0].params: expected map of matchers",
+                ),
+            ] {
+                for params in [
+                    serde_json::Value::Null,
+                    serde_json::json!([]),
+                    serde_json::json!("invalid"),
+                    serde_json::json!(false),
+                    serde_json::json!(42),
+                ] {
+                    let mut candidate = valid.clone();
+                    let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                    if flat_allow {
+                        endpoint["rules"][0] = endpoint["rules"][0]["allow"].take();
+                    }
+                    endpoint
+                        .pointer_mut(rule_pointer)
+                        .expect("fixture rule exists")["params"] = params;
+                    // The validator identifies the malformed field internally;
+                    // public load errors must redact authored policy details.
+                    let (errors, _) = crate::l7::validate_l7_policies(&candidate);
+                    assert!(
+                        errors.iter().any(|error| error.contains(diagnostic)),
+                        "{errors:?}"
+                    );
+                    let source = encode(&candidate);
+                    let error = OpaEngine::from_strings(TEST_POLICY, &source)
+                        .err()
+                        .expect("non-map params must reject at startup");
+                    // The canonical schema rejects malformed matcher maps before
+                    // protocol-specific validation can lower tool aliases.
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("OPA policy schema validation failed"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
+                    let error = engine
+                        .reload(TEST_POLICY, &source)
+                        .expect_err("non-map params must reject on reload");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("OPA policy schema validation failed"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
+                    assert_eq!(engine.current_generation(), generation);
+                    assert!(eval_l7(&engine, &allowed));
+                    assert!(!eval_l7(&engine, &denied));
+                }
+            }
+
+            // Empty maps accept alias insertion; explicit name maps retain the
+            // same selector without an alias. Neither form may erase a deny.
+            for explicit_name in [false, true] {
+                let mut candidate = valid.clone();
+                let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                for pointer in ["/rules/0/allow", "/deny_rules/0"] {
+                    let rule = endpoint.pointer_mut(pointer).expect("fixture rule exists");
+                    rule["params"] = if explicit_name {
+                        let tool = rule.as_object_mut().expect("rule map").remove("tool");
+                        serde_json::json!({"name": tool.expect("fixture tool selector")})
+                    } else {
+                        serde_json::json!({})
+                    };
+                }
+                let source = encode(&candidate);
+                let control = OpaEngine::from_strings(TEST_POLICY, &source)
+                    .expect("valid matcher map must load");
+                assert!(eval_l7(&control, &allowed));
+                assert!(!eval_l7(&control, &denied));
+                let previous_generation = engine.current_generation();
+                engine
+                    .reload(TEST_POLICY, &source)
+                    .expect("valid matcher map must reload after rejection");
+                assert_eq!(engine.current_generation(), previous_generation + 1);
+                assert!(eval_l7(&engine, &allowed));
+                assert!(!eval_l7(&engine, &denied));
             }
         }
     }

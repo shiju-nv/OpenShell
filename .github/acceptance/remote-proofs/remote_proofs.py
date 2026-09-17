@@ -40,6 +40,10 @@ def checked_helpers(control_root):
     pins = json.loads((HERE / "control-pins.json").read_text())
     for name, expected in pins["fixtures"].items():
         require(digest(HERE / "fixtures" / name) == expected, f"Fixture changed: {name}")
+    require(set(pins["fixture_image"]) == {"fixture_image.py", "fixture-image.Dockerfile", "fixture-image-pins.json"},
+            "Fixture image producer inputs differ")
+    for name, expected in pins["fixture_image"].items():
+        require(digest(HERE / name) == expected, f"Fixture image producer changed: {name}")
     helper = control_root / pins["build_helper"]["relative_path"]
     require(digest(helper) == pins["build_helper"]["sha256"], "Build helper changed")
     spec = importlib.util.spec_from_file_location("proof_build_contract", helper)
@@ -184,6 +188,16 @@ def main():
             result["builds"][role] = {"compiler_artifact": artifact, "executable": str(exported), "sha256": digest(exported), "features": artifact["features"]}
         fixtures = evidence / "fixtures"
         result["fixtures"] = prepare_fixtures(root, fixtures, pins)
+        # Shipping images remain the product provenance. A separate Debian
+        # image supplies the shell utilities required by these real libtests.
+        spec = importlib.util.spec_from_file_location("proof_fixture_contract", HERE / "fixture_image.py")
+        fixture_helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture_helper)
+        supervisor = (args.products.resolve().parent / products["files"]["supervisor"]["path"]).resolve()
+        require(digest(supervisor) == products["files"]["supervisor"]["sha256"], "Downloaded supervisor changed")
+        result["fixture_image"] = fixture_helper.prepare(helper, root, logs, evidence, image, supervisor,
+                                                        sandbox, result["builds"], pins["fixture_image"])
+        image = result["fixture_image"]["image"]
         env.update(OPENSHELL_ACTIVATION_CONTROL_IMAGE=image["id"], OPENSHELL_ACTIVATION_SANDBOX_BINARY=str(sandbox),
                    OPENSHELL_ACTIVATION_LINUX_TEST_BINARY=result["builds"]["sandbox"]["executable"],
                    OPENSHELL_ACTIVATION_SUPERVISOR_LINUX_TEST_BINARY=result["builds"]["supervisor"]["executable"])

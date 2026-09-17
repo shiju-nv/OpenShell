@@ -15,6 +15,170 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+fn gateway_provenance_policy() -> openshell_core::proto::SandboxPolicy {
+    let mut policy = openshell_policy::parse_sandbox_policy(
+        r#"
+version: 1
+network_policies:
+  redis:
+    name: redis
+    endpoints:
+      - host: allowed.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/redis-cli
+"#,
+    )
+    .expect("parse gateway provenance policy");
+    policy.landlock = openshell_policy::restrictive_default_policy().landlock;
+    let endpoint = &mut policy
+        .network_policies
+        .get_mut("redis")
+        .expect("gateway policy")
+        .endpoints[0];
+    // These runtime flags must survive validation and generation publication.
+    endpoint.provider_credentialed = true;
+    endpoint.advisor_proposed = true;
+    policy
+}
+
+fn assert_gateway_generation(engine: &OpaEngine, allowed_host: &str, generation: u64) {
+    use openshell_supervisor_network::opa::{NetworkAction, NetworkInput};
+
+    assert_eq!(engine.current_generation(), generation);
+    for host in ["allowed.example.com", "repaired.example.com"] {
+        let input = NetworkInput {
+            host: host.into(),
+            port: 443,
+            binary_path: "/usr/bin/redis-cli".into(),
+            binary_sha256: String::new(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        };
+        let authorization = engine.authorize_egress(&input).expect("authorize endpoint");
+        assert_eq!(authorization.generation, generation);
+        assert_eq!(
+            matches!(authorization.action, NetworkAction::Allow { .. }),
+            host == allowed_host,
+            "unexpected authorization for {host}"
+        );
+        if host == allowed_host {
+            assert!(!authorization.exact_declared_endpoint_host);
+            let guards = engine
+                .query_endpoint_credential_guards(&input)
+                .expect("query credential provenance");
+            assert_eq!(guards.len(), 1);
+            assert!(
+                openshell_supervisor_network::l7::parse_endpoint_credential_guard(&guards[0])
+                    .provider_credentialed
+            );
+        }
+    }
+}
+
+async fn assert_gateway_coordinator_rejects_and_repairs(registry_changed: bool) {
+    let (mut runtime, _, boundary, events) = runtime();
+    let policy = gateway_provenance_policy();
+    runtime.engine = Arc::new(OpaEngine::from_proto(&policy).expect("initial gateway policy"));
+    super::super::install_builtin_middleware_registry(&runtime.engine)
+        .await
+        .expect("initial middleware registry");
+    runtime.snapshot.policy = Some(policy.clone());
+    let generation = runtime.engine.current_generation();
+    let installed = boundary
+        .installed
+        .lock()
+        .expect("installation lock")
+        .clone();
+    assert_gateway_generation(&runtime.engine, "allowed.example.com", generation);
+
+    let connections = Arc::new(AtomicU64::new(0));
+    let connector_connections = Arc::clone(&connections);
+    runtime.connector = Arc::new(move |services, authentication| {
+        connector_connections.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            super::super::connect_middleware_registry(&services, &authentication).await
+        })
+    });
+    let mut candidate = snapshot(2);
+    candidate.policy_validation_failure_mode =
+        openshell_core::PolicyValidationFailureMode::RetainLastValid;
+    // Changing authentication rebuilds the registry without requiring an
+    // external service; unchanged authentication retains the installed one.
+    candidate.extension_authentication_enabled = registry_changed;
+    candidate.policy = Some(policy);
+    let policy = candidate.policy.as_mut().expect("candidate policy");
+    policy
+        .landlock
+        .as_mut()
+        .expect("Landlock policy")
+        .compatibility = "unsupported".into();
+    policy
+        .network_policies
+        .get_mut("redis")
+        .expect("gateway policy")
+        .endpoints[0]
+        .host = "repaired.example.com".into();
+    Box::pin(runtime.reconcile_snapshot(candidate.clone()))
+        .await
+        .expect("repairable invalid-scalar rejection");
+
+    assert_gateway_generation(&runtime.engine, "allowed.example.com", generation);
+    assert!(runtime.engine.fail_closed_reason().is_none());
+    assert_eq!(runtime.snapshot.policy_hash, "policy-1");
+    assert_eq!(runtime.credentials.snapshot().revision, 1);
+    assert_eq!(
+        *boundary.installed.lock().expect("installation lock"),
+        installed
+    );
+    assert!(*boundary.ready.borrow() && *runtime.readiness.borrow());
+    assert_eq!(
+        *events.lock().expect("events lock"),
+        ["report:Rejected:false"]
+    );
+    // Invalid OPA input is rejected before middleware connections or publication.
+    assert_eq!(connections.load(Ordering::Relaxed), 0);
+
+    candidate
+        .policy
+        .as_mut()
+        .expect("candidate policy")
+        .landlock
+        .as_mut()
+        .expect("Landlock policy")
+        .compatibility = "best_effort".into();
+    Box::pin(runtime.reconcile_snapshot(candidate))
+        .await
+        .expect("install repaired gateway policy");
+    assert_gateway_generation(&runtime.engine, "repaired.example.com", generation + 1);
+    assert_eq!(runtime.credentials.snapshot().revision, 2);
+    assert_eq!(runtime.snapshot.policy_hash, "policy-2");
+    assert_eq!(
+        *boundary.installed.lock().expect("installation lock"),
+        Some(revision(&runtime.snapshot))
+    );
+    assert!(*boundary.ready.borrow() && *runtime.readiness.borrow());
+    assert_eq!(
+        connections.load(Ordering::Relaxed),
+        u64::from(registry_changed)
+    );
+    assert!(events.lock().expect("events lock").ends_with(&[
+        "report:Accepted:false".into(),
+        "release".into(),
+        "report:Accepted:true".into(),
+    ]));
+}
+
+#[tokio::test]
+async fn gateway_policy_only_reload_rejects_candidate_retains_policy_and_accepts_repair() {
+    Box::pin(assert_gateway_coordinator_rejects_and_repairs(false)).await;
+}
+
+#[tokio::test]
+async fn gateway_policy_and_registry_reload_rejects_candidate_retains_policy_and_accepts_repair() {
+    Box::pin(assert_gateway_coordinator_rejects_and_repairs(true)).await;
+}
+
 struct RuntimeDelivery {
     snapshot: Mutex<SettingsPollResult>,
     providers: Mutex<ProviderEnvironmentResult>,
@@ -288,7 +452,7 @@ fn runtime_policy_evidence(
 
 impl RuntimeProcessFixture {
     async fn new() -> Self {
-        Self::new_with_protocol_case(None, false).await
+        Box::pin(Self::new_with_protocol_case(None, false)).await
     }
 
     #[allow(
@@ -789,7 +953,7 @@ async fn runtime_endpoint_probe(
     reason = "keeps before, held, and released process observations in one scenario"
 )]
 async fn configuration_activation_runtime_publication_pause_holds_workload() {
-    let mut fixture = RuntimeProcessFixture::new().await;
+    let mut fixture = Box::pin(RuntimeProcessFixture::new()).await;
     let pid = fixture.pid();
     runtime_endpoint_probe(
         &fixture.runtime.engine,
@@ -886,7 +1050,7 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
             "provider-revision-mismatch",
             "opa-rejection",
         ] {
-            let mut fixture = RuntimeProcessFixture::new().await;
+            let mut fixture = Box::pin(RuntimeProcessFixture::new()).await;
             let pid = fixture.pid();
             let initial = revision(&fixture.runtime.snapshot);
             let mut candidate = fixture.candidate.clone();

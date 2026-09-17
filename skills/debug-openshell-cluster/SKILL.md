@@ -198,6 +198,13 @@ During recovery, an authenticated control/boundary connection and isolation `Con
 
 These admission and workload-release checks apply to gateway-managed control/boundary sandboxes. A standalone network proxy continues to load its local policy file and has no sandbox admission or workload-release record to inspect.
 
+The published supervisor image uses a shell-free distroless Debian 13 base.
+Use container logs, engine inspection and the configured exec health probe for
+diagnostics; `exec ... sh`, package installation and in-container shell scripts
+are unavailable. Workload shells belong to the separate sandbox image. Preserve
+the driver-selected UID and writable runtime/log mounts when reproducing a
+supervisor startup failure.
+
 ### Step 4: Check Docker-Backed Gateways
 
 ```bash

@@ -199,6 +199,8 @@ The gateway stores sandbox-authored policy revisions separately from effective c
 
 The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
 
+An explicitly supplied MCP rule `params` value must be a map in both allow and deny rules. Omit the field when using only the `tool` alias; `params: null` is rejected before alias lowering. A rejected raw policy reload preserves the active evaluator and its generation.
+
 The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
 deny rules only when their connection and request-processing metadata agree;

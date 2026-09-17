@@ -1,0 +1,16 @@
+{
+  "architecture": "amd64",
+  "base_config_digest": "sha256:e426a54f50cc4cf82dd5cab8ba8426ed02c391840cb5a62dfd987542dbabea3b",
+  "base_manifest_digest": "sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f",
+  "base_reference": "docker.io/library/debian@sha256:abc9cb88a5587630d7f915f47b23b0668fe250fbfc6457aa4d52b534c1bbf73f",
+  "os": "debian",
+  "required_packages": [
+    "coreutils",
+    "dash",
+    "libc-bin",
+    "libc6",
+    "libgcc-s1"
+  ],
+  "schema_version": 1,
+  "version_id": "13"
+}

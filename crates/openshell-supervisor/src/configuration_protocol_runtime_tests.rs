@@ -730,7 +730,11 @@ fn configuration_activation_protocol_authored_empty_is_not_proto_omission() {
 #[ignore = "requires the candidate boundary executable and isolated Linux fixture"]
 async fn configuration_activation_protocol_startup_matrix() {
     for case in ProtocolRuntimeCase::ALL {
-        let fixture = RuntimeProcessFixture::new_with_protocol_case(Some(&case), true).await;
+        let fixture = Box::pin(RuntimeProcessFixture::new_with_protocol_case(
+            Some(&case),
+            true,
+        ))
+        .await;
         assert_eq!(fixture.start_count(), 1);
         let state = fixture
             .boundary
@@ -794,8 +798,11 @@ async fn configuration_activation_protocol_update_matrix() {
             openshell_core::PolicyValidationFailureMode::RetainLastValid,
             openshell_core::PolicyValidationFailureMode::FailClosed,
         ] {
-            let mut fixture =
-                RuntimeProcessFixture::new_with_protocol_case(Some(&case), false).await;
+            let mut fixture = Box::pin(RuntimeProcessFixture::new_with_protocol_case(
+                Some(&case),
+                false,
+            ))
+            .await;
             let initial = revision(&fixture.runtime.snapshot);
             let pid = fixture.pid();
             let start_ticks = protocol_runtime_start_ticks(pid);
