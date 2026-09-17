@@ -1953,10 +1953,10 @@ mod linux {
                 return Err("configuration cannot release without confirmed control".to_string());
             }
             let state = lock(&self.state);
-            if let RuntimeState::Running(process) = &*state {
-                if !process.boundary_runtime.resume() {
-                    return Err("held workload could not resume".to_string());
-                }
+            if let RuntimeState::Running(process) = &*state
+                && !process.boundary_runtime.resume()
+            {
+                return Err("held workload could not resume".to_string());
             }
             activation.released = Some(released.clone());
             Ok(released)
@@ -2371,13 +2371,13 @@ mod linux {
                 Request::AbortConfiguration { prepared } => {
                     self.abort_configuration(&prepared).map_or_else(
                         |error| guest_error(BoundaryErrorKind::Configuration, error),
-                        |_| Response::ConfigurationAborted,
+                        |()| Response::ConfigurationAborted,
                     )
                 }
                 Request::QuiesceConfiguration { identity } => {
                     self.quiesce_configuration(&identity).map_or_else(
                         |error| guest_error(BoundaryErrorKind::Configuration, error),
-                        |_| Response::ConfigurationQuiesced,
+                        |()| Response::ConfigurationQuiesced,
                     )
                 }
                 Request::StartAgent {
