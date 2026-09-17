@@ -30,15 +30,18 @@ The user's input falls into one of three tiers. Work with whatever the user prov
 The user provides API endpoints and a broad intent. No API docs needed.
 
 Examples:
+
 - "Allow curl to hit api.github.com, read-only"
 - "Give claude full access to api.anthropic.com"
 - "Let /usr/bin/myapp talk to internal-svc:8080 but only for reading"
 
 This is sufficient for:
+
 - **L4-only** policies (allow all traffic to host:port, no HTTP inspection)
 - **Preset-based L7** policies (`read-only`, `read-write`, `full` on all paths)
 
 For this tier, default to:
+
 - `access: read-only` when the user says "read", "browse", "view", "query", "fetch"
 - `access: read-write` when the user says "read-write", "create", "update" (but not "delete")
 - `access: full` when the user says "full access", "everything", "unrestricted"
@@ -53,6 +56,7 @@ For this tier, default to:
 The user knows some API paths but doesn't have full docs.
 
 Examples:
+
 - "Allow GET on /api/v1/models and POST on /api/v1/completions at integrate.api.nvidia.com"
 - "Read-only on /repos/** at api.github.com, but also allow POST on /repos/*/issues"
 
@@ -121,11 +125,13 @@ Ask these when the user's intent is broad and more specificity is possible:
 When the user mentions a recognizable API host but hasn't provided docs, and the current tier is **Minimal**, attempt to upgrade to **Full** by searching for the API documentation online.
 
 **When to trigger:**
+
 - The host is a well-known public API (e.g., `api.github.com`, `api.anthropic.com`, `api.openai.com`, `integrate.api.nvidia.com`, `api.stripe.com`, `api.slack.com`, `api.gitlab.com`)
 - The user has NOT already provided API docs
 - The user has NOT explicitly asked for a broad preset ("just read-only, nothing fancy")
 
 **How to do it:**
+
 1. Tell the user: "I can look up the REST API docs for [service] to help generate a more precise policy. Want me to do that?"
 2. If the user agrees (or hasn't declined), search for the docs:
    - Search the web with a query like `"[service name] REST API documentation endpoints"` or `"[service name] OpenAPI spec"`
@@ -134,6 +140,7 @@ When the user mentions a recognizable API host but hasn't provided docs, and the
 4. Use the discovered endpoints to offer tighter scoping: "I found [N] endpoints in the [service] API. Based on your intent, I can narrow the policy to just [subset]. Want me to do that, or keep the broader preset?"
 
 **When to skip:**
+
 - The user explicitly asked for a broad preset or said "don't bother with docs"
 - The API is internal, private, or not publicly documented
 - The host is not recognizable as a well-known service
@@ -148,6 +155,7 @@ If the user confirms the policy must stay broad (they don't know the paths, need
 ### Iteration
 
 You may need to go back and forth a few times. Keep the loop tight:
+
 1. Ask one batch of clarifying questions (group related questions together)
 2. Update your understanding based on the answer
 3. If the answer reveals further scoping opportunities, ask a follow-up
@@ -159,7 +167,11 @@ You may need to go back and forth a few times. Keep the loop tight:
 
 Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/reference/policy-schema.md) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
 
+Generate the authored representation documented there. Do not copy lowered runtime settings, endpoint provenance, or custom OPA application data into a policy submitted through the CLI. Preserve the distinction between an omitted section, an empty object, and an explicit value; an empty filesystem object changes workdir access. Use the reference's parsing and representation section to resolve field types, omission defaults, and parser-limit failures.
+
 Key sections to reference:
+
+- **Parsing and Representation** — authored inputs, raw runtime data, parser limits, and presence-sensitive defaults
 - **Policy Schema Reference** — top-level structure
 - **`network_policies`** — rule structure
 - **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules, allowed_ips
@@ -366,6 +378,22 @@ If the user needs access to multiple hosts or the same host with different rules
 
 Before presenting the policy to the user, verify correctness **and** flag breadth concerns.
 
+For gateway-managed sandboxes, validate the policy together with attached provider profiles and credential bindings. A syntactically valid policy can still be rejected when those inputs cannot activate together. Such an initial rejection keeps the workload unstarted and the sandbox available for repair; an absent image policy selects restrictive defaults.
+
+When repairing a rejected sandbox, inspect the desired configuration error and edit the base policy so provider-composed entries are not copied into it unintentionally:
+
+```fish
+openshell sandbox get my-sandbox --output json
+openshell policy get my-sandbox --base > repair-policy.yaml
+openshell sandbox provider list my-sandbox
+```
+
+Correct the policy or the attached provider's credentials, profile coverage, or binding, then submit the corrected policy with `openshell policy set my-sandbox --policy repair-policy.yaml --wait` when a policy change is needed. The JSON `policy_source` describes `sandbox` or `global` gateway policy scope; it does not identify whether the sandbox policy came from an image or defaults. Check the governing scope before proposing a repair.
+
+Static fields (`filesystem_policy`, `landlock`, and `process`) can be repaired only while admission is pending or rejected and `configuration_activation_authorized` is explicitly `false`. The first authorization to release the workload consumes that permission before execution may begin. A missing value or restart does not restore it. After authorization, generate a policy for a new sandbox when static fields must change.
+
+Verify `configuration_admission.activation_confirmed` and sandbox readiness after repair. Gateway admission and an accepted held installation are intermediate states; `loaded` follows the final report for matching policy/providers and current runtime instances. A rejected desired candidate can leave an earlier accepted configuration active only under `retain_last_valid`. The default `fail_closed` posture holds workload execution and readiness until a valid configuration activates. A successful initial repair starts the waiting workload once. Standalone network-proxy use retains local-file policy loading and does not use sandbox admission status.
+
 ### Hard Errors (would block sandbox startup)
 
 - [ ] `rules` and `access` are NOT both present on the same endpoint
@@ -522,6 +550,7 @@ Show the generated policy YAML with:
 ## Step 8: Confirm and Refine
 
 After presenting or applying the policy, ask if the user wants to:
+
 - Tighten or loosen any rules
 - Add more endpoints or binaries
 - Switch between enforce/audit mode

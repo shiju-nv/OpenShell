@@ -17,6 +17,8 @@ fmt.Printf("Sandbox config: policy_version=%d, revision=%d\n",
     config.PolicyVersion, config.ConfigRevision)
 ```
 
+`ConfigurationAdmitted` reports gateway validation of the complete policy and provider composition. When validation fails, `ConfigurationError` explains the rejected input. Inspect `Sandbox.Status.ConfigurationAdmission.ActivationConfirmed` to determine whether the runtime activated a configuration; gateway validation alone does not establish activation. This SDK read observes configuration without advancing the control instance's configuration delivery.
+
 ## GetGateway
 
 Retrieve the gateway-level configuration.

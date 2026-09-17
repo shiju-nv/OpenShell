@@ -24,6 +24,23 @@ const REFRESH_REQUEST_HASH_ANNOTATION: &str = "internal.openshell.ai/refresh-req
 const REFRESH_ISSUED_AT_ANNOTATION: &str = "internal.openshell.ai/refresh-issued-at";
 const REFRESH_ROTATION_ID_ANNOTATION: &str = "internal.openshell.ai/refresh-rotation-id";
 
+/// Whether an annotation stores gateway-owned runtime identity or refresh lineage.
+/// User and sandbox metadata updates must reject these keys so they cannot
+/// restore a consumed bearer or replace its bounded replay authorization.
+pub fn is_runtime_identity_annotation(name: &str) -> bool {
+    matches!(
+        name,
+        RUNTIME_GENERATION_ANNOTATION
+            | AUTH_EPOCH_ANNOTATION
+            | GATEWAY_TOKEN_ID_ANNOTATION
+            | PREVIOUS_GATEWAY_TOKEN_ID_ANNOTATION
+            | REFRESH_REPLAY_UNTIL_ANNOTATION
+            | REFRESH_REQUEST_HASH_ANNOTATION
+            | REFRESH_ISSUED_AT_ANNOTATION
+            | REFRESH_ROTATION_ID_ANNOTATION
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshRequestHash(String);
 

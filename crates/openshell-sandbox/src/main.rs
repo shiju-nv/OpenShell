@@ -1838,6 +1838,8 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
 
 #[cfg(target_os = "linux")]
 fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+    use miette::Context as _;
+
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
@@ -1847,7 +1849,9 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
                 .with_filter(console_filter),
         )
         .try_init();
-    let (qualification, _) = qualify_runtime()?;
+    // Keep every failed kernel primitive under the same startup qualification
+    // context while retaining its detailed cause before bootstrap is read.
+    let (qualification, _) = qualify_runtime().wrap_err("capability-free sandbox probe")?;
     openshell_sandbox::run(bootstrap, qualification)
 }
 

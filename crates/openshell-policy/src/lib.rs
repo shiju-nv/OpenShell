@@ -427,6 +427,7 @@ fn allow_proto_to_def(
         fields: allow.fields,
         tool,
         params,
+        review: None,
     }
 }
 
@@ -631,6 +632,9 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         _ => None,
     };
 
+    // Protobuf strings represent omitted identity components as empty values.
+    // Preserve each omission for driver resolution; an entirely empty process
+    // section has the same authored meaning as an absent section.
     let process = policy.process.as_ref().and_then(|p| {
         if p.run_as_user.is_empty() && p.run_as_group.is_empty() {
             None
@@ -751,6 +755,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                             }),
                             json_rpc,
                             mcp,
+                            review: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -782,6 +787,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
         process,
         network_policies,
         network_middlewares,
+        metadata: None,
     })
 }
 
@@ -839,7 +845,10 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // actionable MCP diagnostics the top-level user-facing error.
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw = openshell_policy_schema::parse_policy(yaml)?;
+    let raw = openshell_policy_schema::parse_policy(
+        yaml,
+        openshell_policy_schema::ParseProfile::RuntimeStrict,
+    )?;
     to_proto(raw)
 }
 
@@ -847,6 +856,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
     let raw = openshell_policy_schema::parse_policy_file(
         path,
+        openshell_policy_schema::ParseProfile::RuntimeStrict,
         openshell_policy_schema::ParseLimits::default(),
     )?;
     to_proto(raw)
@@ -2197,6 +2207,42 @@ network_policies:
             assert_eq!(
                 json_process.is_some(),
                 expected_user.is_some() || expected_group.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn process_identity_omission_survives_yaml_round_trip() {
+        for (field, omitted_field, identity) in [
+            ("run_as_user", "run_as_group", "1234"),
+            ("run_as_group", "run_as_user", "1235"),
+        ] {
+            let input = format!("version: 1\nprocess:\n  {field}: \"{identity}\"\n");
+            let policy = parse_sandbox_policy(&input).expect("partial identity should parse");
+            assert!(validate_sandbox_policy(&policy).is_ok());
+
+            let yaml = serialize_sandbox_policy(&policy)
+                .expect("partial identity must remain available for policy inspection");
+            assert!(yaml.contains(field));
+            assert!(!yaml.contains(omitted_field));
+            assert_eq!(
+                parse_sandbox_policy(&yaml).expect("YAML round trip should parse"),
+                policy
+            );
+
+            let json = sandbox_policy_to_json_value(&policy)
+                .expect("partial identity must remain available for JSON inspection");
+            assert_eq!(json["process"][field], identity);
+            assert!(json["process"].get(omitted_field).is_none());
+            let encoded = serialize_sandbox_policy_json(&policy)
+                .expect("partial identity should serialize as JSON");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&encoded).expect("valid JSON"),
+                json
+            );
+            assert_eq!(
+                parse_sandbox_policy(&encoded).expect("JSON round trip should parse"),
+                policy
             );
         }
     }
@@ -4633,6 +4679,48 @@ network_policies:
     }
 
     #[test]
+    fn empty_nested_mcp_parameters_cannot_erase_runtime_selectors() {
+        let source = |params: &str| {
+            format!(
+                "version: 1\nnetwork_policies:\n  mcp:\n    endpoints:\n      - host: mcp.example.com\n        port: 443\n        protocol: mcp\n        mcp: {{}}\n        rules:\n          - allow:\n              method: tools/call\n              params: {params}\n"
+            )
+        };
+        for params in [
+            "{ name: {} }",
+            "{ name: safe_tool, arguments: { file: {} } }",
+            "{ arguments: { file: safe, missing: {} } }",
+        ] {
+            assert!(
+                parse_sandbox_policy(&source(params)).is_err(),
+                "malformed selectors must reject instead of broadening tools/call: {params}"
+            );
+        }
+
+        let policy =
+            parse_sandbox_policy(&source("{ name: safe_tool, arguments: { file: safe } }"))
+                .expect("nonempty nested parameter selectors must remain valid");
+        let params = &policy.network_policies["mcp"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow rule")
+            .params;
+        assert_eq!(params.len(), 2);
+        assert_eq!(params["name"].glob, "safe_tool");
+        assert_eq!(params["arguments.file"].glob, "safe");
+
+        let unrestricted = parse_sandbox_policy(&source("{}"))
+            .expect("an explicitly empty root params map remains valid");
+        assert!(
+            unrestricted.network_policies["mcp"].endpoints[0].rules[0]
+                .allow
+                .as_ref()
+                .expect("allow rule")
+                .params
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn parse_rejects_unsupported_json_rpc_config_fields() {
         let yaml = r"
 version: 1
@@ -4811,6 +4899,36 @@ network_policies:
         assert!(
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
+        );
+    }
+
+    #[test]
+    fn canonical_serializers_omit_empty_proto_process() {
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy::default()),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        let yaml = serialize_sandbox_policy(&policy).expect("empty process should serialize");
+        assert!(!yaml.contains("process"));
+        let json = sandbox_policy_to_json_value(&policy).expect("empty process should serialize");
+        assert!(json.get("process").is_none());
+        let encoded = serialize_sandbox_policy_json(&policy).expect("valid JSON encoding");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).expect("valid JSON"),
+            json
+        );
+
+        let expected = SandboxPolicy {
+            process: None,
+            ..policy
+        };
+        assert_eq!(parse_sandbox_policy(&yaml).expect("valid YAML"), expected);
+        assert_eq!(
+            parse_sandbox_policy(&encoded).expect("valid JSON"),
+            expected
         );
     }
 

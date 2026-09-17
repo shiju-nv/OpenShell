@@ -123,13 +123,21 @@ func SandboxConfigFromProto(resp *sbv1.GetSandboxConfigResponse) *v1.SandboxConf
 		return nil
 	}
 	sc := &v1.SandboxConfig{
-		PolicyVersion:               resp.GetVersion(),
-		PolicyHash:                  resp.GetPolicyHash(),
-		ConfigRevision:              resp.GetConfigRevision(),
-		PolicySource:                PolicySourceFromProto(resp.GetPolicySource()),
-		GlobalPolicyVersion:         resp.GetGlobalPolicyVersion(),
-		ProviderEnvRevision:         resp.GetProviderEnvRevision(),
-		PolicyValidationFailureMode: resp.GetPolicyValidationFailureMode(),
+		PolicyVersion:                     resp.GetVersion(),
+		PolicyHash:                        resp.GetPolicyHash(),
+		ConfigRevision:                    resp.GetConfigRevision(),
+		PolicySource:                      PolicySourceFromProto(resp.GetPolicySource()),
+		GlobalPolicyVersion:               resp.GetGlobalPolicyVersion(),
+		ProviderEnvRevision:               resp.GetProviderEnvRevision(),
+		PolicyValidationFailureMode:       resp.GetPolicyValidationFailureMode(),
+		ConfigurationAdmitted:             resp.GetConfigurationAdmitted(),
+		ConfigurationError:                resp.GetConfigurationError(),
+		ConfigurationSnapshot:             resp.GetConfigurationSnapshot(),
+		ConfigurationInstanceID:           resp.GetConfigurationInstanceId(),
+		ConfigurationBoundaryInstanceID:   resp.GetConfigurationBoundaryInstanceId(),
+		RuntimeGeneration:                 resp.GetRuntimeGeneration(),
+		ConfigurationRegistrationRevision: resp.GetConfigurationRegistrationRevision(),
+		ConfigurationDeliveryRevision:     resp.GetConfigurationDeliveryRevision(),
 	}
 
 	// Convert proto SandboxPolicy to typed SDK SandboxPolicy.

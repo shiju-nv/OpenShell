@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal, signature-unverified JWT inspection shared by gateway clients.
+//! JWT inspection and authenticated sandbox session and registration profiles.
 //!
-//! Used only for client-side refresh scheduling (deciding when a bearer is
-//! near expiry). It never verifies the signature and must not be used for
-//! any authorization decision. Both the sandbox-side
-//! [`crate::grpc_client`] and the user-facing `openshell-sdk` refresh path
-//! derive token expiry from here so the decode lives in one place.
+//! [`parse_exp_secs`] only inspects expiry for client-side refresh scheduling;
+//! it never authenticates a token. With the `jwt` feature, dedicated issuer
+//! and verifier methods enforce separate signed profiles for gateway access,
+//! sandbox access, and control registration.
 
 /// Decode the numeric `exp` claim (Unix seconds) from a JWT payload without
 /// verifying the signature.
@@ -49,6 +48,10 @@ mod session {
     pub const GATEWAY_SESSION_JWT_TYPE: &str = "openshell-gateway-session+jwt";
     pub const SANDBOX_SESSION_JWT_TYPE: &str = "openshell-sandbox-session+jwt";
     pub const SANDBOX_SESSION_AUDIENCE: &str = "openshell-sandbox";
+    /// JOSE type reserved for gateway-approved control registrations.
+    pub const CONTROL_REGISTRATION_JWT_TYPE: &str = "openshell-control-registration+jwt";
+    /// Audience accepted only by explicit control-registration verification.
+    pub const CONTROL_REGISTRATION_AUDIENCE: &str = "openshell-control-registration";
     pub const DEFAULT_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
     pub const MIN_SESSION_TOKEN_TTL: Duration = Duration::from_mins(1);
     pub const MAX_SESSION_TOKEN_TTL: Duration = Duration::from_hours(1);
@@ -182,6 +185,78 @@ mod session {
         pub sandbox_id: SandboxId,
         pub runtime_generation: SandboxGenerationId,
         pub auth_epoch: CredentialEpoch,
+    }
+
+    /// Gateway authorization for one control process to attach to one boundary.
+    ///
+    /// The boundary must compare every identity field with its trusted launch
+    /// and attach state, then enforce monotonic registration revisions. A valid
+    /// signature alone does not authorize replacing a newer registration.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ControlRegistrationGrant {
+        /// Durable sandbox launch and authentication identity.
+        pub runtime_identity: SandboxRuntimeIdentity,
+        /// Control process authorized by the gateway registration.
+        pub supervisor_instance_id: Uuid,
+        /// Boundary session assigned by the compute driver.
+        pub boundary_session_id: Uuid,
+        /// Fresh incarnation of the boundary process accepting the control.
+        pub boundary_instance_id: Uuid,
+        /// Positive registration order persisted and checked by the gateway.
+        pub registration_revision: u64,
+    }
+
+    impl ControlRegistrationGrant {
+        fn validate(&self) -> Result<(), SessionJwtError> {
+            // Serde-transparent identity types can bypass their constructors;
+            // validate again before signing or trusting deserialized claims.
+            SandboxId::parse(self.runtime_identity.sandbox_id.as_str())?;
+            SandboxGenerationId::parse(self.runtime_identity.runtime_generation.as_str())
+                .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
+            CredentialEpoch::new(self.runtime_identity.auth_epoch.get())?;
+            if self.supervisor_instance_id.is_nil()
+                || self.boundary_session_id.is_nil()
+                || self.boundary_instance_id.is_nil()
+            {
+                return Err(SessionJwtError::InvalidRegistrationIdentity);
+            }
+            if self.registration_revision == 0 {
+                return Err(SessionJwtError::InvalidRegistrationRevision);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ControlRegistrationClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        iat: i64,
+        exp: i64,
+        jti: String,
+        sandbox_id: SandboxId,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+        component: SessionComponent,
+        supervisor_instance_id: String,
+        boundary_session_id: String,
+        boundary_instance_id: String,
+        registration_revision: u64,
+    }
+
+    /// A signature-verified grant whose current registration must still be fenced.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AuthenticatedControlRegistration {
+        /// Exact gateway-authorized runtime and process identities.
+        pub grant: ControlRegistrationGrant,
+        /// Unique identifier of this signed token, independent of its revision.
+        pub token_id: Uuid,
+        /// Signed issue time in Unix seconds.
+        pub issued_at: i64,
+        /// Signed expiration time in Unix seconds.
+        pub expires_at: i64,
     }
 
     /// A JWT whose contents are deliberately omitted from `Debug` output and
@@ -576,6 +651,54 @@ mod session {
             })
         }
 
+        /// Sign the exact registration accepted by the gateway's durable CAS.
+        ///
+        /// Call only after persisting the registration. Reissuing the same
+        /// registration keeps its revision and renews only the token lifetime.
+        pub fn mint_control_registration(
+            &self,
+            grant: &ControlRegistrationGrant,
+        ) -> Result<MintedSessionToken, SessionJwtError> {
+            grant.validate()?;
+            let issued_at = self.clock.now_unix_seconds();
+            let expires_at = issued_at
+                .checked_add(
+                    i64::try_from(self.ttl.as_secs())
+                        .map_err(|_| SessionJwtError::InvalidLifetime)?,
+                )
+                .ok_or(SessionJwtError::InvalidLifetime)?;
+            let token_id = Uuid::new_v4();
+            let claims = ControlRegistrationClaims {
+                iss: self.issuer.clone(),
+                sub: format!(
+                    "{SANDBOX_SUBJECT_PREFIX}{}",
+                    grant.runtime_identity.sandbox_id
+                ),
+                aud: CONTROL_REGISTRATION_AUDIENCE.to_string(),
+                iat: issued_at,
+                exp: expires_at,
+                jti: token_id.to_string(),
+                sandbox_id: grant.runtime_identity.sandbox_id.clone(),
+                runtime_generation: grant.runtime_identity.runtime_generation.clone(),
+                auth_epoch: grant.runtime_identity.auth_epoch,
+                component: SessionComponent::OpenShellSupervisor,
+                supervisor_instance_id: grant.supervisor_instance_id.to_string(),
+                boundary_session_id: grant.boundary_session_id.to_string(),
+                boundary_instance_id: grant.boundary_instance_id.to_string(),
+                registration_revision: grant.registration_revision,
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(self.key_id.clone());
+            header.typ = Some(CONTROL_REGISTRATION_JWT_TYPE.to_string());
+            let token = encode(&header, &claims, &self.encoding_key)
+                .map_err(|_| SessionJwtError::SigningFailed)?;
+            Ok(MintedSessionToken {
+                token: SecretJwt::parse(token)?,
+                expires_at,
+                token_id,
+            })
+        }
+
         fn mint(
             &self,
             profile: SessionTokenProfile,
@@ -702,6 +825,72 @@ mod session {
             self.validate_claims(claims)
         }
 
+        /// Authenticate a control-registration grant using the trusted gateway keys.
+        ///
+        /// This deliberately selects a separate type and audience, regardless of
+        /// the verifier's session profile. Session credentials cannot stand in for
+        /// a registration grant, and grants cannot authenticate session requests.
+        pub fn verify_control_registration(
+            &self,
+            token: &str,
+        ) -> Result<AuthenticatedControlRegistration, SessionJwtError> {
+            install_crypto_provider();
+            let header = decode_header(token).map_err(|_| SessionJwtError::InvalidToken)?;
+            if header.alg != Algorithm::EdDSA {
+                return Err(SessionJwtError::WrongAlgorithm);
+            }
+            if header.typ.as_deref() != Some(CONTROL_REGISTRATION_JWT_TYPE) {
+                return Err(SessionJwtError::WrongTokenType);
+            }
+            let key_id = header.kid.ok_or(SessionJwtError::MissingKeyId)?;
+            let key = self
+                .keys
+                .get(&key_id)
+                .ok_or(SessionJwtError::UnknownKeyId)?;
+            let mut validation = Validation::new(Algorithm::EdDSA);
+            validation.validate_exp = false;
+            validation.validate_aud = false;
+            validation.set_required_spec_claims(&["iss", "aud", "iat", "exp", "sub", "jti"]);
+            let claims = decode::<ControlRegistrationClaims>(token, key, &validation)
+                .map_err(|_| SessionJwtError::InvalidToken)?
+                .claims;
+            if claims.iss != self.issuer {
+                return Err(SessionJwtError::WrongIssuer);
+            }
+            if claims.aud != CONTROL_REGISTRATION_AUDIENCE {
+                return Err(SessionJwtError::WrongAudience);
+            }
+            if claims.sub != format!("{SANDBOX_SUBJECT_PREFIX}{}", claims.sandbox_id) {
+                return Err(SessionJwtError::SubjectMismatch);
+            }
+            let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
+            if token_id.is_nil() {
+                return Err(SessionJwtError::InvalidJti);
+            }
+            self.validate_lifetime(claims.iat, claims.exp)?;
+            let grant = ControlRegistrationGrant {
+                runtime_identity: SandboxRuntimeIdentity {
+                    sandbox_id: claims.sandbox_id,
+                    runtime_generation: claims.runtime_generation,
+                    auth_epoch: claims.auth_epoch,
+                },
+                supervisor_instance_id: Uuid::parse_str(&claims.supervisor_instance_id)
+                    .map_err(|_| SessionJwtError::InvalidToken)?,
+                boundary_session_id: Uuid::parse_str(&claims.boundary_session_id)
+                    .map_err(|_| SessionJwtError::InvalidToken)?,
+                boundary_instance_id: Uuid::parse_str(&claims.boundary_instance_id)
+                    .map_err(|_| SessionJwtError::InvalidToken)?,
+                registration_revision: claims.registration_revision,
+            };
+            grant.validate()?;
+            Ok(AuthenticatedControlRegistration {
+                grant,
+                token_id,
+                issued_at: claims.iat,
+                expires_at: claims.exp,
+            })
+        }
+
         fn validate_claims(
             &self,
             claims: SessionClaims,
@@ -718,21 +907,7 @@ mod session {
             SandboxGenerationId::parse(claims.runtime_generation.to_string())
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
-            if claims.exp <= claims.iat {
-                return Err(SessionJwtError::InvalidLifetime);
-            }
-            let lifetime = claims.exp.saturating_sub(claims.iat);
-            if lifetime > i64::try_from(MAX_SESSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
-                return Err(SessionJwtError::InvalidLifetime);
-            }
-            let now = self.clock.now_unix_seconds();
-            let leeway = i64::try_from(MAX_SESSION_CLOCK_LEEWAY.as_secs()).unwrap_or(30);
-            if claims.iat > now.saturating_add(leeway) {
-                return Err(SessionJwtError::IssuedInFuture);
-            }
-            if claims.exp < now.saturating_sub(leeway) {
-                return Err(SessionJwtError::Expired);
-            }
+            self.validate_lifetime(claims.iat, claims.exp)?;
             Ok(AuthenticatedSandboxSession {
                 sandbox_id: claims.sandbox_id,
                 runtime_generation: claims.runtime_generation,
@@ -741,6 +916,29 @@ mod session {
                 issued_at: claims.iat,
                 expires_at: claims.exp,
             })
+        }
+
+        fn validate_lifetime(
+            &self,
+            issued_at: i64,
+            expires_at: i64,
+        ) -> Result<(), SessionJwtError> {
+            if expires_at <= issued_at {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            let lifetime = expires_at.saturating_sub(issued_at);
+            if lifetime > i64::try_from(MAX_SESSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
+                return Err(SessionJwtError::InvalidLifetime);
+            }
+            let now = self.clock.now_unix_seconds();
+            let leeway = i64::try_from(MAX_SESSION_CLOCK_LEEWAY.as_secs()).unwrap_or(30);
+            if issued_at > now.saturating_add(leeway) {
+                return Err(SessionJwtError::IssuedInFuture);
+            }
+            if expires_at < now.saturating_sub(leeway) {
+                return Err(SessionJwtError::Expired);
+            }
+            Ok(())
         }
     }
 
@@ -762,6 +960,12 @@ mod session {
         MissingRuntimeIdentity,
         #[error("sandbox runtime identity is invalid")]
         InvalidRuntimeIdentity,
+        /// A registered process or session UUID is nil.
+        #[error("control registration process and session identities must be non-nil UUIDs")]
+        InvalidRegistrationIdentity,
+        /// Registration ordering cannot use the unregistered zero sentinel.
+        #[error("control registration revision must be positive")]
+        InvalidRegistrationRevision,
         #[error("key ID is invalid")]
         InvalidKeyId,
         #[error("verification key IDs must be unique")]
@@ -974,6 +1178,287 @@ mod tests {
                 sandbox.verify(pair.gateway.token.expose_secret()),
                 Err(SessionJwtError::WrongTokenType)
             );
+        }
+
+        fn registration_grant(identity: SandboxRuntimeIdentity) -> ControlRegistrationGrant {
+            ControlRegistrationGrant {
+                runtime_identity: identity,
+                supervisor_instance_id: uuid::Uuid::new_v4(),
+                boundary_session_id: uuid::Uuid::new_v4(),
+                boundary_instance_id: uuid::Uuid::new_v4(),
+                registration_revision: 7,
+            }
+        }
+
+        #[test]
+        fn configuration_activation_registration_profiles_are_not_interchangeable() {
+            let (issuer, gateway, sandbox, identity) = fixture();
+            let pair = issuer.mint_pair(&identity).expect("session pair");
+            let grant = registration_grant(identity);
+            let minted = issuer
+                .mint_control_registration(&grant)
+                .expect("registration token");
+            let authenticated = sandbox
+                .verify_control_registration(minted.token.expose_secret())
+                .expect("authenticated registration");
+            assert_eq!(authenticated.grant, grant);
+            assert_eq!(authenticated.token_id, minted.token_id);
+            assert_eq!(authenticated.issued_at, 1_900_000_000);
+            assert_eq!(authenticated.expires_at, minted.expires_at);
+
+            for verifier in [&gateway, &sandbox] {
+                assert_eq!(
+                    verifier.verify(minted.token.expose_secret()),
+                    Err(SessionJwtError::WrongTokenType)
+                );
+                for session_token in [&pair.gateway.token, &pair.sandbox.token] {
+                    assert_eq!(
+                        verifier.verify_control_registration(session_token.expose_secret()),
+                        Err(SessionJwtError::WrongTokenType)
+                    );
+                }
+            }
+
+            let renewed = issuer
+                .mint_control_registration(&grant)
+                .expect("renew registration token");
+            assert_ne!(renewed.token_id, minted.token_id);
+            assert_eq!(
+                sandbox
+                    .verify_control_registration(renewed.token.expose_secret())
+                    .expect("renewed registration")
+                    .grant,
+                grant
+            );
+        }
+
+        fn signed_registration_claims(
+            mutate: impl FnOnce(&mut serde_json::Value),
+        ) -> (SessionJwtVerifier, String) {
+            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let verifier = SessionJwtVerifier::new(
+                "test",
+                SessionTokenProfile::Sandbox,
+                [SessionVerificationKey {
+                    key_id: "current".to_string(),
+                    public_key_pem: key.public_key_pem().into_bytes(),
+                }],
+                Arc::new(FixedClock(1_900_000_000)),
+            )
+            .expect("registration verifier");
+            // Build the wire claims independently of the production struct so
+            // malformed signed inputs exercise validation after deserialization.
+            let mut claims = serde_json::json!({
+                "iss": "openshell-gateway:test",
+                "sub": "spiffe://openshell/sandbox/sandbox-a",
+                "aud": CONTROL_REGISTRATION_AUDIENCE,
+                "iat": 1_900_000_000_i64,
+                "exp": 1_900_003_600_i64,
+                "jti": uuid::Uuid::new_v4().to_string(),
+                "sandbox_id": "sandbox-a",
+                "runtime_generation": "generation-1",
+                "auth_epoch": 1,
+                "component": "openshell-supervisor",
+                "supervisor_instance_id": uuid::Uuid::new_v4().to_string(),
+                "boundary_session_id": uuid::Uuid::new_v4().to_string(),
+                "boundary_instance_id": uuid::Uuid::new_v4().to_string(),
+                "registration_revision": 7,
+            });
+            mutate(&mut claims);
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some("current".to_string());
+            header.typ = Some(CONTROL_REGISTRATION_JWT_TYPE.to_string());
+            let token = encode(
+                &header,
+                &claims,
+                &EncodingKey::from_ed_pem(key.serialize_pem().as_bytes()).expect("encoding key"),
+            )
+            .expect("sign registration claims");
+            (verifier, token)
+        }
+
+        #[test]
+        fn configuration_activation_registration_accepts_exact_wire_profile() {
+            let (verifier, token) = signed_registration_claims(|_| {});
+            let authenticated = verifier
+                .verify_control_registration(&token)
+                .expect("valid signed registration claims");
+            assert_eq!(authenticated.grant.registration_revision, 7);
+            assert_eq!(
+                authenticated.grant.runtime_identity.sandbox_id.as_str(),
+                "sandbox-a"
+            );
+        }
+
+        #[test]
+        fn configuration_activation_registration_rejects_wrong_claim_purpose() {
+            for (field, value, expected) in [
+                (
+                    "iss",
+                    "openshell-gateway:other",
+                    SessionJwtError::WrongIssuer,
+                ),
+                (
+                    "aud",
+                    SANDBOX_SESSION_AUDIENCE,
+                    SessionJwtError::WrongAudience,
+                ),
+                (
+                    "sub",
+                    "spiffe://openshell/sandbox/another-sandbox",
+                    SessionJwtError::SubjectMismatch,
+                ),
+            ] {
+                let (verifier, token) = signed_registration_claims(|claims| {
+                    claims[field] = serde_json::json!(value);
+                });
+                assert_eq!(verifier.verify_control_registration(&token), Err(expected));
+            }
+        }
+
+        #[test]
+        fn configuration_activation_registration_rejects_invalid_identity_claims() {
+            for (field, value, expected) in [
+                (
+                    "runtime_generation",
+                    serde_json::json!("Invalid/Generation"),
+                    SessionJwtError::InvalidRuntimeIdentity,
+                ),
+                (
+                    "auth_epoch",
+                    serde_json::json!(0),
+                    SessionJwtError::InvalidCredentialEpoch,
+                ),
+                (
+                    "registration_revision",
+                    serde_json::json!(0),
+                    SessionJwtError::InvalidRegistrationRevision,
+                ),
+                (
+                    "supervisor_instance_id",
+                    serde_json::json!(uuid::Uuid::nil().to_string()),
+                    SessionJwtError::InvalidRegistrationIdentity,
+                ),
+                (
+                    "boundary_session_id",
+                    serde_json::json!(uuid::Uuid::nil().to_string()),
+                    SessionJwtError::InvalidRegistrationIdentity,
+                ),
+                (
+                    "boundary_instance_id",
+                    serde_json::json!(uuid::Uuid::nil().to_string()),
+                    SessionJwtError::InvalidRegistrationIdentity,
+                ),
+            ] {
+                let (verifier, token) = signed_registration_claims(|claims| {
+                    claims[field] = value;
+                });
+                assert_eq!(verifier.verify_control_registration(&token), Err(expected));
+            }
+            let (verifier, token) = signed_registration_claims(|claims| {
+                claims["sandbox_id"] = serde_json::json!(" ");
+                claims["sub"] = serde_json::json!("spiffe://openshell/sandbox/ ");
+            });
+            assert_eq!(
+                verifier.verify_control_registration(&token),
+                Err(SessionJwtError::InvalidSandboxId)
+            );
+        }
+
+        #[test]
+        fn configuration_activation_registration_rejects_malformed_claim_shapes() {
+            for (field, value) in [
+                ("aud", serde_json::json!([CONTROL_REGISTRATION_AUDIENCE])),
+                ("component", serde_json::json!("unknown-component")),
+                ("supervisor_instance_id", serde_json::json!("not-a-uuid")),
+                ("registration_revision", serde_json::json!(-1)),
+                ("registration_revision", serde_json::Value::Null),
+                ("unexpected_permission", serde_json::json!(true)),
+            ] {
+                let (verifier, token) = signed_registration_claims(|claims| {
+                    claims[field] = value;
+                });
+                assert_eq!(
+                    verifier.verify_control_registration(&token),
+                    Err(SessionJwtError::InvalidToken)
+                );
+            }
+        }
+
+        #[test]
+        fn configuration_activation_registration_rejects_stale_or_invalid_lifetimes() {
+            for (issued_at, expires_at, expected) in [
+                (1_899_996_000, 1_899_999_600, SessionJwtError::Expired),
+                (
+                    1_900_000_031,
+                    1_900_003_600,
+                    SessionJwtError::IssuedInFuture,
+                ),
+                (
+                    1_900_000_000,
+                    1_900_000_000,
+                    SessionJwtError::InvalidLifetime,
+                ),
+                (
+                    1_900_000_000,
+                    1_900_003_601,
+                    SessionJwtError::InvalidLifetime,
+                ),
+            ] {
+                let (verifier, token) = signed_registration_claims(|claims| {
+                    claims["iat"] = serde_json::json!(issued_at);
+                    claims["exp"] = serde_json::json!(expires_at);
+                });
+                assert_eq!(verifier.verify_control_registration(&token), Err(expected));
+            }
+            for token_id in ["not-a-uuid".to_string(), uuid::Uuid::nil().to_string()] {
+                let (verifier, token) = signed_registration_claims(|claims| {
+                    claims["jti"] = serde_json::json!(token_id);
+                });
+                assert_eq!(
+                    verifier.verify_control_registration(&token),
+                    Err(SessionJwtError::InvalidJti)
+                );
+            }
+        }
+
+        #[test]
+        fn configuration_activation_registration_rejects_wrong_signature() {
+            let (issuer, _gateway, _sandbox, identity) = fixture();
+            let (_other_issuer, _other_gateway, other_sandbox, _other_identity) = fixture();
+            let minted = issuer
+                .mint_control_registration(&registration_grant(identity))
+                .expect("registration token");
+            assert_eq!(
+                other_sandbox.verify_control_registration(minted.token.expose_secret()),
+                Err(SessionJwtError::InvalidToken)
+            );
+        }
+
+        #[test]
+        fn configuration_activation_registration_issuer_rejects_invalid_identity() {
+            let (issuer, _gateway, _sandbox, identity) = fixture();
+            let valid = registration_grant(identity);
+            for field in 0..4 {
+                let mut grant = valid.clone();
+                match field {
+                    0 => grant.supervisor_instance_id = uuid::Uuid::nil(),
+                    1 => grant.boundary_session_id = uuid::Uuid::nil(),
+                    2 => grant.boundary_instance_id = uuid::Uuid::nil(),
+                    _ => grant.registration_revision = 0,
+                }
+                let expected = if field == 3 {
+                    SessionJwtError::InvalidRegistrationRevision
+                } else {
+                    SessionJwtError::InvalidRegistrationIdentity
+                };
+                assert_eq!(
+                    issuer
+                        .mint_control_registration(&grant)
+                        .expect_err("invalid grant"),
+                    expected
+                );
+            }
         }
 
         #[test]

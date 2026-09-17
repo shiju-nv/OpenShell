@@ -332,6 +332,86 @@ fn find_group_by_name(path: &Path, name: &str) -> Result<Option<GroupEntry>> {
     })
 }
 
+/// Validate explicit workload selectors against the identity already provisioned.
+/// Names resolve through bounded image account files, never host NSS. Omitted
+/// components retain the driver's immutable identity; conflicts require a new runtime.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_selected_process_identity(
+    policy: &SandboxPolicy,
+    expected_user_id: u32,
+    expected_group_id: u32,
+) -> Result<()> {
+    validate_selected_process_identity_at(
+        policy,
+        expected_user_id,
+        expected_group_id,
+        Path::new(PASSWD_PATH),
+        Path::new(GROUP_PATH),
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_selected_process_identity_at(
+    policy: &SandboxPolicy,
+    expected_user_id: u32,
+    expected_group_id: u32,
+    passwd_path: &Path,
+    group_path: &Path,
+) -> Result<()> {
+    if expected_user_id == 0 || expected_group_id == 0 {
+        return Err(miette::miette!(
+            "resolved workload identity must be non-root"
+        ));
+    }
+    if let Some(user) = policy
+        .process
+        .run_as_user
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        validate_component(user, "process user")?;
+        let uid = match user.parse::<u32>() {
+            Ok(uid) => uid,
+            Err(_) => {
+                find_passwd_by_name(passwd_path, user)?
+                    .ok_or_else(|| {
+                        miette::miette!("selected process user is absent from image accounts")
+                    })?
+                    .uid
+            }
+        };
+        if uid != expected_user_id {
+            return Err(miette::miette!(
+                "selected process user conflicts with immutable workload identity"
+            ));
+        }
+    }
+    if let Some(group) = policy
+        .process
+        .run_as_group
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        validate_component(group, "process group")?;
+        let gid = match group.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => {
+                find_group_by_name(group_path, group)?
+                    .ok_or_else(|| {
+                        miette::miette!("selected process group is absent from image accounts")
+                    })?
+                    .gid
+            }
+        };
+        if gid != expected_group_id {
+            return Err(miette::miette!(
+                "selected process group conflicts with immutable workload identity"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve supplementary groups declared for an OCI named user without
 /// consulting NSS. Numeric OCI users have no trustworthy group-membership
 /// name and therefore receive no supplementary groups.
@@ -461,9 +541,11 @@ fn parse_group(fields: &[&str]) -> Result<GroupEntry> {
 
 fn read_account_file(path: &Path) -> Result<String> {
     let mut options = OpenOptions::new();
+    // Opening an image-supplied FIFO must not wait for a writer before the
+    // metadata check can reject it as a non-regular account file.
     options
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let mut file = options
         .open(path)
         .into_diagnostic()
@@ -546,6 +628,330 @@ mod tests {
         policy.process.run_as_user = user.map(str::to_string);
         policy.process.run_as_group = group.map(str::to_string);
         policy
+    }
+
+    #[test]
+    fn configuration_activation_omitted_selectors_retain_driver_identity() {
+        let dir = tempdir().unwrap();
+        let passwd = dir.path().join("missing-passwd");
+        let group = dir.path().join("missing-group");
+
+        for (user, group_name) in [(None, None), (Some(""), Some(""))] {
+            validate_selected_process_identity_at(
+                &policy(user, group_name),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect(
+                "omitted components must retain the provisioned identity without account reads",
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_activation_numeric_selectors_do_not_read_accounts() {
+        let dir = tempdir().unwrap();
+        let passwd = dir.path().join("missing-passwd");
+        let group = dir.path().join("missing-group");
+
+        for (user, group_name) in [
+            (Some("1234"), Some("1235")),
+            (Some("1234"), None),
+            (None, Some("1235")),
+        ] {
+            validate_selected_process_identity_at(
+                &policy(user, group_name),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect("matching numeric components must not depend on account files");
+        }
+    }
+
+    #[test]
+    fn configuration_activation_names_use_pinned_accounts_without_nss() {
+        // These names deliberately resolve differently from host root accounts.
+        // The passwd primary group must not override an omitted group selector.
+        let (_dir, passwd, group) =
+            account_files("root:x:1234:9999::/home/app:/bin/sh\n", "root:x:1235:\n");
+
+        validate_selected_process_identity_at(
+            &policy(Some("root"), Some("root")),
+            1234,
+            1235,
+            &passwd,
+            &group,
+        )
+        .expect("named selectors must use the pinned workload account files");
+        validate_selected_process_identity_at(
+            &policy(Some("root"), None),
+            1234,
+            1235,
+            &passwd,
+            &group.with_file_name("missing-group"),
+        )
+        .expect("an omitted group retains the driver GID without a group-file read");
+        validate_selected_process_identity_at(
+            &policy(None, Some("root")),
+            1234,
+            1235,
+            &passwd.with_file_name("missing-passwd"),
+            &group,
+        )
+        .expect("an omitted user retains the driver UID without a passwd-file read");
+    }
+
+    #[test]
+    fn configuration_activation_uid_and_gid_conflicts_are_rejected() {
+        let (_dir, passwd, group) = account_files(
+            "other:x:2234:2235::/home/other:/bin/sh\n",
+            "other:x:2235:\n",
+        );
+
+        for (user, group_name, component) in [
+            (Some("2234"), None, "user"),
+            (Some("other"), None, "user"),
+            (None, Some("2235"), "group"),
+            (None, Some("other"), "group"),
+        ] {
+            let error = validate_selected_process_identity_at(
+                &policy(user, group_name),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect_err("a policy cannot change the provisioned identity");
+            assert!(error.to_string().contains(&format!(
+                "selected process {component} conflicts with immutable workload identity"
+            )));
+        }
+    }
+
+    #[test]
+    fn configuration_activation_unknown_names_do_not_fall_back_to_nss() {
+        let (_dir, passwd, group) = account_files("", "");
+
+        for (user, group_name, component) in
+            [(Some("root"), None, "user"), (None, Some("root"), "group")]
+        {
+            let error = validate_selected_process_identity_at(
+                &policy(user, group_name),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect_err("host account names cannot resolve absent workload accounts");
+            assert!(error.to_string().contains(&format!(
+                "selected process {component} is absent from image accounts"
+            )));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_selected_identity_fifo_rejected(account_file: &str, selected_policy: SandboxPolicy) {
+        use nix::sys::stat::Mode;
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let (dir, passwd, group) =
+            account_files("app:x:1234:1235::/home/app:/bin/sh\n", "staff:x:1235:\n");
+        let fifo_path = dir.path().join(account_file);
+        fs::remove_file(&fifo_path).expect("replace the selected account file");
+        nix::unistd::mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)
+            .expect("create workload account FIFO");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let result = validate_selected_process_identity_at(
+                &selected_policy,
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .map_err(|error| error.to_string());
+            let _ = result_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("identity validation worker starts");
+
+        let (result, needed_writer) = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => (result, false),
+            Err(RecvTimeoutError::Timeout) => {
+                // Linux permits a nonblocking read/write FIFO open with no
+                // peer. Keep this writer alive to release a regressed blocking
+                // reader, then report the timeout without stranding its thread.
+                let _writer = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&fifo_path)
+                    .expect("open bounded FIFO writer fallback");
+                (
+                    result_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("FIFO writer fallback releases identity validation"),
+                    true,
+                )
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("identity validation worker disconnected")
+            }
+        };
+        worker.join().expect("identity validation worker exits");
+        let error = result.expect_err("named process identity must reject an account FIFO");
+        assert!(error.contains("is not a regular file"), "{error}");
+        assert!(
+            !needed_writer,
+            "account FIFO open blocked waiting for a writer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuration_activation_named_user_fifo_rejected_without_blocking() {
+        assert_selected_identity_fifo_rejected("passwd", policy(Some("app"), None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configuration_activation_named_group_fifo_rejected_without_blocking() {
+        assert_selected_identity_fifo_rejected("group", policy(None, Some("staff")));
+    }
+
+    #[test]
+    fn configuration_activation_malformed_selectors_are_rejected() {
+        let dir = tempdir().unwrap();
+        let passwd = dir.path().join("missing-passwd");
+        let group = dir.path().join("missing-group");
+        let oversized = "a".repeat(MAX_ACCOUNT_FIELD_SIZE + 1);
+
+        for selector in [" app", "app ", "app:staff", "app\n", oversized.as_str()] {
+            for (user, group_name) in [(Some(selector), None), (None, Some(selector))] {
+                let error = validate_selected_process_identity_at(
+                    &policy(user, group_name),
+                    1234,
+                    1235,
+                    &passwd,
+                    &group,
+                )
+                .expect_err("malformed selectors must fail before reading account files");
+                assert!(error.to_string().contains("is malformed"));
+            }
+        }
+    }
+
+    #[test]
+    fn configuration_activation_malformed_matching_accounts_are_rejected() {
+        let valid_passwd = "app:x:1234:1235::/home/app:/bin/sh\n";
+        let valid_group = "staff:x:1235:\n";
+
+        for (passwd_content, group_content, user, group_name) in [
+            ("app:x:1234:1235\n", valid_group, Some("app"), None),
+            (
+                "app:x:invalid:1235::/home/app:/bin/sh\n",
+                valid_group,
+                Some("app"),
+                None,
+            ),
+            (
+                "app:x:1234:invalid::/home/app:/bin/sh\n",
+                valid_group,
+                Some("app"),
+                None,
+            ),
+            (valid_passwd, "staff:x:1235\n", None, Some("staff")),
+            (valid_passwd, "staff:x:invalid:\n", None, Some("staff")),
+        ] {
+            let (_dir, passwd, group) = account_files(passwd_content, group_content);
+            let error = validate_selected_process_identity_at(
+                &policy(user, group_name),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect_err("a selected malformed account record must fail closed");
+            assert!(error.to_string().contains("is malformed"));
+        }
+    }
+
+    #[test]
+    fn configuration_activation_ambiguous_matching_accounts_are_rejected() {
+        for duplicate_uid in [1234, 2234] {
+            let (_dir, passwd, group) = account_files(
+                &format!(
+                    "app:x:1234:1235::/home/app:/bin/sh\napp:x:{duplicate_uid}:1235::/home/app:/bin/sh\n"
+                ),
+                "staff:x:1235:\n",
+            );
+            let error = validate_selected_process_identity_at(
+                &policy(Some("app"), None),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect_err("duplicate user records must not select an arbitrary match");
+            assert!(error.to_string().contains("ambiguous"));
+        }
+        for duplicate_gid in [1235, 2235] {
+            let (_dir, passwd, group) = account_files(
+                "app:x:1234:1235::/home/app:/bin/sh\n",
+                &format!("staff:x:1235:\nstaff:x:{duplicate_gid}:\n"),
+            );
+            let error = validate_selected_process_identity_at(
+                &policy(None, Some("staff")),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect_err("duplicate group records must not select an arbitrary match");
+            assert!(error.to_string().contains("ambiguous"));
+        }
+    }
+
+    #[test]
+    fn configuration_activation_root_identities_are_rejected() {
+        let (_dir, passwd, group) =
+            account_files("root_alias:x:0:1235::/root:/bin/sh\n", "root_alias:x:0:\n");
+
+        for (uid, gid) in [(0, 1235), (1234, 0), (0, 0)] {
+            let error = validate_selected_process_identity_at(
+                &policy(None, None),
+                uid,
+                gid,
+                &passwd,
+                &group,
+            )
+            .expect_err("even omitted selectors must reject a root driver identity");
+            assert!(error.to_string().contains("must be non-root"));
+        }
+        for (user, group_name) in [
+            (Some("0"), None),
+            (Some("root_alias"), None),
+            (None, Some("0")),
+            (None, Some("root_alias")),
+        ] {
+            let error = validate_selected_process_identity_at(
+                &policy(user, group_name),
+                1234,
+                1235,
+                &passwd,
+                &group,
+            )
+            .expect_err("numeric and named root selections must not replace a non-root identity");
+            assert!(error.to_string().contains("conflicts"));
+        }
     }
 
     #[test]

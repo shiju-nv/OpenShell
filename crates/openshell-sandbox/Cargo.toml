@@ -76,6 +76,7 @@ landlock = "0.4"
 seccompiler = "0.5"
 socket2 = { workspace = true }
 tempfile = "3"
+uuid = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
