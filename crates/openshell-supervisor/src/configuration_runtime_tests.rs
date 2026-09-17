@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn gateway_provenance_policy() -> openshell_core::proto::SandboxPolicy {
     let mut policy = openshell_policy::parse_sandbox_policy(
-        r#"
+        r"
 version: 1
 network_policies:
   redis:
@@ -27,7 +27,7 @@ network_policies:
         port: 443
     binaries:
       - path: /usr/bin/redis-cli
-"#,
+",
     )
     .expect("parse gateway provenance policy");
     policy.landlock = openshell_policy::restrictive_default_policy().landlock;

@@ -18,7 +18,7 @@ import time
 import uuid
 
 
-CANDIDATE_TREE = "945721e3aad8d0b4fab3b93dcf999cebd4fa2bba"
+CANDIDATE_TREE = "53d10c281d2155de7891cb461db3db5be54b5c83"
 HISTORICAL_SOURCE_SHA256 = "41ab5ee8614cee7910b58ed5c5600036f3c32bbc3ae567446d9ec6c357c54030"
 HARNESSES = {"policy_activation", "configuration_composition_acceptance"}
 # No prefix-based expansion is allowed: hosted credentials may share familiar

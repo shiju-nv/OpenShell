@@ -1,7 +1,7 @@
 {
   "build_helper": {
     "relative_path": "linux-runner-assessment/build-scripts/build_products.py",
-    "sha256": "6f79bfd12aa9ca63bb0362238124d618657911eb1d2fbb50d0742ff5d816a1cd"
+    "sha256": "bc2c0c874ab5561d931563dcb71312b040497fdec935db8c8533ad968e17c16d"
   },
   "expected_protocol_rows": 60,
   "fixture_image": {
