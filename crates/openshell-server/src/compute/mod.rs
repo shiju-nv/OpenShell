@@ -8005,6 +8005,7 @@ mod tests {
         crate::grpc::OpenShellService::new(state.clone())
             .start_sandbox(crate::grpc::test_support::authed_request(
                 openshell_core::proto::StartSandboxRequest {
+                    request_id: String::new(),
                     name: name.to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 },

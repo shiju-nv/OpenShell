@@ -642,6 +642,7 @@ pub async fn sandbox_create(
         )])
     };
     let request = CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(SandboxSpec {
             resource_requirements,
             environment: if template.is_none() {
@@ -2821,6 +2822,7 @@ pub async fn sandbox_template_create(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .create_sandbox_template(CreateSandboxTemplateRequest {
+            request_id: String::new(),
             template: Some(SandboxWorkloadTemplate {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -3008,6 +3010,7 @@ pub async fn sandbox_template_delete(
     for name in names {
         let response = client
             .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -3436,6 +3439,7 @@ pub async fn sandbox_delete(
 
         let response = match client
             .delete_sandbox(DeleteSandboxRequest {
+                request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -3496,6 +3500,7 @@ pub async fn sandbox_stop(
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
         .stop_sandbox(StopSandboxRequest {
+            request_id: String::new(),
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
@@ -3519,6 +3524,7 @@ pub async fn sandbox_start(
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
         .start_sandbox(StartSandboxRequest {
+            request_id: String::new(),
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })
@@ -3627,6 +3633,7 @@ pub async fn service_expose(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .expose_service(ExposeServiceRequest {
+            request_id: String::new(),
             sandbox: sandbox.to_string(),
             service: service.to_string(),
             target_port: u32::from(target_port),
@@ -3753,6 +3760,7 @@ pub async fn service_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_service(DeleteServiceRequest {
+            request_id: String::new(),
             allow_missing: false,
             sandbox: sandbox.to_string(),
             service: service.to_string(),
@@ -3973,6 +3981,7 @@ pub async fn workspace_create(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .create_workspace(CreateWorkspaceRequest {
+            request_id: String::new(),
             name: name.to_string(),
             labels,
         })
@@ -4127,6 +4136,7 @@ pub async fn workspace_delete(server: &str, names: &[String], tls: &TlsOptions) 
     for name in names {
         let response = client
             .delete_workspace(DeleteWorkspaceRequest {
+                request_id: String::new(),
                 allow_missing: false,
                 name: name.clone(),
             })
@@ -4164,6 +4174,7 @@ pub async fn workspace_member_add(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .add_workspace_member(AddWorkspaceMemberRequest {
+            request_id: String::new(),
             workspace: workspace.to_string(),
             principal_subject: subject.to_string(),
             role: role_val.into(),
@@ -4198,6 +4209,7 @@ pub async fn workspace_member_remove(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
+            request_id: String::new(),
             allow_missing: true,
             workspace: workspace.to_string(),
             principal_subject: subject.to_string(),
@@ -6027,6 +6039,7 @@ pub async fn sandbox_draft_approve(
 
     let response = client
         .approve_draft_chunk(ApproveDraftChunkRequest {
+            request_id: String::new(),
             name: name.to_string(),
             chunk_id: chunk_id.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -6059,6 +6072,7 @@ pub async fn sandbox_draft_reject(
 
     client
         .reject_draft_chunk(RejectDraftChunkRequest {
+            request_id: String::new(),
             name: name.to_string(),
             chunk_id: chunk_id.to_string(),
             reason: reason.to_string(),
@@ -6100,6 +6114,7 @@ pub async fn sandbox_draft_approve_all(
 
     let response = client
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
+            request_id: String::new(),
             name: name.to_string(),
             include_security_flagged,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -6131,6 +6146,7 @@ pub async fn sandbox_draft_clear(
 
     let response = client
         .clear_draft_chunks(ClearDraftChunksRequest {
+            request_id: String::new(),
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         })

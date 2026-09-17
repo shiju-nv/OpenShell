@@ -28,6 +28,9 @@ carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes connections that miss a ten-second acknowledgement deadline. Closing a connection freezes the owned workload process tree and cancels its stream bridges before releasing the exclusive DNS mediation lease. The supervisor has 30 seconds to recover. A replacement supervisor uses a new process instance ID and a gateway-signed registration grant bound to the current sandbox, driver generation, authentication epoch, boundary session and incarnation, and registration revision. The boundary rejects stale grants and acknowledges the registered identity. Confirmation proves isolation but leaves the workload frozen. Recovery requires complete configuration installation, gateway acceptance, and an exact release acknowledgement; expiry terminates the workload. Idle healthy connections remain usable.
+
+A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
+
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
 five-second deadline, never consuming authenticated control slots or threads.
 The socket broker reserves the TCP control-listener port against workload
