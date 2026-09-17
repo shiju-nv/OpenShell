@@ -51,7 +51,7 @@ impl ConfigurationGateway for RuntimeDelivery {
             .lock()
             .expect("report lock")
             .push(admission.clone());
-        Ok(Default::default())
+        Ok(openshell_core::proto::ReportSandboxConfigurationResponse::default())
     }
 
     async fn middleware_credentials(
@@ -384,8 +384,8 @@ impl RuntimeProcessFixture {
                 socket_path: socket_path.clone(),
                 tls: server_tls,
             },
-            resource_claims: Default::default(),
-            resource_claim_files: Default::default(),
+            resource_claims: std::collections::BTreeMap::default(),
+            resource_claim_files: std::collections::BTreeMap::default(),
             workload_identity: workload_identity.clone(),
             driver_fence: fence.clone(),
             child_env: HashMap::new(),
@@ -433,7 +433,7 @@ impl RuntimeProcessFixture {
         if let Some(case) = protocol_case {
             initial.policy = Some(protocol_runtime_policy(
                 initial.policy.as_ref().expect("initial policy"),
-                case,
+                *case,
             ));
         }
         let provider_a = runtime_provider(5, endpoint_a.port, "cred-A");
@@ -457,7 +457,7 @@ impl RuntimeProcessFixture {
                 trust_anchor_pem: tls.trust_anchor_pem,
             },
             host_gateway_ip: None,
-            resource_claims: Default::default(),
+            resource_claims: std::collections::BTreeMap::default(),
             driver_fence: fence,
         };
         let mut registry = BackendRegistry::new();
@@ -904,13 +904,13 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
                         .providers
                         .lock()
                         .expect("provider lock")
-                        .provider_env_revision += 1
+                        .provider_env_revision += 1;
                 }
                 "opa-rejection" => {
                     candidate.policy.as_mut().expect("policy").landlock =
                         Some(openshell_core::proto::LandlockPolicy {
                             compatibility: "invalid".into(),
-                        })
+                        });
                 }
                 _ => unreachable!("enumerated faults"),
             }

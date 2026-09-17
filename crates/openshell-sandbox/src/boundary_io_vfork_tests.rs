@@ -29,7 +29,7 @@ mod configuration_vfork_fixture {
                 args.ready,
                 (&raw const pid).cast(),
                 size_of::<libc::pid_t>(),
-            ) != size_of::<libc::pid_t>() as isize
+            ) != size_of::<libc::pid_t>().cast_signed()
             {
                 libc::_exit(91);
             }
