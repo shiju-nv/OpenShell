@@ -1,0 +1,55 @@
+{
+  "candidate_tree": "91ef9d67772e114d5aa2cea2964b7baa7cfd131d",
+  "execution_run": false,
+  "schema_version": 1,
+  "scopes": {
+    "drivers": [
+      "Verify selective gateway compute-driver builds"
+    ],
+    "nextest": [
+      "Test"
+    ],
+    "roots": [
+      "Verify system CA roots build mode compiles and excludes bundled Mozilla roots"
+    ],
+    "telemetry": [
+      "Verify telemetry can be compiled out",
+      "Verify the defaults-without-telemetry feature alias tracks the default feature set"
+    ]
+  },
+  "shipping_shell": [
+    "bash",
+    "-euo",
+    "pipefail"
+  ],
+  "source_inputs": {
+    ".config/nextest.toml": "47b1bb8d620fafcc3bc0ee0a4704cbcc8763e7b7b1680c0e3a683148e52e06c5",
+    ".github/workflows/branch-checks.yml": "499a3ddb3a769f126491783ee9496628e3c0c21859b27177c6395739c64e962c",
+    "tasks/scripts/verify-defaults-without-telemetry.sh": "4301e793e780c0e4f2636d38d829cd129da27ddd16820fe0b3ed0c3d5af4049b",
+    "tasks/scripts/verify-telemetry-compiled-out.sh": "fa640a70b2617531259fd7a036b9e94370204e8f066d043a9d4ac06bb1e9e097"
+  },
+  "steps": {
+    "Test": {
+      "environment": {
+        "OPENSHELL_TELEMETRY_ENABLED": "false"
+      },
+      "script": "cargo nextest run --profile ci --workspace --features openshell-server/test-support\n"
+    },
+    "Verify selective gateway compute-driver builds": {
+      "environment": {},
+      "script": "cargo test -p openshell-gateway --all-targets --no-default-features\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm\n"
+    },
+    "Verify system CA roots build mode compiles and excludes bundled Mozilla roots": {
+      "environment": {},
+      "script": "cargo check -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots\nif cargo tree -p openshell-supervisor -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then\n  echo \"ERROR: webpki-roots found in system CA roots build\" >&2\n  exit 1\nfi\nif cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then\n  echo \"ERROR: webpki-root-certs found in system CA roots build\" >&2\n  exit 1\nfi\n"
+    },
+    "Verify telemetry can be compiled out": {
+      "environment": {},
+      "script": "cargo build -p openshell-gateway --bin openshell-gateway\ntasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway\ncargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry\ntasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway\ncargo build -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry\ntasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor\n"
+    },
+    "Verify the defaults-without-telemetry feature alias tracks the default feature set": {
+      "environment": {},
+      "script": "tasks/scripts/verify-defaults-without-telemetry.sh\n"
+    }
+  }
+}

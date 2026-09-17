@@ -1,0 +1,343 @@
+{
+  "executed": false,
+  "expected_rows": [
+    {
+      "case": "Rest",
+      "fault": "misplaced-mcp-options",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "Rest",
+      "fault": "conflicting-query-matchers",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "Rest",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "Graphql",
+      "fault": "misplaced-mcp-options",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "Graphql",
+      "fault": "invalid-graphql-operation",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "Graphql",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "Websocket",
+      "fault": "misplaced-mcp-options",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "Websocket",
+      "fault": "conflicting-query-matchers",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "Websocket",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "JsonRpc",
+      "fault": "misplaced-mcp-options",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "JsonRpc",
+      "fault": "json-rpc-params-matcher",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "JsonRpc",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "empty-revision",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "duplicate-revision",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "padded-revision",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "unsupported-revision",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "draft-revision",
+      "phase": "startup-rejected-and-repaired"
+    },
+    {
+      "case": "McpOmitted",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "McpEmptyProto",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "McpRevisions",
+      "phase": "startup-activated"
+    },
+    {
+      "case": "Rest",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "Rest",
+      "fault": "conflicting-query-matchers",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "Rest",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "Rest",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "Rest",
+      "fault": "conflicting-query-matchers",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "Rest",
+      "phase": "update-repaired",
+      "retains": false
+    },
+    {
+      "case": "Graphql",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "Graphql",
+      "fault": "invalid-graphql-operation",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "Graphql",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "Graphql",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "Graphql",
+      "fault": "invalid-graphql-operation",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "Graphql",
+      "phase": "update-repaired",
+      "retains": false
+    },
+    {
+      "case": "Websocket",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "Websocket",
+      "fault": "conflicting-query-matchers",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "Websocket",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "Websocket",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "Websocket",
+      "fault": "conflicting-query-matchers",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "Websocket",
+      "phase": "update-repaired",
+      "retains": false
+    },
+    {
+      "case": "JsonRpc",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "JsonRpc",
+      "fault": "json-rpc-params-matcher",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "JsonRpc",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "JsonRpc",
+      "fault": "misplaced-mcp-options",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "JsonRpc",
+      "fault": "json-rpc-params-matcher",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "JsonRpc",
+      "phase": "update-repaired",
+      "retains": false
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "empty-revision",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "duplicate-revision",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "padded-revision",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "unsupported-revision",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "draft-revision",
+      "phase": "update-rejected",
+      "retains": true
+    },
+    {
+      "case": "McpOmitted",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "empty-revision",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "duplicate-revision",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "padded-revision",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "unsupported-revision",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "McpOmitted",
+      "fault": "draft-revision",
+      "phase": "update-rejected",
+      "retains": false
+    },
+    {
+      "case": "McpOmitted",
+      "phase": "update-repaired",
+      "retains": false
+    },
+    {
+      "case": "McpEmptyProto",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "McpEmptyProto",
+      "phase": "update-repaired",
+      "retains": false
+    },
+    {
+      "case": "McpRevisions",
+      "phase": "update-repaired",
+      "retains": true
+    },
+    {
+      "case": "McpRevisions",
+      "phase": "update-repaired",
+      "retains": false
+    }
+  ],
+  "marker": "configuration_protocol_runtime_observation ",
+  "scope": {
+    "controlled": [
+      "gateway delivery and admission reporting"
+    ],
+    "not_proved": [
+      "real gateway or driver composition",
+      "external-client L7 relay behavior"
+    ],
+    "real": [
+      "ConfigurationSession and RuntimeConfiguration",
+      "installed OPA endpoint configuration and network decisions",
+      "authenticated backend/boundary TLS transaction",
+      "kernel-held workload and remote exec",
+      "provider credential rewriting and controlled upstream TCP"
+    ]
+  },
+  "source": "crates/openshell-supervisor/src/configuration_protocol_runtime_tests.rs",
+  "source_sha256": "fd9b1aa71021a4c6afc4b5d5e6ddc81e0e44d1fdd39befcb9f6b4f6694be6a00"
+}

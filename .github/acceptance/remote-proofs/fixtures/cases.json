@@ -1,0 +1,441 @@
+{
+  "schema": "openshell-effective-configuration-acceptance-v1",
+  "frozen_at": "2026-09-15T14:50:00+05:30",
+  "scope": "Actual candidate gateway, control, Linux boundary, workload, and controlled upstream behavior.",
+  "runtime_requirements": {
+    "evidence": [
+      "gateway admission/readiness responses",
+      "boundary process inventory",
+      "workload append-only start records and monotonic heartbeat",
+      "upstream captured endpoint and synthetic credential tags",
+      "candidate executable and image provenance"
+    ],
+    "forbidden_substitutes": [
+      "receipt-only success",
+      "source-shape grep",
+      "mock-only proof of workload freeze",
+      "test runner printing expected fixture output"
+    ],
+    "fixture_materialization": "Substitute controlled endpoint host/port, available workload interpreter path, and allocated runtime IDs. Snapshot A/B revision numbers identify distinct logical generations: bind each alias once to the product-calculated opaque configuration/provider fingerprints and persisted policy version before executing scenario actions, and record that binding with rendered policies and policy hashes. Pure protocol fixtures may use the literal numeric examples. A mismatch must mutate exactly one bound field to a distinct value, never redefine an expected alias after observing a response. Preserve policy semantics, provider bindings, action sequence, and every expected behavioral observation. Reject missing scenarios and unavailable Linux process proofs instead of skipping them.",
+    "process_identity": "Fixture runtime/session/instance values are symbolic aliases bound once to actual generated IDs. Mutations target a distinct ID; never replace the expected alias with the observed mismatch."
+  },
+  "snapshots": {
+    "A": {
+      "configuration_revision": 11,
+      "policy_version": 7,
+      "policy_fixture": "policy-a.yaml",
+      "policy_source": "user",
+      "provider_revision": 5,
+      "provider_names": [
+        "service-a"
+      ],
+      "credential_tag": "cred-A",
+      "allowed_endpoint": "egress-a.invalid"
+    },
+    "B": {
+      "configuration_revision": 12,
+      "policy_version": 8,
+      "policy_fixture": "policy-b.yaml",
+      "policy_source": "user",
+      "provider_revision": 6,
+      "provider_names": [
+        "service-b"
+      ],
+      "credential_tag": "cred-B",
+      "allowed_endpoint": "egress-b.invalid"
+    },
+    "invalid_initial": {
+      "policy_fixture": "policy-invalid-binding.yaml",
+      "policy_source": "image",
+      "provider_revision": 5,
+      "provider_names": [
+        "service-a"
+      ]
+    }
+  },
+  "runtime_binding": {
+    "runtime_generation": "rt-1",
+    "session": "sess-1",
+    "supervisor_instance": "ctrl-1",
+    "boundary_instance": "bound-1",
+    "registration_revision": 1
+  },
+  "scenarios": [
+    {
+      "id": "rejected-initial-repair-once",
+      "suites": [
+        "repair",
+        "cross-boundary"
+      ],
+      "initial": "invalid_initial",
+      "actions": [
+        "create sandbox",
+        "observe rejection before repair",
+        "replace static policy with snapshot A while never-activated marker is present",
+        "retry identical repair and initial-start/activation messages"
+      ],
+      "expect": {
+        "before_repair": {
+          "readiness": false,
+          "initial_starts": 0,
+          "main_process": false,
+          "credential_requests": 0,
+          "repairable": true,
+          "terminal_error": false
+        },
+        "after_repair": {
+          "readiness": true,
+          "accepted_snapshot": "A",
+          "initial_starts": 1,
+          "main_process_instances": 1
+        },
+        "after_replay": {
+          "initial_starts": 1,
+          "main_process_instances": 1
+        }
+      }
+    },
+    {
+      "id": "restrictive-no-image-policy",
+      "suites": [
+        "repair"
+      ],
+      "actions": [
+        "create image without policy",
+        "observe selected restrictive default",
+        "attempt controlled unauthorized endpoint"
+      ],
+      "expect": {
+        "unauthorized_request_allowed": false,
+        "credential_requests": 0,
+        "policy_source": "default"
+      }
+    },
+    {
+      "id": "exact-activation-mismatch-matrix",
+      "suites": [
+        "integration",
+        "cross-boundary"
+      ],
+      "initial": "A",
+      "candidate": "B",
+      "mutations": [
+        {
+          "field": "configuration_revision",
+          "value": 13
+        },
+        {
+          "field": "policy_version",
+          "value": 9
+        },
+        {
+          "field": "policy_hash",
+          "value": "hash-of-distinct-policy"
+        },
+        {
+          "field": "policy_source",
+          "value": "image"
+        },
+        {
+          "field": "provider_revision",
+          "value": 7
+        },
+        {
+          "field": "runtime_generation",
+          "value": "rt-2"
+        },
+        {
+          "field": "session",
+          "value": "sess-2"
+        },
+        {
+          "field": "supervisor_instance",
+          "value": "ctrl-2"
+        },
+        {
+          "field": "boundary_instance",
+          "value": "bound-2"
+        },
+        {
+          "field": "admission_token",
+          "value": "distinct-server-issued-token"
+        },
+        {
+          "field": "registration_revision",
+          "value": 2
+        }
+      ],
+      "actions": [
+        "stage B using real candidate processes",
+        "fault exactly one returned identity field per isolated iteration",
+        "attempt accepted report and exec",
+        "repair with exact B identity"
+      ],
+      "expect_each_mismatch": {
+        "accepted_snapshot": "A",
+        "candidate_accepted": false,
+        "readiness": false,
+        "exec_allowed": false,
+        "initial_starts": 1
+      }
+    },
+    {
+      "id": "old-runtime-authentication",
+      "suites": [
+        "integration",
+        "cross-boundary"
+      ],
+      "initial": "A",
+      "actions": [
+        "replace persisted runtime generation",
+        "send old-runtime JWT with otherwise matching configuration fields"
+      ],
+      "expect": {
+        "authentication_accepted": false,
+        "readiness_restored": false
+      }
+    },
+    {
+      "id": "atomic-publication",
+      "suites": [
+        "cross-boundary"
+      ],
+      "initial": "A",
+      "candidate": "B",
+      "actions": [
+        "continuously probe both endpoints and new exec",
+        "pause after boundary staging before control publication",
+        "sample heartbeat and readiness",
+        "publish control B, COMMIT boundary B while frozen, obtain exact gateway acceptance, RELEASE exact B and compare response"
+      ],
+      "expect_during_pause": {
+        "readiness": false,
+        "heartbeat_advances": false,
+        "exec_allowed": false,
+        "candidate_credential_requests": 0
+      },
+      "forbidden_pairs": [
+        [
+          "egress-a.invalid",
+          "cred-B"
+        ],
+        [
+          "egress-b.invalid",
+          "cred-A"
+        ]
+      ],
+      "expect_after_release": {
+        "readiness": true,
+        "accepted_snapshot": "B",
+        "only_usable_endpoint": "egress-b.invalid",
+        "only_usable_credential": "cred-B",
+        "initial_starts": 1
+      }
+    },
+    {
+      "id": "rejected-live-candidates",
+      "suites": [
+        "cross-boundary",
+        "repair"
+      ],
+      "initial": "A",
+      "candidate": "B",
+      "failure_cases": [
+        "unresolved provider binding",
+        "provider fetch revision mismatch",
+        "OPA compilation rejection"
+      ],
+      "failure_postures": [
+        "retain-last-valid",
+        "fail-closed"
+      ],
+      "expect_each": {
+        "accepted_snapshot": "A",
+        "candidate_credential_requests": 0,
+        "initial_starts": 1
+      },
+      "expect_posture": {
+        "retain-last-valid": {
+          "reactivated_snapshot": "A",
+          "only_usable_credential": "cred-A"
+        },
+        "fail-closed": {
+          "readiness": false,
+          "heartbeat_advances": false,
+          "exec_allowed": false
+        }
+      }
+    },
+    {
+      "id": "lost-commit-response",
+      "suites": [
+        "cross-boundary",
+        "recovery"
+      ],
+      "initial": "A",
+      "candidate": "B",
+      "actions": [
+        "drop boundary commit response after staged update",
+        "observe uncertainty",
+        "retry identical activation",
+        "deliver delayed duplicate response"
+      ],
+      "expect_during_uncertainty": {
+        "readiness": false,
+        "exec_allowed": false
+      },
+      "expect_after_retry": {
+        "accepted_snapshot": "B",
+        "readiness": true,
+        "initial_starts": 1,
+        "main_process_instances": 1
+      }
+    },
+    {
+      "id": "confirmation-does-not-resume",
+      "suites": [
+        "recovery",
+        "cross-boundary"
+      ],
+      "initial": "A",
+      "actions": [
+        "disconnect control and observe workload freeze",
+        "register ctrl-2 with gateway, obtain signed current registration grant, attach and complete Confirm only",
+        "attempt exec and old ctrl-1 activation",
+        "install A, COMMIT exact ctrl-2 activation while frozen, obtain gateway acceptance, RELEASE and verify exact identity"
+      ],
+      "expect_after_confirm": {
+        "heartbeat_advances": false,
+        "readiness": false,
+        "exec_allowed": false,
+        "initial_starts": 1
+      },
+      "expect_old_activation": {
+        "accepted": false,
+        "readiness_restored": false
+      },
+      "expect_after_activation": {
+        "heartbeat_advances": true,
+        "readiness": true,
+        "initial_starts": 1,
+        "same_main_process": true
+      }
+    },
+    {
+      "id": "independent-process-restart",
+      "suites": [
+        "recovery"
+      ],
+      "initial": "A",
+      "restart_targets": [
+        "control",
+        "boundary"
+      ],
+      "actions": [
+        "restart named process",
+        "replay prior-incarnation activation evidence",
+        "perform fresh validation and exact activation"
+      ],
+      "expect_stale": {
+        "readiness": false,
+        "exec_allowed": false
+      },
+      "expect_if_workload_survives": {
+        "initial_starts": 1,
+        "same_main_process": true
+      },
+      "expect_if_workload_exits": {
+        "terminal_state_preserved": true,
+        "relaunch_requires_new_authorized_runtime_generation": true
+      }
+    },
+    {
+      "id": "durable-repair-and-readiness",
+      "suites": [
+        "unit",
+        "integration",
+        "repair"
+      ],
+      "actions": [
+        "restart while never-activated marker is present",
+        "perform allowed static repair",
+        "consume first activation",
+        "restart control and attempt static repair",
+        "remove marker from legacy storage fixture and attempt static repair",
+        "send stale loaded-policy report and driver-ready observation while rejected"
+      ],
+      "expect": {
+        "repair_before_activation": true,
+        "repair_after_activation": false,
+        "repair_when_marker_missing": false,
+        "stale_loaded_advances_policy": false,
+        "driver_ready_overrides_rejection": false
+      }
+    },
+    {
+      "id": "lost-release-response",
+      "suites": [
+        "cross-boundary",
+        "recovery"
+      ],
+      "initial": "A",
+      "candidate": "B",
+      "actions": [
+        "commit B while boundary remains frozen",
+        "record exact gateway acceptance",
+        "drop successful boundary RELEASE response",
+        "observe control readiness",
+        "retry identical RELEASE",
+        "deliver delayed duplicate response"
+      ],
+      "expect_before_release": {
+        "heartbeat_advances": false,
+        "exec_allowed": false
+      },
+      "expect_after_lost_response": {
+        "gateway_accepted_snapshot": "B",
+        "control_readiness": false,
+        "workload_may_have_resumed": true
+      },
+      "expect_after_retry": {
+        "readiness": true,
+        "accepted_snapshot": "B",
+        "initial_starts": 1,
+        "main_process_instances": 1
+      }
+    },
+    {
+      "id": "registration-grant-takeover",
+      "suites": [
+        "integration",
+        "cross-boundary",
+        "recovery"
+      ],
+      "initial": "A",
+      "actions": [
+        "register ctrl-2 with gateway using expected ctrl-1 and current boundary identities",
+        "obtain signed grant at newer registration revision",
+        "attach ctrl-2 using exact grant",
+        "retry old ctrl-1 grant",
+        "mutate each grant binding field independently",
+        "replay newer grant idempotently"
+      ],
+      "grant_binding_fields": [
+        "sandbox_id",
+        "runtime_generation",
+        "auth_epoch",
+        "supervisor_instance",
+        "session",
+        "boundary_instance",
+        "registration_revision"
+      ],
+      "expect": {
+        "new_registration_accepted": true,
+        "old_grant_accepted": false,
+        "mismatched_grant_accepted": false,
+        "confirm_alone_resumes": false,
+        "initial_starts": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,388 @@
+name: Candidate Linux acceptance
+
+# This workflow lives only on the verification branch, never in the product PR.
+on:
+  push:
+    branches: [ci/3092-3145-acceptance]
+permissions:
+  contents: read
+concurrency:
+  group: candidate-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ACCEPTANCE_PRODUCT_COMMIT: 64b5b2c49e206c124c2b089f146c81e7e0551570
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.acceptance-target
+  SCCACHE_DIR: ${{ github.workspace }}/.acceptance-sccache
+  SCCACHE_CACHE_SIZE: 512M
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  MISE_LOCKED: "true"
+  OPENSHELL_TELEMETRY_ENABLED: "false"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  candidate:
+    if: github.repository == 'shiju-nv/OpenShell'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  rust:
+    needs: candidate
+    name: ${{ matrix.suite }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [rust-checks, rust-tests]
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - name: Inventory and free unused hosted SDKs
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/prepare_runner.py
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-mise
+        with:
+          version: v2026.9.9
+      - name: Run literal Rust task scope
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          args=(--suite "$SUITE")
+          if [[ "$SUITE" == rust-tests ]]; then
+            args=(--suite command -- python3 .acceptance-control/remote-capture/remote_capture.py
+              run --mode native --evidence "$RUNNER_TEMP/acceptance-evidence/native-capture"
+              -- mise run --jobs 1 test:rust)
+          fi
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --evidence "$RUNNER_TEMP/acceptance-evidence/tasks" "${args[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  stock-linux-extras:
+    needs: candidate
+    name: Stock Linux ${{ matrix.scope }} (x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [nextest, telemetry, drivers, roots]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - name: Inventory and free unused hosted SDKs
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/prepare_runner.py
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-mise
+        with:
+          version: v2026.9.9
+      - name: Run exact shipping Linux feature coverage
+        run: |
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/outer" -- \
+            python3 .acceptance-control/linux-runner-assessment/extras-scripts/extras.py \
+            --scope '${{ matrix.scope }}' --evidence "$RUNNER_TEMP/acceptance-evidence/extras" \
+            --target-dir "$CARGO_TARGET_DIR"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  repository-ci:
+    needs: [candidate, rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ACCEPTANCE_RUST_JOBS_PASSED: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - name: Inventory and free unused hosted SDKs
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/prepare_runner.py
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-mise
+        with:
+          version: v2026.9.9
+      - name: Complete the repository CI task graph after both Rust matrices pass
+        run: |
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --suite non-rust \
+            --evidence "$RUNNER_TEMP/acceptance-evidence/tasks"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  products:
+    needs: candidate
+    name: Product binaries (${{ matrix.role }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [host, supervisor, sandbox]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - name: Inventory and free unused hosted SDKs
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/prepare_runner.py
+      - uses: ./.github/actions/setup-nix
+      - name: Build one independent product scope
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          target=native
+          if [[ "$ROLE" == sandbox ]]; then target=x86_64-unknown-linux-musl; fi
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target "$target" --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/outer" -- \
+            python3 .acceptance-control/linux-runner-assessment/build-scripts/build_products.py \
+            "$ROLE" --output "$RUNNER_TEMP/acceptance-products/$ROLE" --target-dir "$CARGO_TARGET_DIR"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: acceptance-products-${{ matrix.role }}
+          path: ${{ runner.temp }}/acceptance-products/${{ matrix.role }}
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  docker-default:
+    needs: [candidate, products]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - name: Inventory and free unused hosted SDKs
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/prepare_runner.py
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-mise
+        with:
+          version: v2026.9.9
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: acceptance-products-*
+          path: ${{ runner.temp }}/acceptance-artifacts
+      - name: Restore artifact names and executable modes
+        run: |
+          for role in host supervisor sandbox; do
+            mv "$RUNNER_TEMP/acceptance-artifacts/acceptance-products-$role" "$RUNNER_TEMP/acceptance-artifacts/$role"
+            chmod 0755 "$RUNNER_TEMP/acceptance-artifacts/$role/products/"*
+          done
+      - name: Package and attest local images without a registry write
+        run: |
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/packaging-outer" -- \
+            python3 .acceptance-control/linux-runner-assessment/build-scripts/assemble_products.py \
+            --artifacts "$RUNNER_TEMP/acceptance-artifacts" \
+            --output "$RUNNER_TEMP/acceptance-artifacts/products.json" \
+            --evidence "$RUNNER_TEMP/acceptance-evidence/packaging"
+      - name: Run the literal unfiltered default Docker task
+        run: |
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/runtime-outer" -- \
+            python3 .acceptance-control/remote-docker/remote_docker.py \
+            --products "$RUNNER_TEMP/acceptance-artifacts/products.json" \
+            --evidence "$RUNNER_TEMP/acceptance-evidence/runtime"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  isolated-runtime-proofs:
+    needs: [candidate, products]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.ACCEPTANCE_PRODUCT_COMMIT }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: .acceptance-control
+          persist-credentials: false
+          sparse-checkout: .github/acceptance
+      - name: Expose isolated control scripts
+        run: cp -a .acceptance-control/.github/acceptance/. .acceptance-control/
+      - name: Verify exact candidate before setup
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py --suite verify-source --evidence "$RUNNER_TEMP/acceptance-evidence/source"
+      - name: Inventory and free unused hosted SDKs
+        run: python3 .acceptance-control/linux-runner-assessment/runner-scripts/prepare_runner.py
+      - uses: ./.github/actions/setup-nix
+      - uses: ./.github/actions/setup-mise
+        with:
+          version: v2026.9.9
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: acceptance-products-*
+          path: ${{ runner.temp }}/acceptance-artifacts
+      - name: Restore artifact names and executable modes
+        run: |
+          for role in host supervisor sandbox; do
+            mv "$RUNNER_TEMP/acceptance-artifacts/acceptance-products-$role" "$RUNNER_TEMP/acceptance-artifacts/$role"
+            chmod 0755 "$RUNNER_TEMP/acceptance-artifacts/$role/products/"*
+          done
+      - name: Package and attest local images without a registry write
+        run: |
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/packaging-outer" -- \
+            python3 .acceptance-control/linux-runner-assessment/build-scripts/assemble_products.py \
+            --artifacts "$RUNNER_TEMP/acceptance-artifacts" \
+            --output "$RUNNER_TEMP/acceptance-artifacts/products.json" \
+            --evidence "$RUNNER_TEMP/acceptance-evidence/packaging"
+      - name: Run exact isolated Linux acceptance fixtures
+        run: |
+          python3 .acceptance-control/linux-runner-assessment/runner-scripts/run_job.py \
+            --nix-target native --suite command --evidence "$RUNNER_TEMP/acceptance-evidence/proofs-outer" -- \
+            python3 .acceptance-control/remote-proofs/remote_proofs.py \
+            --products "$RUNNER_TEMP/acceptance-artifacts/products.json" \
+            --evidence "$RUNNER_TEMP/acceptance-evidence/proofs" \
+            --target-dir "$RUNNER_TEMP/acceptance-proof-target"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
+          path: ${{ runner.temp }}/acceptance-evidence
+          retention-days: 14
+          if-no-files-found: error
+
+  acceptance-result:
+    needs: [candidate, rust, stock-linux-extras, repository-ci, products, docker-default, isolated-runtime-proofs]
+    if: always() && github.repository == 'shiju-nv/OpenShell'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every scope on the same immutable candidate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ['RESULTS'])
+          failures = {name: row['result'] for name, row in needs.items() if row['result'] != 'success'}
+          print(json.dumps({'product_commit': os.environ['ACCEPTANCE_PRODUCT_COMMIT'], 'jobs': needs}, indent=2))
+          if failures:
+              raise SystemExit(str(failures))
+          PY
