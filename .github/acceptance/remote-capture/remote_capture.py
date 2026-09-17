@@ -403,6 +403,148 @@ def capture_provenance(original, directory, context, environment):
             "artifacts": asset(directory / "artifacts.json", evidence)}
 
 
+def process_snapshot(pid):
+    """Bind one live Linux process to its argv, executable, cwd, and birth time."""
+    require(type(pid) is int and pid > 0, "Invalid process identifier")
+    directory = Path("/proc") / str(pid)
+    before = (directory / "stat").read_text()
+    fields = before.rsplit(")", 1)[1].split()
+    result = {"pid": pid, "ppid": int(fields[1]), "start_ticks": int(fields[19]),
+              "argv": [os.fsdecode(value) for value in (directory / "cmdline").read_bytes().split(b"\0") if value],
+              "executable": os.readlink(directory / "exe"), "sha256": digest(directory / "exe"),
+              "cwd": os.readlink(directory / "cwd")}
+    after = (directory / "stat").read_text().rsplit(")", 1)[1].split()
+    require(fields[1] == after[1] and fields[19] == after[19], "Process ancestry changed during capture")
+    return result
+
+
+def rustdoc_option(argv, option):
+    """Collect both rustdoc option spellings without accepting missing values."""
+    values = []
+    for offset, value in enumerate(argv):
+        if value == option:
+            require(offset + 1 < len(argv), "Missing rustdoc option value")
+            values.append(argv[offset + 1])
+        elif value.startswith(option + "="):
+            values.append(value[len(option) + 1:])
+    return values
+
+
+def doctest_provenance(argv, context, environment, parent, cargo):
+    """Authenticate rustdoc's temporary executable without Cargo depfile claims."""
+    require(context["mode"] == "native", "Doctest capture requires native mode")
+    evidence, source = Path(context["evidence_root"]), Path(context["source_root"])
+    tools = json.loads((evidence / "tools.json").read_text())
+    for row, name in ((parent, "rustdoc"), (cargo, "cargo")):
+        require(row["argv"] and Path(row["argv"][0]).name == name and
+                row["executable"] == tools[name]["resolved_path"] and row["sha256"] == tools[name]["sha256"],
+                "Doctest process differs from pinned " + name)
+    require(parent["ppid"] == cargo["pid"] and parent["pid"] == os.getppid(), "Broken rustdoc/Cargo parent chain")
+    commands = {"test-workspace": ["test", "--workspace", "--exclude", "openshell-server"],
+                "test-server-support": ["test", "-p", "openshell-server", "--features", "test-support"]}
+    leaves = [name for name, command in commands.items() if cargo["argv"][1:] == command]
+    require(len(leaves) == 1 and Path(cargo["cwd"]).resolve(strict=True) == source,
+            "Filtered or changed doctest Cargo parent")
+    leaf = leaves[0]
+    metadata_path = evidence / "metadata" / leaf / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    args = parent["argv"][1:]
+    require(args.count("--test") == 1 and not rustdoc_option(args, "--test-args"), "Filtered rustdoc tests")
+    require(rustdoc_option(args, "--test-runtool") == context["runner"][:1] and
+            rustdoc_option(args, "--test-runtool-arg") == context["runner"][1:], "Foreign rustdoc runner")
+    require(rustdoc_option(args, "--target") in ([], [context["host"]]), "Cross-target rustdoc")
+    crate = rustdoc_option(args, "--crate-name")
+    test_directory = rustdoc_option(args, "--test-run-directory")
+    require(len(crate) == len(test_directory) == 1, "Ambiguous rustdoc crate/directory")
+    matches = [(package, target) for package in metadata["packages"]
+               if package["id"] in metadata["workspace_members"]
+               and (package["name"] == "openshell-server") == (leaf == "test-server-support")
+               for target in package["targets"] if target["doctest"]
+               and set(target["kind"]) & {"lib", "proc-macro"}
+               and target["name"].replace("-", "_") == crate[0]]
+    require(len(matches) == 1, "Rustdoc does not select one enabled metadata target")
+    package, selected = matches[0]
+    manifest = Path(package["manifest_path"]).resolve(strict=True)
+    source_path = Path(selected["src_path"]).resolve(strict=True)
+    require(manifest.is_relative_to(source) and source_path.is_relative_to(source)
+            and Path(test_directory[0]).resolve(strict=True) == manifest.parent == Path.cwd(),
+            "Rustdoc source/test directory escapes selected package")
+    rustdoc_cwd = Path(parent["cwd"]).resolve(strict=True)
+    require(rustdoc_cwd.is_relative_to(source), "Rustdoc cwd escapes selected source")
+    # The source may be workspace-relative even though the test runs in the
+    # package directory. Only the observed rustdoc cwd resolves its spelling.
+    selected_args = [value for value in args if not value.startswith("-")
+                     and (rustdoc_cwd / value).resolve() == source_path]
+    require(len(selected_args) == 1, "Rustdoc argv does not select the metadata source")
+    features = sorted(value[len('feature="'):-1] for value in rustdoc_option(args, "--cfg")
+                      if value.startswith('feature="') and value.endswith('"'))
+    require(len(features) == len(set(features)) and set(features) <= set(package["features"]), "Unknown rustdoc features")
+    require(leaf != "test-server-support" or "test-support" in features, "Rustdoc lacks server feature")
+    require(environment.get("TMPDIR") == context["environment"].get("TMPDIR") and environment.get("TMPDIR"),
+            "Changed or absent doctest temporary root")
+    temporary = Path(environment["TMPDIR"])
+    require(temporary.is_absolute() and temporary.resolve(strict=True) == temporary and temporary.is_dir(),
+            "Noncanonical doctest temporary root")
+    original = Path(argv[0])
+    require(len(argv) == 1 and original.is_absolute() and original.resolve(strict=True) == original
+            and original.name == "rust_out" and original.parent.parent == temporary
+            and re.fullmatch(r"rustdoctest[A-Za-z0-9_]+", original.parent.name),
+            "Doctest executable escapes its temporary root or changes selection")
+    relative = str(source_path.relative_to(source))
+    frozen = json.loads((evidence / "source-before.json").read_text())["files"]
+    require(relative in frozen and digest(source_path) == frozen[relative]["sha256"], "Rustdoc source differs from selected tree")
+    return {"leaf": leaf, "package_id": package["id"], "package": package["name"],
+            "target_name": selected["name"], "kind": selected["kind"], "features": features,
+            "metadata": asset(metadata_path, evidence),
+            "metadata_receipt": asset(metadata_path.with_name("metadata-receipt.json"), evidence),
+            "temporary_root": str(temporary), "rustdoc_source": {"source_relative_path": relative, **frozen[relative]},
+            "provenance_kind": "rustdoc-source-context", "cargo_fingerprint_retained": False, "depfile_retained": False}
+
+
+def run_doctest(argv, environment, context_path, context):
+    """Capture the actual rustdoc-selected child once and preserve its status."""
+    evidence, original = Path(context["evidence_root"]), Path(argv[0])
+    directory = evidence / "doctests" / uuid.uuid4().hex
+    directory.mkdir(parents=True, exist_ok=False)
+    record = {"schema_version": 1, "capture_kind": "rustdoc", "capture_id": directory.name,
+              "capture_passed": False, "product_commit": context["product_commit"],
+              "candidate_tree": context["candidate_tree"], "source_inventory_sha256": context["source_inventory_sha256"],
+              "historical_source_sha256": context["historical_source_sha256"], "original_executable": str(original),
+              "argv": argv, "cwd": os.getcwd(), "context": asset(context_path, evidence),
+              "environment": observed_environment(environment, context["runner_key"])}
+    try:
+        require(digest(Path(__file__)) == context["adapter_sha256"], "Capture adapter changed")
+        require(environment.get(context["runner_key"]) == context["environment"][context["runner_key"]],
+                "Owned runner environment changed")
+        parent = process_snapshot(os.getppid())
+        cargo = process_snapshot(parent["ppid"])
+        record.update(rustdoc_parent=parent, cargo_parent=cargo)
+        record.update(doctest_provenance(argv, context, environment, parent, cargo))
+        before = retain_executable(original, directory / "binary", context["elf_machine"])
+        record.update(executable_sha256_before=before["sha256"], executable_before=before,
+                      binary=asset(directory / "binary", evidence))
+        save(directory / "before.json", record)
+        print("ACCEPTANCE_DOCTEST_START " + json.dumps({"id": directory.name, "argv": argv}), file=sys.stderr, flush=True)
+        record.update(execute_child(argv, environment, directory))
+        record.update(executable_sha256_after=digest(original), executable_after_elf=elf_identity(original, context["elf_machine"]))
+        for field, name in (("stdout", "stdout.log"), ("stderr", "stderr.log"), ("log", "combined.log")):
+            record[field] = asset(directory / name, evidence)
+        require(record["executable_sha256_after"] == before["sha256"] == digest(directory / "binary"),
+                "Doctest executable changed during execution")
+        require(process_snapshot(parent["pid"]) == parent and process_snapshot(cargo["pid"]) == cargo,
+                "Doctest parent chain changed during execution")
+        selected_source = Path(context["source_root"]) / record["rustdoc_source"]["source_relative_path"]
+        require(digest(selected_source) == record["rustdoc_source"]["sha256"], "Rustdoc source changed during execution")
+        record["capture_passed"] = not record["forwarded_signals"]
+    except Exception as error:
+        record.update(error=type(error).__name__ + ": " + str(error), finished=time.time())
+    save(directory / "execution.json", record)
+    print("ACCEPTANCE_DOCTEST_END " + json.dumps({"id": directory.name, "capture_passed": record["capture_passed"],
+          "exit_status": record.get("exit_status")}), file=sys.stderr, flush=True)
+    status = record.get("exit_status", 125) if record["capture_passed"] else 125
+    return status if status >= 0 else 128 - status
+
+
 def cargo_parent():
     """Observe the Cargo process that actually selected this executable."""
     parent = Path("/proc") / str(os.getppid())
@@ -421,6 +563,10 @@ def run_invocation(argv, environment):
     if context["mode"] == "docker" and stem not in HARNESSES:
         # Unselected Docker tests still execute once with identical arguments.
         os.execvpe(argv[0], argv, environment)
+    # Rustdoc also uses Cargo's target runner for its temporary executables.
+    # The separate route authenticates both parents before executing anything.
+    if context["mode"] == "native" and Path(os.readlink(Path("/proc") / str(os.getppid()) / "exe")).name == "rustdoc":
+        return run_doctest(argv, environment, context_path, context)
     directory = evidence / "invocations" / uuid.uuid4().hex
     directory.mkdir(parents=True, exist_ok=False)
     record = {"schema_version": 1, "capture_id": directory.name, "capture_passed": False,
@@ -475,6 +621,13 @@ def finish_capture(evidence_root, *, task_exit_status, task_log):
         rows = [json.loads(path.read_text()) for path in paths]
         result["invocations"] = [asset(path, evidence) for path in paths]
         require(all(row["capture_passed"] for row in rows), "One or more executable captures failed")
+        doctest_paths = sorted((evidence / "doctests").glob("*/execution.json"))
+        doctest_directories = list((evidence / "doctests").glob("*"))
+        require(len(doctest_paths) == len(doctest_directories), "Incomplete doctest capture")
+        doctests = [json.loads(path.read_text()) for path in doctest_paths]
+        result["doctests"] = [asset(path, evidence) for path in doctest_paths]
+        require(context["mode"] == "native" or not doctests, "Docker capture contains doctests")
+        require(all(row["capture_passed"] for row in doctests), "One or more doctest captures failed")
         if context["mode"] == "docker":
             require({row["target_name"] for row in rows} == HARNESSES, "Missing selected Docker harness")
         else:
@@ -490,7 +643,7 @@ def finish_capture(evidence_root, *, task_exit_status, task_log):
         log = Path(task_log).resolve()
         result["task_log"] = {"original_path": str(log), "sha256": digest(log), "size": log.stat().st_size}
         result["capture_passed"] = True
-        result["passed"] = task_exit_status == 0 and all(row["exit_status"] == 0 for row in rows)
+        result["passed"] = task_exit_status == 0 and all(row["exit_status"] == 0 for row in rows + doctests)
     except Exception as error:
         result["errors"].append(type(error).__name__ + ": " + str(error))
     save(evidence / "capture-result.json", result)
