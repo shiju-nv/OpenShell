@@ -113,6 +113,7 @@ jobs:
         with:
           name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
           path: ${{ runner.temp }}/acceptance-evidence
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: error
 
@@ -312,6 +313,7 @@ jobs:
         with:
           name: evidence-${{ github.job }}-${{ strategy.job-index || '0' }}
           path: ${{ runner.temp }}/acceptance-evidence
+          include-hidden-files: true
           retention-days: 14
           if-no-files-found: error
 
