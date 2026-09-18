@@ -1952,6 +1952,13 @@ mod tests {
         mediation_failures: Arc<std::sync::atomic::AtomicUsize>,
         mediation_ready: bool,
         provider_environment_generation: u64,
+        provider_environment_script: Option<Arc<std::sync::Mutex<ProviderEnvironmentScript>>>,
+    }
+
+    #[derive(Default)]
+    struct ProviderEnvironmentScript {
+        responses: std::collections::VecDeque<Response>,
+        requests: Vec<Request>,
     }
 
     type TestGrpcStream = Pin<
@@ -1981,6 +1988,7 @@ mod tests {
             let requests = self.requests.clone();
             let mediation_ready = self.mediation_ready;
             let provider_environment_generation = self.provider_environment_generation;
+            let provider_environment_script = self.provider_environment_script.clone();
             let (outbound, outbound_rx) = tokio::sync::mpsc::channel(1);
             tokio::spawn(async move {
                 let mut frame = Vec::new();
@@ -2046,15 +2054,26 @@ mod tests {
                             }
                             Request::Terminate { .. } => Response::Terminated,
                             Request::TerminateBoundary => Response::BoundaryTerminated,
-                            Request::UpdateProviderEnvironment {
+                            request @ Request::UpdateProviderEnvironment {
                                 revision,
                                 generation,
                                 ..
-                            } => Response::ProviderEnvironmentUpdated {
-                                revision,
-                                generation: generation.max(provider_environment_generation),
-                                applied: generation > provider_environment_generation,
-                            },
+                            } => {
+                                provider_environment_script.as_ref().map_or_else(
+                                    || Response::ProviderEnvironmentUpdated {
+                                        revision,
+                                        generation: generation.max(provider_environment_generation),
+                                        applied: generation > provider_environment_generation,
+                                    },
+                                    |script| {
+                                        // Script complete responses independently of the request so
+                                        // tests can challenge each acknowledgment identity check.
+                                        let mut script = script.lock().unwrap();
+                                        script.requests.push(request);
+                                        script.responses.pop_front().expect("scripted response")
+                                    },
+                                )
+                            }
                             Request::Resize { .. } => Response::Resized,
                             Request::LoopbackConnect { .. } => Response::PortConnected,
                             Request::StartAgent {
@@ -2129,6 +2148,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            provider_environment_script: None,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2193,6 +2213,7 @@ mod tests {
                     mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     mediation_ready: false,
                     provider_environment_generation: 0,
+                    provider_environment_script: None,
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2286,6 +2307,7 @@ mod tests {
                     mediation_failures: server_failures.clone(),
                     mediation_ready: true,
                     provider_environment_generation: 0,
+                    provider_environment_script: None,
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
@@ -2340,6 +2362,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            provider_environment_script: None,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2490,6 +2513,14 @@ mod tests {
         certificate: Arc<rustls::ServerConfig>,
         expected_token: String,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_tls_boundary_with_provider_script(certificate, expected_token, None).await
+    }
+
+    async fn spawn_tls_boundary_with_provider_script(
+        certificate: Arc<rustls::ServerConfig>,
+        expected_token: String,
+        provider_environment_script: Option<Arc<std::sync::Mutex<ProviderEnvironmentScript>>>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -2500,12 +2531,25 @@ mod tests {
             else {
                 return;
             };
-            serve_test_grpc(Box::new(stream), expected_token).await;
+            serve_test_grpc_with_provider_script(
+                Box::new(stream),
+                expected_token,
+                provider_environment_script,
+            )
+            .await;
         });
         (address, task)
     }
 
     async fn serve_test_grpc(stream: BoundaryDuplexStream, expected_token: String) {
+        serve_test_grpc_with_provider_script(stream, expected_token, None).await;
+    }
+
+    async fn serve_test_grpc_with_provider_script(
+        stream: BoundaryDuplexStream,
+        expected_token: String,
+        provider_environment_script: Option<Arc<std::sync::Mutex<ProviderEnvironmentScript>>>,
+    ) {
         let service = TestGrpcBoundary {
             wait_for_half_close: false,
             expected_token,
@@ -2513,6 +2557,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            provider_environment_script,
         };
         tonic::transport::Server::builder()
             .add_service(IsolationBoundaryServer::new(service))
@@ -2833,6 +2878,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 0,
+            provider_environment_script: None,
         };
         let server = tokio::spawn(async move {
             loop {
@@ -2904,6 +2950,7 @@ mod tests {
             mediation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mediation_ready: false,
             provider_environment_generation: 50,
+            provider_environment_script: None,
         };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -2993,6 +3040,127 @@ mod tests {
         );
         server.abort();
         let _ = server.await;
+    }
+
+    // Exercise authenticated TLS and the production synchronization loop. Only the
+    // boundary responses are scripted; request contents and receipts remain observable.
+    async fn assert_provider_environment_rejection_and_repair(
+        rejected: [(u64, u64, bool); 3],
+        expected_generations: [u64; 4],
+    ) {
+        let responses = std::iter::once((6, 1, true))
+            .chain(rejected)
+            .chain(std::iter::once((6, expected_generations[3], true)))
+            .map(
+                |(revision, generation, applied)| Response::ProviderEnvironmentUpdated {
+                    revision,
+                    generation,
+                    applied,
+                },
+            )
+            .collect();
+        let script = Arc::new(std::sync::Mutex::new(ProviderEnvironmentScript {
+            responses,
+            ..Default::default()
+        }));
+        let certificate = test_certificate();
+        let (address, server) = spawn_tls_boundary_with_provider_script(
+            certificate.server_config,
+            "a".repeat(32),
+            Some(script.clone()),
+        )
+        .await;
+        let original_env = HashMap::from([("TOKEN".into(), "original".into())]);
+        let credentials =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                6,
+                original_env.clone(),
+            );
+        let exec = RemoteExec {
+            client: Arc::new(BoundaryClient::new(
+                tls_runtime_descriptor(address, certificate.client_tls),
+                test_bearer(&"a".repeat(32)),
+            )),
+            provider_credentials: credentials.clone(),
+            publication_generation: tokio::sync::Mutex::new(0),
+        };
+        let installed = exec.synchronize_provider_environment().await.unwrap();
+        assert_eq!(installed.revision, 6);
+        assert_eq!(
+            installed.installation_id,
+            credentials.snapshot().installation_id
+        );
+        assert_eq!(installed.session_id, test_session_id());
+
+        let rejected = exec.synchronize_provider_environment().await;
+        assert!(
+            matches!(rejected, Err(BackendError::Process(ref message))
+                if message == "boundary provider environment changed concurrently during reconciliation"),
+            "invalid acknowledgments must exhaust reconciliation without a receipt: {rejected:?}"
+        );
+        assert_eq!(script.lock().unwrap().requests.len(), 4);
+
+        // A failed acknowledgment must not suppress installation of a repaired
+        // map that retains its provider revision but has a new local identity.
+        let repaired_env = HashMap::from([("TOKEN".into(), "repaired".into())]);
+        credentials.install_child_env_snapshot(6, repaired_env.clone());
+        let repaired = exec.synchronize_provider_environment().await.unwrap();
+        assert_eq!(repaired.revision, installed.revision);
+        assert_ne!(repaired.installation_id, installed.installation_id);
+        assert_eq!(
+            repaired.installation_id,
+            credentials.snapshot().installation_id
+        );
+        assert_eq!(repaired.session_id, test_session_id());
+        {
+            let script = script.lock().unwrap();
+            assert!(script.responses.is_empty());
+            assert_eq!(script.requests.len(), 5);
+            for (index, generation) in std::iter::once(1).chain(expected_generations).enumerate() {
+                let expected = Request::UpdateProviderEnvironment {
+                    revision: 6,
+                    generation,
+                    provider_env: if index == 4 {
+                        repaired_env.clone()
+                    } else {
+                        original_env.clone()
+                    },
+                };
+                assert!(
+                    script.requests[index] == expected,
+                    "request {index} must preserve the exact snapshot and advance publication ordering"
+                );
+            }
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn provider_environment_rejects_wrong_revision_and_allows_same_revision_repair() {
+        assert_provider_environment_rejection_and_repair(
+            [(7, 2, true), (7, 3, true), (7, 4, true)],
+            [2, 3, 4, 5],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provider_environment_rejects_wrong_generation_and_allows_same_revision_repair() {
+        assert_provider_environment_rejection_and_repair(
+            [(6, 12, true), (6, 23, true), (6, 34, true)],
+            [2, 13, 24, 35],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provider_environment_rejects_unapplied_ack_and_allows_same_revision_repair() {
+        assert_provider_environment_rejection_and_repair(
+            [(6, 2, false), (6, 3, false), (6, 4, false)],
+            [2, 3, 4, 5],
+        )
+        .await;
     }
 
     #[tokio::test]
