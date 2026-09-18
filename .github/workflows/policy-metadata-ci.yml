@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: policy-metadata-${{ github.ref }}
+  group: policy-metadata-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        phase: [focused, broad]
+        phase: [focused]
     steps:
       - name: Check out the immutable controller
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

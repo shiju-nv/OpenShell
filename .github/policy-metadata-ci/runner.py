@@ -420,6 +420,40 @@ class Runner:
         server = self.build("candidate-server", "openshell-server")["openshell_server"]
         for index, (test, count, exact) in enumerate(SERVER_TESTS):
             self.test(f"candidate-server-{index}", server, test, count, exact)
+        self.checks(
+            [
+                ("format-workspace", ["cargo", "fmt", "--all", "--", "--check"]),
+                (
+                    "clippy-server",
+                    [
+                        "cargo",
+                        "clippy",
+                        "--locked",
+                        "-p",
+                        "openshell-server",
+                        "--all-targets",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                ),
+                (
+                    "nextest-server",
+                    [
+                        "cargo",
+                        "nextest",
+                        "run",
+                        "--locked",
+                        "--profile",
+                        "ci",
+                        "-p",
+                        "openshell-server",
+                        "--features",
+                        "test-support",
+                    ],
+                ),
+            ]
+        )
         cli = self.build("candidate-cli", "openshell-cli")
         for index, test in enumerate(CLI_TESTS):
             self.test(f"candidate-cli-json-{index}", cli["openshell_cli"], test)
@@ -626,6 +660,10 @@ class Runner:
                 ],
             ),
         ]
+        self.checks(commands)
+
+    def checks(self, commands):
+        """Retain independent failures and require actual Nextest execution."""
         failed = []
         for label, command in commands:
             row, log = self.command(label, command)

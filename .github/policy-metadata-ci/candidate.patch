@@ -1,12 +1,12 @@
 diff --git a/architecture/security-policy.md b/architecture/security-policy.md
-index 667694a1fced418f2913c4df877ded6dfbb887ca..0c62de8f9cdbaeeec666e65026f52f567b5025b8 100644
+index 667694a1fced418f2913c4df877ded6dfbb887ca..5814c98b37b96cba751348352a1b001bcaeaeafd 100644
 --- a/architecture/security-policy.md
 +++ b/architecture/security-policy.md
 @@ -225,6 +225,8 @@ supervisor polls for config revisions and attempts to load new dynamic policy
  into the in-process OPA engine; CLI reads of the latest sandbox policy use the
  same effective configuration path.
  
-+Policy history and metadata-only revision lookup remain available when a stored payload cannot be decoded or validated. Such revisions report a failed status and diagnostic, omit the policy payload, and clear the untrusted policy hash. Revision lookup enforces the same workspace or platform-administrator authorization in both metadata and full-payload modes. Full-payload reads, effective configuration and activation still require valid policy; inspecting metadata neither modifies the stored revision nor changes the active policy.
++For revisions readable from storage, policy history and metadata-only revision lookup remain available when policy decoding or validation fails. Such revisions report a failed status and diagnostic, omit the policy payload, and clear the untrusted policy hash. Storage read errors still fail before either projection. Revision lookup enforces the same workspace or platform-administrator authorization in both metadata and full-payload modes. Full-payload reads, effective configuration and activation still require valid policy; inspecting metadata neither modifies the stored revision nor changes the active policy.
 +
  The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
  
@@ -546,7 +546,7 @@ index 27cf9d63ea827c351dfaa878ab8cb7a40a493b37..397342800b0e9ed7538efccd55e598fd
  #[tokio::test]
  async fn explicit_name_takes_precedence_over_persisted() {
 diff --git a/crates/openshell-server/src/grpc/policy.rs b/crates/openshell-server/src/grpc/policy.rs
-index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e140c225b7 100644
+index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c64c75e6f5 100644
 --- a/crates/openshell-server/src/grpc/policy.rs
 +++ b/crates/openshell-server/src/grpc/policy.rs
 @@ -4271,7 +4271,9 @@ pub(super) async fn handle_get_sandbox_policy_status(
@@ -576,7 +576,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e1
              let identity_error = format!(
                  "policy revision is invalid under the current schema: {}",
                  error.message()
-@@ -8680,6 +8681,282 @@ mod tests {
+@@ -8680,6 +8681,310 @@ mod tests {
          assert!(listed.revisions[1].policy.is_none());
      }
  
@@ -589,10 +589,38 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e1
 +        sandbox.set_current_policy_version(1);
 +        state.store.put_message(&sandbox).await.unwrap();
 +
++        // Current NetworkBinary reserves tag 2, but the stored-policy legacy
++        // decoder expects a bool there. A length-delimited value keeps the
++        // current protobuf readable while making legacy decoding fail.
++        let mut legacy_binary = NetworkBinary {
++            path: "/usr/bin/true".to_string(),
++        }
++        .encode_to_vec();
++        legacy_binary.extend_from_slice(&[0x12, 0x00]);
++        let rule_key = "mcp".to_string();
++        let mut malformed_legacy = valid.clone();
++        let mut legacy_rule = malformed_legacy
++            .network_policies
++            .remove(&rule_key)
++            .unwrap()
++            .encode_to_vec();
++        prost::encoding::bytes::encode(3, &legacy_binary, &mut legacy_rule);
++        let mut rule_entry = Vec::new();
++        prost::encoding::string::encode(1, &rule_key, &mut rule_entry);
++        prost::encoding::bytes::encode(2, &legacy_rule, &mut rule_entry);
++        let mut malformed_legacy_payload = malformed_legacy.encode_to_vec();
++        prost::encoding::bytes::encode(5, &rule_entry, &mut malformed_legacy_payload);
++        let current_policy = ProtoSandboxPolicy::decode(malformed_legacy_payload.as_slice())
++            .expect("the current policy protobuf must remain readable");
++        validate_and_canonicalize_policy(current_policy)
++            .expect("the current policy remains valid without the reserved field");
++        decode_stored_policy(&malformed_legacy_payload)
++            .expect_err("the stored-policy legacy decoder must reject the wire type");
++
 +        for (version, payload) in [
 +            (1, valid.encode_to_vec()),
 +            (2, legacy_non_mcp_policy_with_mcp_options().encode_to_vec()),
-+            (3, vec![0xff]),
++            (3, malformed_legacy_payload),
 +        ] {
 +            state
 +                .store
@@ -859,7 +887,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e1
      #[tokio::test]
      async fn valid_global_policy_overrides_invalid_legacy_history() {
          let state = test_server_state().await;
-@@ -9901,17 +10178,20 @@ mod tests {
+@@ -9901,17 +10206,20 @@ mod tests {
          let mut state = test_server_state().await;
          Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
  
@@ -891,7 +919,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e1
  
          let list_error = handle_list_sandbox_policies(
              &state,
-@@ -9946,17 +10226,20 @@ mod tests {
+@@ -9946,17 +10254,20 @@ mod tests {
          .unwrap_err();
          assert_eq!(update_error.code(), Code::InvalidArgument);
  
@@ -923,7 +951,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e1
  
          let list_error = handle_list_sandbox_policies(
              &state,
-@@ -22282,21 +22565,26 @@ mod tests {
+@@ -22282,21 +22593,26 @@ mod tests {
              req
          }
  
@@ -966,20 +994,20 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e1
          let err = handle_list_sandbox_policies(
              &state,
 diff --git a/docs/sandboxes/policies.mdx b/docs/sandboxes/policies.mdx
-index a8b743b5cd6c23bfff1828df78976e4fc4c3db59..77860ac77c7e793b2df22d327684ec3f32bc1bb1 100644
+index a8b743b5cd6c23bfff1828df78976e4fc4c3db59..aefa8e8a70c3bf13d88e5a0d2a08b4f3254e47c3 100644
 --- a/docs/sandboxes/policies.mdx
 +++ b/docs/sandboxes/policies.mdx
 @@ -267,6 +267,8 @@ The following steps outline the hot-reload policy update workflow.
     Pass the returned token to `--page-token` to continue. Use
     `openshell policy list --global --output json` for global history.
  
-+   To inspect a known revision's metadata and load error directly, run `openshell policy get <name> --rev <version> --output json`, or omit `--output json` for a table. Use `openshell policy get --global --rev <version> --output json` for a global revision. These metadata views remain available when the stored policy is malformed or no longer validates: the revision reports a failed status, includes its diagnostic, and omits the payload and trusted hash. Reads with `--base` or `--full` still require a valid payload. Metadata inspection does not change the active policy.
++   To inspect a known revision's metadata and load error directly, run `openshell policy get <name> --rev <version> --output json`, or omit `--output json` for a table. Use `openshell policy get --global --rev <version> --output json` for a global revision. Like policy history, these metadata views can show a readable stored revision whose policy fails decoding or validation: the revision reports a failed status, includes its diagnostic, and omits the payload and trusted hash. Storage read errors still fail. Reads with `--base` or `--full` still require a valid payload. Metadata inspection does not change the active policy.
 +
  ### Validation failures
  
  Before starting a workload, OpenShell validates its effective policy together
 diff --git a/proto/openshell.proto b/proto/openshell.proto
-index 586b7d435fe321fcbba7abde2f7abdd547d4de38..5ae9ae99486a17bbed6d4e85cfd9491cb0e30078 100644
+index 586b7d435fe321fcbba7abde2f7abdd547d4de38..72c553d41676ad8c7336caa5255350c625630255 100644
 --- a/proto/openshell.proto
 +++ b/proto/openshell.proto
 @@ -458,7 +458,7 @@ service OpenShell {
@@ -991,18 +1019,19 @@ index 586b7d435fe321fcbba7abde2f7abdd547d4de38..5ae9ae99486a17bbed6d4e85cfd9491c
    rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
        returns (GetSandboxPolicyStatusResponse) {
      option (openshell.options.v1.authorization) = {
-@@ -2731,6 +2731,10 @@ message GetSandboxPolicyStatusRequest {
+@@ -2731,6 +2731,11 @@ message GetSandboxPolicyStatusRequest {
    // Explicit workspace scope for sandbox-scoped queries. Omit only when
    // `global` is true; the all-workspaces selection is invalid.
    openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
-+  // Omit the policy payload. Invalid stored payloads remain inspectable as
-+  // failed revisions with a load_error and no policy_hash. False requires a
-+  // valid payload and returns it, including for status-polling callers.
++  // Omit the policy payload from a readable stored revision. Like history
++  // listing, policy decoding or validation failures return failed metadata
++  // with a load_error and no policy_hash. Storage read errors still fail.
++  // False requires a valid payload and returns it, including for polling.
 +  bool metadata_only = 6;
  }
  
  // Get sandbox policy status response.
-@@ -2816,22 +2820,22 @@ message SandboxPolicyRevision {
+@@ -2816,22 +2821,22 @@ message SandboxPolicyRevision {
    reserved "created_at_ms", "loaded_at_ms";
    // Policy version (monotonically increasing per sandbox).
    uint32 version = 1;
@@ -1034,7 +1063,7 @@ index 586b7d435fe321fcbba7abde2f7abdd547d4de38..5ae9ae99486a17bbed6d4e85cfd9491c
    openshell.sandbox.v1.SandboxPolicy policy = 7;
    // Immutable provenance supplied with this policy revision.
    map<string, string> provenance = 8;
-@@ -2845,8 +2849,8 @@ enum PolicyStatus {
+@@ -2845,8 +2850,8 @@ enum PolicyStatus {
    // Sandbox successfully applied this policy version.
    POLICY_STATUS_LOADED = 2;
    // Sandbox attempted to apply but failed; LKG policy remains active.
@@ -1046,7 +1075,7 @@ index 586b7d435fe321fcbba7abde2f7abdd547d4de38..5ae9ae99486a17bbed6d4e85cfd9491c
    // A newer version was persisted before the sandbox loaded this one.
    POLICY_STATUS_SUPERSEDED = 4;
 diff --git a/sdk/go/proto/openshellv1/openshell.pb.go b/sdk/go/proto/openshellv1/openshell.pb.go
-index 319344a845e901fabdd8ab6ed238be47652257ff..a7c8dd442ef9ae27a0a9368f0b6036b0246f1884 100644
+index 319344a845e901fabdd8ab6ed238be47652257ff..fec1e2dfb6e033bbe0119df6acc703149ef0dab3 100644
 --- a/sdk/go/proto/openshellv1/openshell.pb.go
 +++ b/sdk/go/proto/openshellv1/openshell.pb.go
 @@ -736,8 +736,8 @@ const (
@@ -1060,22 +1089,23 @@ index 319344a845e901fabdd8ab6ed238be47652257ff..a7c8dd442ef9ae27a0a9368f0b6036b0
  	PolicyStatus_POLICY_STATUS_FAILED PolicyStatus = 3
  	// A newer version was persisted before the sandbox loaded this one.
  	PolicyStatus_POLICY_STATUS_SUPERSEDED PolicyStatus = 4
-@@ -11689,8 +11689,12 @@ type GetSandboxPolicyStatusRequest struct {
+@@ -11689,8 +11689,13 @@ type GetSandboxPolicyStatusRequest struct {
  	// Explicit workspace scope for sandbox-scoped queries. Omit only when
  	// `global` is true; the all-workspaces selection is invalid.
  	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 -	unknownFields  protoimpl.UnknownFields
 -	sizeCache      protoimpl.SizeCache
-+	// Omit the policy payload. Invalid stored payloads remain inspectable as
-+	// failed revisions with a load_error and no policy_hash. False requires a
-+	// valid payload and returns it, including for status-polling callers.
++	// Omit the policy payload from a readable stored revision. Like history
++	// listing, policy decoding or validation failures return failed metadata
++	// with a load_error and no policy_hash. Storage read errors still fail.
++	// False requires a valid payload and returns it, including for polling.
 +	MetadataOnly  bool `protobuf:"varint,6,opt,name=metadata_only,json=metadataOnly,proto3" json:"metadata_only,omitempty"`
 +	unknownFields protoimpl.UnknownFields
 +	sizeCache     protoimpl.SizeCache
  }
  
  func (x *GetSandboxPolicyStatusRequest) Reset() {
-@@ -11751,6 +11755,13 @@ func (x *GetSandboxPolicyStatusRequest) GetWorkspaceScope() *datamodelv1.Workspa
+@@ -11751,6 +11756,13 @@ func (x *GetSandboxPolicyStatusRequest) GetWorkspaceScope() *datamodelv1.Workspa
  	return nil
  }
  
@@ -1089,7 +1119,7 @@ index 319344a845e901fabdd8ab6ed238be47652257ff..a7c8dd442ef9ae27a0a9368f0b6036b0
  // Get sandbox policy status response.
  type GetSandboxPolicyStatusResponse struct {
  	state protoimpl.MessageState `protogen:"open.v1"`
-@@ -12251,22 +12262,22 @@ type SandboxPolicyRevision struct {
+@@ -12251,22 +12263,22 @@ type SandboxPolicyRevision struct {
  	state protoimpl.MessageState `protogen:"open.v1"`
  	// Policy version (monotonically increasing per sandbox).
  	Version uint32 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
@@ -1121,7 +1151,7 @@ index 319344a845e901fabdd8ab6ed238be47652257ff..a7c8dd442ef9ae27a0a9368f0b6036b0
  	Policy *sandboxv1.SandboxPolicy `protobuf:"bytes,7,opt,name=policy,proto3" json:"policy,omitempty"`
  	// Immutable provenance supplied with this policy revision.
  	Provenance    map[string]string `protobuf:"bytes,8,rep,name=provenance,proto3" json:"provenance,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-@@ -17942,12 +17953,13 @@ const file_openshell_proto_rawDesc = "" +
+@@ -17942,12 +17954,13 @@ const file_openshell_proto_rawDesc = "" +
  	"\vannotations\x18\x05 \x03(\v23.openshell.v1.UpdateConfigResponse.AnnotationsEntryR\vannotations\x1a>\n" +
  	"\x10AnnotationsEntry\x12\x10\n" +
  	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
@@ -1160,14 +1190,14 @@ index 0609450c893ca0f07d0f6c956b5083099fd969b0..6b017031f1f84e3da9034de76d2fcc1a
  	// List policy history for a sandbox.
  	ListSandboxPolicies(context.Context, *ListSandboxPoliciesRequest) (*ListSandboxPoliciesResponse, error)
 diff --git a/skills/openshell-cli/SKILL.md b/skills/openshell-cli/SKILL.md
-index 057874fa3a4c2d25dd4b884bc5732166cdc7de14..dabfd2f30b5ca2d04c1c16257faf6b72670e94eb 100644
+index 057874fa3a4c2d25dd4b884bc5732166cdc7de14..4fe56b9f34c34af6c3a8eacdd60f23335c56c1d2 100644
 --- a/skills/openshell-cli/SKILL.md
 +++ b/skills/openshell-cli/SKILL.md
 @@ -587,6 +587,8 @@ Fetch a specific historical revision:
  openshell policy get dev --rev 3 --full
  ```
  
-+If a stored revision cannot be decoded or validated, omit `--full` and `--base` to inspect its metadata and load error, for example `openshell policy get dev --rev 3 --output json`. A failed metadata result does not contain a policy payload or trusted hash and does not change which revision is active. Repair and validate the policy before submitting a replacement.
++If policy decoding or validation fails for a readable stored revision, omit `--full` and `--base` to inspect its metadata and load error, for example `openshell policy get dev --rev 3 --output json`. As with history listing, storage read errors still fail. A failed metadata result does not contain a policy payload or trusted hash and does not change which revision is active. Repair and validate the policy before submitting a replacement.
 +
  Gateway-global policy commands use `--global` and require confirmation unless `--yes` is supplied:
  
