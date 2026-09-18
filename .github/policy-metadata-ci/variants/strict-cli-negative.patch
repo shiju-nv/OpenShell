@@ -1,0 +1,20 @@
+--- a/crates/openshell-cli/src/run.rs
++++ b/crates/openshell-cli/src/run.rs
+@@ -5240,7 +5240,7 @@
+             version,
+             global: false,
+             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+-            metadata_only: view == PolicyGetView::Metadata,
++            metadata_only: false,
+         })
+         .await
+         .into_diagnostic()?;
+@@ -5493,7 +5493,7 @@
+             workspace_scope: None,
+             // Metadata-only inspection applies to explicit revisions; current
+             // global reads must still materialize usable policy.
+-            metadata_only: version > 0 && view == PolicyGetView::Metadata,
++            metadata_only: false,
+         })
+         .await
+         .into_diagnostic()?;

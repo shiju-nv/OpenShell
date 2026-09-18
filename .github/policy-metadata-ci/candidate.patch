@@ -1,0 +1,1174 @@
+diff --git a/architecture/security-policy.md b/architecture/security-policy.md
+index 667694a1fced418f2913c4df877ded6dfbb887ca..0c62de8f9cdbaeeec666e65026f52f567b5025b8 100644
+--- a/architecture/security-policy.md
++++ b/architecture/security-policy.md
+@@ -225,6 +225,8 @@ supervisor polls for config revisions and attempts to load new dynamic policy
+ into the in-process OPA engine; CLI reads of the latest sandbox policy use the
+ same effective configuration path.
+ 
++Policy history and metadata-only revision lookup remain available when a stored payload cannot be decoded or validated. Such revisions report a failed status and diagnostic, omit the policy payload, and clear the untrusted policy hash. Revision lookup enforces the same workspace or platform-administrator authorization in both metadata and full-payload modes. Full-payload reads, effective configuration and activation still require valid policy; inspecting metadata neither modifies the stored revision nor changes the active policy.
++
+ The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
+ 
+ After validating L7 rules, the OPA loader converts nonempty string query and MCP parameter matchers into explicit `glob` objects, including MCP `tool` aliases and deny rules. Matchers representable in both YAML and protobuf therefore expose the same representation to endpoint configuration consumers. Already lowered `glob` and `any` matchers retain their values across reloads; normalization preserves runtime endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
+diff --git a/crates/openshell-cli/src/run.rs b/crates/openshell-cli/src/run.rs
+index 098c52c1cfc687f1d66e4c29b7d053f810d05f10..0ba6cbab76502b6ff677039aa286592b3654c20b 100644
+--- a/crates/openshell-cli/src/run.rs
++++ b/crates/openshell-cli/src/run.rs
+@@ -4887,6 +4887,7 @@ pub async fn sandbox_policy_set(
+             version: 0,
+             global: false,
+             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
++            metadata_only: false,
+         })
+         .await
+         .ok()
+@@ -4946,6 +4947,7 @@ pub async fn sandbox_policy_set(
+                 version: resp.version,
+                 global: false,
+                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
++                metadata_only: false,
+             })
+             .await
+             .into_diagnostic()?;
+@@ -5125,6 +5127,7 @@ pub async fn sandbox_policy_update(
+                 version: response.version,
+                 global: false,
+                 workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
++                metadata_only: false,
+             })
+             .await
+             .into_diagnostic()?;
+@@ -5166,6 +5169,10 @@ pub async fn sandbox_policy_update(
+     }
+ }
+ 
++// Human revision details bound diagnostic text by Unicode scalars; JSON keeps
++// the complete diagnostic for callers that need to inspect the stored failure.
++const POLICY_REVISION_ERROR_MAX_CHARS: usize = 256;
++
+ pub async fn sandbox_policy_get(
+     server: &str,
+     name: &str,
+@@ -5233,6 +5240,7 @@ where
+             version,
+             global: false,
+             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
++            metadata_only: view == PolicyGetView::Metadata,
+         })
+         .await
+         .into_diagnostic()?;
+@@ -5283,7 +5291,12 @@ where
+             .into_diagnostic()?;
+         }
+         if !rev.load_error.is_empty() {
+-            writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
++            writeln!(
++                stdout,
++                "Error:        {}",
++                truncate_status_field(&rev.load_error, POLICY_REVISION_ERROR_MAX_CHARS)
++            )
++            .into_diagnostic()?;
+         }
+ 
+         if view.includes_policy() {
+@@ -5426,9 +5439,50 @@ pub async fn sandbox_policy_get_global(
+     version: u32,
+     view: PolicyGetView,
+     output: &str,
+-    _workspace: &str,
++    workspace: &str,
+     tls: &TlsOptions,
+ ) -> Result<()> {
++    let mut stdout = Vec::new();
++    let mut stderr = Vec::new();
++    sandbox_policy_get_global_to_writer(
++        server,
++        version,
++        view,
++        output,
++        workspace,
++        tls,
++        (&mut stdout, &mut stderr),
++    )
++    .await?;
++
++    {
++        let mut terminal_stdout = std::io::stdout().lock();
++        terminal_stdout.write_all(&stdout).into_diagnostic()?;
++    }
++    {
++        let mut terminal_stderr = std::io::stderr().lock();
++        terminal_stderr.write_all(&stderr).into_diagnostic()?;
++    }
++
++    Ok(())
++}
++
++/// Write global policy revision output and diagnostics to the supplied writers.
++#[doc(hidden)]
++pub async fn sandbox_policy_get_global_to_writer<W, E>(
++    server: &str,
++    version: u32,
++    view: PolicyGetView,
++    output: &str,
++    _workspace: &str,
++    tls: &TlsOptions,
++    writers: (&mut W, &mut E),
++) -> Result<()>
++where
++    W: Write + Send,
++    E: Write + Send,
++{
++    let (stdout, stderr) = writers;
+     let mut client = grpc_client(server, tls).await?;
+ 
+     let status_resp = client
+@@ -5437,6 +5491,9 @@ pub async fn sandbox_policy_get_global(
+             version,
+             global: true,
+             workspace_scope: None,
++            // Metadata-only inspection applies to explicit revisions; current
++            // global reads must still materialize usable policy.
++            metadata_only: version > 0 && view == PolicyGetView::Metadata,
+         })
+         .await
+         .into_diagnostic()?;
+@@ -5447,40 +5504,61 @@ pub async fn sandbox_policy_get_global(
+         match output {
+             "json" => {
+                 let obj = policy_revision_to_json("global", None, None, &rev, status, view)?;
+-                println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
++                writeln!(
++                    stdout,
++                    "{}",
++                    serde_json::to_string_pretty(&obj).into_diagnostic()?
++                )
++                .into_diagnostic()?;
+                 return Ok(());
+             }
+             "table" => {}
+             _ => return Err(miette!("unsupported output format: {output}")),
+         }
+ 
+-        println!("Scope:        global");
+-        println!("Version:      {}", rev.version);
+-        println!("Hash:         {}", rev.policy_hash);
+-        println!("Status:       {status:?}");
++        writeln!(stdout, "Scope:        global").into_diagnostic()?;
++        writeln!(stdout, "Version:      {}", rev.version).into_diagnostic()?;
++        writeln!(stdout, "Hash:         {}", rev.policy_hash).into_diagnostic()?;
++        writeln!(stdout, "Status:       {status:?}").into_diagnostic()?;
+         if let Some(created_time) = rev.created_time.as_ref() {
+-            println!(
++            writeln!(
++                stdout,
+                 "Created:      {} ms",
+                 proto_timestamp_ms(Some(created_time))
+-            );
++            )
++            .into_diagnostic()?;
+         }
+         if let Some(loaded_time) = rev.loaded_time.as_ref() {
+-            println!("Loaded:       {} ms", proto_timestamp_ms(Some(loaded_time)));
++            writeln!(
++                stdout,
++                "Loaded:       {} ms",
++                proto_timestamp_ms(Some(loaded_time))
++            )
++            .into_diagnostic()?;
++        }
++        if !rev.load_error.is_empty() {
++            writeln!(
++                stdout,
++                "Error:        {}",
++                truncate_status_field(&rev.load_error, POLICY_REVISION_ERROR_MAX_CHARS)
++            )
++            .into_diagnostic()?;
+         }
+ 
+         if view.includes_policy() {
+             if let Some(ref policy) = rev.policy {
+-                println!("---");
++                writeln!(stdout, "---").into_diagnostic()?;
+                 let policy = policy_for_view(policy, view);
+                 let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
+                     .wrap_err("failed to serialize policy to YAML")?;
+-                print!("{yaml_str}");
++                write!(stdout, "{yaml_str}").into_diagnostic()?;
+             } else {
+-                eprintln!("Policy payload not available for this version");
++                writeln!(stderr, "Policy payload not available for this version")
++                    .into_diagnostic()?;
+             }
+         }
+     } else {
+-        eprintln!("No global policy history found");
++        writeln!(stderr, "No global policy history found").into_diagnostic()?;
+     }
+ 
+     Ok(())
+diff --git a/crates/openshell-cli/tests/sandbox_name_fallback_integration.rs b/crates/openshell-cli/tests/sandbox_name_fallback_integration.rs
+index 27cf9d63ea827c351dfaa878ab8cb7a40a493b37..397342800b0e9ed7538efccd55e598fdd51df966 100644
+--- a/crates/openshell-cli/tests/sandbox_name_fallback_integration.rs
++++ b/crates/openshell-cli/tests/sandbox_name_fallback_integration.rs
+@@ -34,10 +34,12 @@ use tonic::{Response, Status};
+ 
+ // ── mock OpenShell server ─────────────────────────────────────────────
+ 
+-/// Records which sandbox name was requested via `get_sandbox`.
++/// Records sandbox lookups and policy status requests received by the fixture.
+ #[derive(Clone, Default)]
+ struct SandboxState {
+     last_get_name: Arc<Mutex<Option<String>>>,
++    policy_status_requests: Arc<Mutex<Vec<GetSandboxPolicyStatusRequest>>>,
++    policy_load_error: Arc<Mutex<Option<String>>>,
+ }
+ 
+ #[derive(Clone, Default)]
+@@ -472,9 +474,16 @@ impl OpenShell for TestOpenShell {
+ 
+     async fn update_config(
+         &self,
+-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
++        request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+     ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
+-        Err(Status::unimplemented("not implemented in test"))
++        let req = request.into_inner();
++        assert_eq!(req.name, "my-sandbox");
++        assert!(req.policy.is_some() || !req.merge_operations.is_empty());
++        Ok(Response::new(openshell_core::proto::UpdateConfigResponse {
++            version: 4,
++            policy_hash: "sha256:updated-policy".to_string(),
++            ..Default::default()
++        }))
+     }
+ 
+     async fn get_sandbox_policy_status(
+@@ -482,9 +491,23 @@ impl OpenShell for TestOpenShell {
+         request: tonic::Request<GetSandboxPolicyStatusRequest>,
+     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+         let req = request.into_inner();
+-        assert_eq!(req.name, "my-sandbox");
+-        assert_eq!(req.version, 3);
+-        assert!(!req.global);
++        self.state
++            .policy_status_requests
++            .lock()
++            .await
++            .push(req.clone());
++        if req.global {
++            assert!(req.name.is_empty());
++            assert!(req.workspace_scope.is_none());
++        } else {
++            assert_eq!(req.name, "my-sandbox");
++        }
++        let load_error = self.state.policy_load_error.lock().await.clone();
++        if load_error.is_some() && !req.metadata_only {
++            return Err(Status::failed_precondition(
++                "stored policy cannot be materialized",
++            ));
++        }
+ 
+         let policy = SandboxPolicy {
+             version: 1,
+@@ -509,12 +532,21 @@ impl OpenShell for TestOpenShell {
+ 
+         Ok(Response::new(GetSandboxPolicyStatusResponse {
+             revision: Some(SandboxPolicyRevision {
+-                version: 7,
+-                policy_hash: "sha256:test-policy".to_string(),
+-                status: PolicyStatus::Loaded.into(),
++                version: if req.version == 0 { 7 } else { req.version },
++                policy_hash: if load_error.is_some() {
++                    String::new()
++                } else {
++                    "sha256:test-policy".to_string()
++                },
++                status: if load_error.is_some() {
++                    PolicyStatus::Failed.into()
++                } else {
++                    PolicyStatus::Loaded.into()
++                },
+                 created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                 loaded_time: openshell_core::time::timestamp_from_millis(1_700_000_000_500).ok(),
+-                policy: Some(policy),
++                policy: (!req.metadata_only).then_some(policy),
++                load_error: load_error.unwrap_or_default(),
+                 ..Default::default()
+             }),
+             active_version: 7,
+@@ -963,7 +995,7 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
+         serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+     assert_eq!(json["scope"], "sandbox");
+     assert_eq!(json["sandbox"], "my-sandbox");
+-    assert_eq!(json["version"], 7);
++    assert_eq!(json["version"], 3);
+     assert_eq!(json["active_version"], 7);
+     assert_eq!(json["hash"], "sha256:test-policy");
+     assert_eq!(json["status"], "loaded");
+@@ -974,6 +1006,237 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
+     );
+ }
+ 
++async fn policy_revision_output(
++    ts: &TestServer,
++    global: bool,
++    version: u32,
++    view: run::PolicyGetView,
++    output: &str,
++) -> miette::Result<(Vec<u8>, Vec<u8>)> {
++    let mut stdout = Vec::new();
++    let mut stderr = Vec::new();
++    if global {
++        run::sandbox_policy_get_global_to_writer(
++            &ts.endpoint,
++            version,
++            view,
++            output,
++            "default",
++            &ts.tls,
++            (&mut stdout, &mut stderr),
++        )
++        .await?;
++    } else {
++        run::sandbox_policy_get_to_writer(
++            &ts.endpoint,
++            "my-sandbox",
++            version,
++            view,
++            output,
++            "default",
++            &ts.tls,
++            (&mut stdout, &mut stderr),
++        )
++        .await?;
++    }
++    Ok((stdout, stderr))
++}
++
++#[tokio::test]
++async fn policy_revision_metadata_rpc_modes_cover_both_scopes_and_views() {
++    let ts = run_server().await;
++    let mut expected_requests = Vec::new();
++    for global in [false, true] {
++        for (view, metadata_only) in [
++            (run::PolicyGetView::Metadata, true),
++            (run::PolicyGetView::Base, false),
++            (run::PolicyGetView::Full, false),
++        ] {
++            let (stdout, stderr) = policy_revision_output(&ts, global, 3, view, "json")
++                .await
++                .expect("explicit revision should be available");
++            assert!(stderr.is_empty());
++            let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
++            assert_eq!(json["version"], 3);
++            assert_eq!(json.get("policy").is_none(), metadata_only);
++            expected_requests.push((global, 3, metadata_only));
++        }
++    }
++
++    // Reading the current global policy still requires strict materialization.
++    policy_revision_output(&ts, true, 0, run::PolicyGetView::Metadata, "json")
++        .await
++        .expect("current global policy should remain available");
++    expected_requests.push((true, 0, false));
++
++    // Current sandbox policy reads retain the effective-config RPC path.
++    let (stdout, stderr) =
++        policy_revision_output(&ts, false, 0, run::PolicyGetView::Metadata, "json")
++            .await
++            .expect("effective sandbox policy should remain available");
++    assert!(stderr.is_empty());
++    let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
++    assert_eq!(json["version"], 9);
++    assert_eq!(json["status"], "effective");
++
++    let requests = ts.openshell.state.policy_status_requests.lock().await;
++    let actual: Vec<_> = requests
++        .iter()
++        .map(|request| (request.global, request.version, request.metadata_only))
++        .collect();
++    assert_eq!(actual, expected_requests);
++}
++
++#[tokio::test]
++async fn policy_revision_metadata_invalid_revision_preserves_json_and_bounds_table() {
++    let ts = run_server().await;
++    let boundary = format!("{}é", "a".repeat(255));
++    for (diagnostic, displayed) in [
++        (
++            "unsupported revision café/非常に長いパス".to_string(),
++            "unsupported revision café/非常に長いパス".to_string(),
++        ),
++        (boundary.clone(), boundary.clone()),
++        (
++            format!("{boundary}{}", "長".repeat(512)),
++            format!("{boundary}..."),
++        ),
++    ] {
++        *ts.openshell.state.policy_load_error.lock().await = Some(diagnostic.clone());
++        for global in [false, true] {
++            let (stdout, stderr) =
++                policy_revision_output(&ts, global, 3, run::PolicyGetView::Metadata, "json")
++                    .await
++                    .expect("invalid revision metadata should be readable");
++            assert!(stderr.is_empty());
++            let json: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
++            assert_eq!(json["scope"], if global { "global" } else { "sandbox" });
++            assert_eq!(json["version"], 3);
++            assert_eq!(json["hash"], "");
++            assert_eq!(json["status"], "failed");
++            assert_eq!(json["created_at_ms"], 1_700_000_000_000_i64);
++            assert_eq!(json["loaded_at_ms"], 1_700_000_000_500_i64);
++            assert_eq!(json["load_error"], diagnostic);
++            assert!(json.get("policy").is_none());
++            if global {
++                assert!(json.get("active_version").is_none());
++                assert!(json.get("sandbox").is_none());
++            } else {
++                assert_eq!(json["sandbox"], "my-sandbox");
++                assert_eq!(json["active_version"], 7);
++            }
++
++            let (stdout, stderr) =
++                policy_revision_output(&ts, global, 3, run::PolicyGetView::Metadata, "table")
++                    .await
++                    .expect("invalid revision detail table should be readable");
++            assert!(stderr.is_empty());
++            let table = String::from_utf8(stdout).expect("table must remain valid UTF-8");
++            assert!(table.contains("Version:      3\n"));
++            assert!(table.contains("Status:       Failed\n"));
++            assert!(table.contains(&format!("Error:        {displayed}\n")));
++            assert!(!table.contains("---"));
++            let error = table
++                .lines()
++                .find_map(|line| line.strip_prefix("Error:        "))
++                .expect("both scopes display the load error");
++            assert!(error.chars().count() <= 259);
++            if global {
++                assert!(table.contains("Scope:        global\n"));
++            } else {
++                assert!(table.contains("Active:       7\n"));
++            }
++        }
++    }
++    assert!(
++        ts.openshell
++            .state
++            .policy_status_requests
++            .lock()
++            .await
++            .iter()
++            .all(|request| request.metadata_only)
++    );
++}
++
++#[tokio::test]
++async fn policy_revision_metadata_payload_views_propagate_strict_errors() {
++    let ts = run_server().await;
++    *ts.openshell.state.policy_load_error.lock().await = Some("invalid stored policy".into());
++    for global in [false, true] {
++        for view in [run::PolicyGetView::Base, run::PolicyGetView::Full] {
++            let error = policy_revision_output(&ts, global, 3, view, "json")
++                .await
++                .expect_err("payload requests must retain materialization failures");
++            assert!(
++                error
++                    .to_string()
++                    .contains("stored policy cannot be materialized")
++            );
++        }
++    }
++    let requests = ts.openshell.state.policy_status_requests.lock().await;
++    assert_eq!(
++        requests.len(),
++        4,
++        "strict failures must not trigger a metadata retry"
++    );
++    assert!(requests.iter().all(|request| !request.metadata_only));
++}
++
++#[tokio::test]
++async fn policy_revision_metadata_set_and_update_polling_remain_strict() {
++    let ts = run_server().await;
++    let policy_dir = tempfile::tempdir().unwrap();
++    let policy_path = policy_dir.path().join("policy.yaml");
++    let policy =
++        openshell_policy::serialize_sandbox_policy(&openshell_policy::restrictive_default_policy())
++            .expect("serialize test policy");
++    std::fs::write(&policy_path, policy).unwrap();
++
++    run::sandbox_policy_set(
++        &ts.endpoint,
++        "my-sandbox",
++        policy_path.to_str().unwrap(),
++        true,
++        10,
++        "default",
++        &ts.tls,
++    )
++    .await
++    .expect("set should poll the submitted revision");
++    run::sandbox_policy_update(
++        &ts.endpoint,
++        "my-sandbox",
++        &["new.example.com:443".to_string()],
++        &[],
++        &[],
++        &[],
++        &[],
++        &[],
++        None,
++        false,
++        None,
++        false,
++        true,
++        10,
++        "default",
++        &ts.tls,
++    )
++    .await
++    .expect("update should poll the submitted revision");
++
++    let requests = ts.openshell.state.policy_status_requests.lock().await;
++    let actual: Vec<_> = requests
++        .iter()
++        .map(|request| (request.version, request.global, request.metadata_only))
++        .collect();
++    assert_eq!(
++        actual,
++        [(0, false, false), (4, false, false), (4, false, false)]
++    );
++}
++
+ /// Verify that an explicit name takes precedence over the persisted one.
+ #[tokio::test]
+ async fn explicit_name_takes_precedence_over_persisted() {
+diff --git a/crates/openshell-server/src/grpc/policy.rs b/crates/openshell-server/src/grpc/policy.rs
+index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..ad69024623922cfe0f2f08698e9135e140c225b7 100644
+--- a/crates/openshell-server/src/grpc/policy.rs
++++ b/crates/openshell-server/src/grpc/policy.rs
+@@ -4271,7 +4271,9 @@ pub(super) async fn handle_get_sandbox_policy_status(
+     let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
+ 
+     Ok(Response::new(GetSandboxPolicyStatusResponse {
+-        revision: Some(policy_record_to_revision(&record, true)?),
++        // Metadata remains available for repair without exporting an invalid policy.
++        // Full-policy responses still reject invalid stored payloads.
++        revision: Some(policy_record_to_revision(&record, !req.metadata_only)?),
+         active_version,
+     }))
+ }
+@@ -6439,11 +6441,10 @@ fn policy_record_to_revision(
+             provenance: record.provenance.clone(),
+         }),
+         Err(error) if !include_policy => {
+-            // History listing is a recovery surface, not an enforcement path.
+-            // Preserve row metadata so one legacy or damaged payload cannot
+-            // hide every usable revision in the page, but blank the untrusted
+-            // hash and mark the projection failed. Detail and runtime callers
+-            // still receive the hard error through the branch below.
++            // Metadata-only reads are a recovery surface, not an enforcement path.
++            // Preserve revision metadata for legacy or damaged payloads, but
++            // blank the untrusted hash and mark the projection failed. Full-policy
++            // and runtime callers still receive the hard error below.
+             let identity_error = format!(
+                 "policy revision is invalid under the current schema: {}",
+                 error.message()
+@@ -8680,6 +8681,282 @@ mod tests {
+         assert!(listed.revisions[1].policy.is_none());
+     }
+ 
++    #[tokio::test]
++    async fn get_sandbox_policy_status_metadata_preserves_invalid_revision_details() {
++        let state = test_server_state().await;
++        let sandbox_id = "metadata-invalid-history";
++        let valid = mcp_policy_with_versions(&["2025-11-25"]);
++        let mut sandbox = test_sandbox(sandbox_id, sandbox_id, valid.clone(), Vec::new());
++        sandbox.set_current_policy_version(1);
++        state.store.put_message(&sandbox).await.unwrap();
++
++        for (version, payload) in [
++            (1, valid.encode_to_vec()),
++            (2, legacy_non_mcp_policy_with_mcp_options().encode_to_vec()),
++            (3, vec![0xff]),
++        ] {
++            state
++                .store
++                .put_policy_revision(
++                    &format!("{sandbox_id}-{version}"),
++                    sandbox_id,
++                    "default",
++                    version,
++                    &payload,
++                    "untrusted-stored-hash",
++                )
++                .await
++                .unwrap();
++        }
++
++        for (version, expected_code) in [(2, Code::FailedPrecondition), (3, Code::Internal)] {
++            // A stored loaded status must not make an invalid payload exportable.
++            state
++                .store
++                .update_policy_status(
++                    sandbox_id,
++                    version,
++                    "loaded",
++                    Some("retained load diagnostic"),
++                    Some(1_000_000),
++                )
++                .await
++                .unwrap();
++            let stored = state
++                .store
++                .get_policy_by_version(sandbox_id, version)
++                .await
++                .unwrap()
++                .unwrap();
++            let request = GetSandboxPolicyStatusRequest {
++                name: sandbox_id.to_string(),
++                version: u32::try_from(version).unwrap(),
++                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
++                ..Default::default()
++            };
++            let error =
++                handle_get_sandbox_policy_status(&state, with_user(Request::new(request.clone())))
++                    .await
++                    .expect_err("full-policy reads must reject invalid stored payloads");
++            assert_eq!(error.code(), expected_code);
++
++            let response = handle_get_sandbox_policy_status(
++                &state,
++                with_user(Request::new(GetSandboxPolicyStatusRequest {
++                    metadata_only: true,
++                    ..request
++                })),
++            )
++            .await
++            .expect("invalid revisions must remain inspectable as metadata")
++            .into_inner();
++            assert_eq!(response.active_version, 1);
++            let revision = response.revision.unwrap();
++            assert_eq!(revision.version, u32::try_from(version).unwrap());
++            assert_eq!(revision.status, PolicyStatus::Failed as i32);
++            assert!(revision.policy.is_none());
++            assert!(revision.policy_hash.is_empty());
++            assert!(
++                revision
++                    .load_error
++                    .starts_with("retained load diagnostic; ")
++            );
++            assert!(revision.load_error.contains(error.message()));
++            assert_eq!(
++                revision.created_time,
++                openshell_core::time::timestamp_from_millis(stored.created_at_ms).ok()
++            );
++            assert_eq!(
++                revision.loaded_time,
++                openshell_core::time::timestamp_from_millis(1_000_000).ok()
++            );
++            assert_eq!(revision.provenance, stored.provenance);
++            let unchanged = state
++                .store
++                .get_policy_by_version(sandbox_id, version)
++                .await
++                .unwrap()
++                .unwrap();
++            assert_eq!(unchanged.status, "loaded");
++            assert_eq!(unchanged.policy_hash, "untrusted-stored-hash");
++            assert_eq!(unchanged.policy_payload, stored.policy_payload);
++        }
++    }
++
++    #[tokio::test]
++    async fn get_sandbox_policy_status_metadata_preserves_valid_revision_identity() {
++        use openshell_core::proto::{WorkspaceMember, WorkspaceRole};
++
++        let mut state = test_server_state().await;
++        Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
++        state
++            .store
++            .put_message(&WorkspaceMember {
++                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
++                    id: "metadata-policy-reader".to_string(),
++                    name: "test-user".to_string(),
++                    workspace: "default".to_string(),
++                    ..Default::default()
++                }),
++                principal_subject: "test-user".to_string(),
++                role: WorkspaceRole::User.into(),
++            })
++            .await
++            .unwrap();
++        let policy = validate_and_canonicalize_policy(mcp_policy_with_versions(&[])).unwrap();
++        let hash = deterministic_policy_hash(&policy);
++        let sandbox_id = "metadata-valid-history";
++        let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy.clone(), Vec::new());
++        sandbox.set_current_policy_version(1);
++        state.store.put_message(&sandbox).await.unwrap();
++
++        for global in [false, true] {
++            let policy_id = if global {
++                GLOBAL_POLICY_SANDBOX_ID
++            } else {
++                sandbox_id
++            };
++            for version in [1, 2] {
++                state
++                    .store
++                    .put_policy_revision(
++                        &format!("{policy_id}-{version}"),
++                        policy_id,
++                        if global { "" } else { "default" },
++                        version,
++                        &policy.encode_to_vec(),
++                        "stale-stored-hash",
++                    )
++                    .await
++                    .unwrap();
++            }
++            state
++                .store
++                .update_policy_status(policy_id, 1, "loaded", None, Some(1_000_000))
++                .await
++                .unwrap();
++
++            for (requested_version, expected_version) in [(1, 1), (2, 2), (0, 2)] {
++                let mut responses = Vec::new();
++                for metadata_only in [false, true] {
++                    let request = GetSandboxPolicyStatusRequest {
++                        name: if global {
++                            String::new()
++                        } else {
++                            sandbox_id.to_string()
++                        },
++                        version: requested_version,
++                        global,
++                        workspace_scope: (!global)
++                            .then(|| openshell_core::proto::workspace_selector("default")),
++                        metadata_only,
++                        ..Default::default()
++                    };
++                    let request = if global {
++                        authed_request(request)
++                    } else {
++                        with_user(Request::new(request))
++                    };
++                    responses.push(
++                        handle_get_sandbox_policy_status(&state, request)
++                            .await
++                            .unwrap()
++                            .into_inner(),
++                    );
++                }
++                let mut full = responses.remove(0);
++                assert_eq!(full.active_version, if global { 0 } else { 1 });
++                let revision = full.revision.as_mut().unwrap();
++                assert_eq!(revision.version, expected_version);
++                assert_eq!(revision.policy_hash, hash);
++                assert_eq!(revision.policy.take(), Some(policy.clone()));
++                assert_eq!(
++                    revision.status,
++                    if expected_version == 1 {
++                        PolicyStatus::Loaded
++                    } else {
++                        PolicyStatus::Pending
++                    } as i32
++                );
++                assert!(revision.load_error.is_empty());
++                assert_eq!(responses.remove(0), full);
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn get_sandbox_policy_status_metadata_preserves_not_found_errors() {
++        let state = test_server_state().await;
++        state
++            .store
++            .put_message(&test_sandbox(
++                "metadata-no-history",
++                "metadata-no-history",
++                openshell_policy::restrictive_default_policy(),
++                Vec::new(),
++            ))
++            .await
++            .unwrap();
++        for (name, global, message) in [
++            ("missing-sandbox", false, "sandbox not found"),
++            (
++                "metadata-no-history",
++                false,
++                "no policy revision found for this sandbox",
++            ),
++            ("", true, "no global policy revision found"),
++        ] {
++            for version in [0, 99] {
++                for metadata_only in [false, true] {
++                    let error = handle_get_sandbox_policy_status(
++                        &state,
++                        authed_request(GetSandboxPolicyStatusRequest {
++                            name: name.to_string(),
++                            version,
++                            global,
++                            workspace_scope: (!global)
++                                .then(|| openshell_core::proto::workspace_selector("default")),
++                            metadata_only,
++                            ..Default::default()
++                        }),
++                    )
++                    .await
++                    .unwrap_err();
++                    assert_eq!(error.code(), Code::NotFound);
++                    assert_eq!(error.message(), message);
++                }
++            }
++        }
++
++        state
++            .store
++            .put_policy_revision(
++                "metadata-existing-revision",
++                "metadata-no-history",
++                "default",
++                1,
++                &openshell_policy::restrictive_default_policy().encode_to_vec(),
++                "stored-hash",
++            )
++            .await
++            .unwrap();
++        for metadata_only in [false, true] {
++            let error = handle_get_sandbox_policy_status(
++                &state,
++                authed_request(GetSandboxPolicyStatusRequest {
++                    name: "metadata-no-history".to_string(),
++                    version: 99,
++                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
++                    metadata_only,
++                    ..Default::default()
++                }),
++            )
++            .await
++            .expect_err("a missing explicit revision must not fall back to the latest");
++            assert_eq!(error.code(), Code::NotFound);
++        }
++    }
++
+     #[tokio::test]
+     async fn valid_global_policy_overrides_invalid_legacy_history() {
+         let state = test_server_state().await;
+@@ -9901,17 +10178,20 @@ mod tests {
+         let mut state = test_server_state().await;
+         Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
+ 
+-        let get_error = handle_get_sandbox_policy_status(
+-            &state,
+-            with_user(Request::new(GetSandboxPolicyStatusRequest {
+-                global: true,
+-                ..GetSandboxPolicyStatusRequest::default()
+-            })),
+-        )
+-        .await
+-        .unwrap_err();
+-        assert_eq!(get_error.code(), Code::PermissionDenied);
+-        assert!(get_error.message().contains("platform admin role required"));
++        for metadata_only in [false, true] {
++            let get_error = handle_get_sandbox_policy_status(
++                &state,
++                with_user(Request::new(GetSandboxPolicyStatusRequest {
++                    global: true,
++                    metadata_only,
++                    ..GetSandboxPolicyStatusRequest::default()
++                })),
++            )
++            .await
++            .unwrap_err();
++            assert_eq!(get_error.code(), Code::PermissionDenied);
++            assert!(get_error.message().contains("platform admin role required"));
++        }
+ 
+         let list_error = handle_list_sandbox_policies(
+             &state,
+@@ -9946,17 +10226,20 @@ mod tests {
+         .unwrap_err();
+         assert_eq!(update_error.code(), Code::InvalidArgument);
+ 
+-        let get_error = handle_get_sandbox_policy_status(
+-            &state,
+-            authed_request(GetSandboxPolicyStatusRequest {
+-                global: true,
+-                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+-                ..Default::default()
+-            }),
+-        )
+-        .await
+-        .unwrap_err();
+-        assert_eq!(get_error.code(), Code::InvalidArgument);
++        for metadata_only in [false, true] {
++            let get_error = handle_get_sandbox_policy_status(
++                &state,
++                authed_request(GetSandboxPolicyStatusRequest {
++                    global: true,
++                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
++                    metadata_only,
++                    ..Default::default()
++                }),
++            )
++            .await
++            .unwrap_err();
++            assert_eq!(get_error.code(), Code::InvalidArgument);
++        }
+ 
+         let list_error = handle_list_sandbox_policies(
+             &state,
+@@ -22282,21 +22565,26 @@ mod tests {
+             req
+         }
+ 
+-        let err = handle_get_sandbox_policy_status(
+-            &state,
+-            non_member_request(GetSandboxPolicyStatusRequest {
+-                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
+-                ..Default::default()
+-            }),
+-        )
+-        .await
+-        .unwrap_err();
+-        assert_eq!(
+-            err.code(),
+-            Code::PermissionDenied,
+-            "handle_get_sandbox_policy_status should return PermissionDenied, got {:?}",
+-            err.code()
+-        );
++        for workspace in ["default", "no-such-ws"] {
++            for metadata_only in [false, true] {
++                let err = handle_get_sandbox_policy_status(
++                    &state,
++                    non_member_request(GetSandboxPolicyStatusRequest {
++                        workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
++                        metadata_only,
++                        ..Default::default()
++                    }),
++                )
++                .await
++                .unwrap_err();
++                assert_eq!(
++                    err.code(),
++                    Code::PermissionDenied,
++                    "handle_get_sandbox_policy_status should return PermissionDenied, got {:?}",
++                    err.code()
++                );
++            }
++        }
+ 
+         let err = handle_list_sandbox_policies(
+             &state,
+diff --git a/docs/sandboxes/policies.mdx b/docs/sandboxes/policies.mdx
+index a8b743b5cd6c23bfff1828df78976e4fc4c3db59..77860ac77c7e793b2df22d327684ec3f32bc1bb1 100644
+--- a/docs/sandboxes/policies.mdx
++++ b/docs/sandboxes/policies.mdx
+@@ -267,6 +267,8 @@ The following steps outline the hot-reload policy update workflow.
+    Pass the returned token to `--page-token` to continue. Use
+    `openshell policy list --global --output json` for global history.
+ 
++   To inspect a known revision's metadata and load error directly, run `openshell policy get <name> --rev <version> --output json`, or omit `--output json` for a table. Use `openshell policy get --global --rev <version> --output json` for a global revision. These metadata views remain available when the stored policy is malformed or no longer validates: the revision reports a failed status, includes its diagnostic, and omits the payload and trusted hash. Reads with `--base` or `--full` still require a valid payload. Metadata inspection does not change the active policy.
++
+ ### Validation failures
+ 
+ Before starting a workload, OpenShell validates its effective policy together
+diff --git a/proto/openshell.proto b/proto/openshell.proto
+index 586b7d435fe321fcbba7abde2f7abdd547d4de38..5ae9ae99486a17bbed6d4e85cfd9491cb0e30078 100644
+--- a/proto/openshell.proto
++++ b/proto/openshell.proto
+@@ -458,7 +458,7 @@ service OpenShell {
+     };
+   }
+ 
+-  // Get the load status of a specific policy version.
++  // Get a policy revision's load status and optionally its payload.
+   rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
+       returns (GetSandboxPolicyStatusResponse) {
+     option (openshell.options.v1.authorization) = {
+@@ -2731,6 +2731,10 @@ message GetSandboxPolicyStatusRequest {
+   // Explicit workspace scope for sandbox-scoped queries. Omit only when
+   // `global` is true; the all-workspaces selection is invalid.
+   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
++  // Omit the policy payload. Invalid stored payloads remain inspectable as
++  // failed revisions with a load_error and no policy_hash. False requires a
++  // valid payload and returns it, including for status-polling callers.
++  bool metadata_only = 6;
+ }
+ 
+ // Get sandbox policy status response.
+@@ -2816,22 +2820,22 @@ message SandboxPolicyRevision {
+   reserved "created_at_ms", "loaded_at_ms";
+   // Policy version (monotonically increasing per sandbox).
+   uint32 version = 1;
+-  // SHA-256 hash of the canonical serialized policy payload. Empty in a
+-  // ListSandboxPolicies projection when the stored payload is invalid under
+-  // the current schema and therefore has no trusted canonical identity.
++  // SHA-256 hash of the canonical serialized policy payload. Metadata-only
++  // status and history queries leave this empty when the stored payload is
++  // invalid and therefore has no trusted canonical identity.
+   string policy_hash = 2;
+-  // Load status of this revision. ListSandboxPolicies reports FAILED when a
+-  // stored historical payload is invalid under the current schema, regardless
+-  // of its persisted sandbox load status.
++  // Load status of this revision. Metadata-only status and history queries
++  // report FAILED for invalid stored payloads, regardless of the persisted
++  // sandbox load status.
+   PolicyStatus status = 3;
+-  // Sandbox load error, or the schema-validation diagnostic for an invalid
+-  // historical row returned by ListSandboxPolicies.
++  // Sandbox load error, or the validation diagnostic for an invalid stored
++  // payload returned by a metadata-only status or history query.
+   string load_error = 4;
+   // Time when this revision was created.
+   google.protobuf.Timestamp created_time = 105;
+   // Time when this revision was loaded by the sandbox. Absent if not loaded.
+   google.protobuf.Timestamp loaded_time = 106;
+-  // The full policy (only populated when explicitly requested).
++  // The full policy, absent from metadata-only status and history queries.
+   openshell.sandbox.v1.SandboxPolicy policy = 7;
+   // Immutable provenance supplied with this policy revision.
+   map<string, string> provenance = 8;
+@@ -2845,8 +2849,8 @@ enum PolicyStatus {
+   // Sandbox successfully applied this policy version.
+   POLICY_STATUS_LOADED = 2;
+   // Sandbox attempted to apply but failed; LKG policy remains active.
+-  // ListSandboxPolicies also uses FAILED for historical payloads that are
+-  // invalid under the current schema; load_error contains the diagnostic.
++  // Metadata-only status and history queries also use FAILED for invalid
++  // stored payloads; load_error contains the diagnostic.
+   POLICY_STATUS_FAILED = 3;
+   // A newer version was persisted before the sandbox loaded this one.
+   POLICY_STATUS_SUPERSEDED = 4;
+diff --git a/sdk/go/proto/openshellv1/openshell.pb.go b/sdk/go/proto/openshellv1/openshell.pb.go
+index 319344a845e901fabdd8ab6ed238be47652257ff..a7c8dd442ef9ae27a0a9368f0b6036b0246f1884 100644
+--- a/sdk/go/proto/openshellv1/openshell.pb.go
++++ b/sdk/go/proto/openshellv1/openshell.pb.go
+@@ -736,8 +736,8 @@ const (
+ 	// Sandbox successfully applied this policy version.
+ 	PolicyStatus_POLICY_STATUS_LOADED PolicyStatus = 2
+ 	// Sandbox attempted to apply but failed; LKG policy remains active.
+-	// ListSandboxPolicies also uses FAILED for historical payloads that are
+-	// invalid under the current schema; load_error contains the diagnostic.
++	// Metadata-only status and history queries also use FAILED for invalid
++	// stored payloads; load_error contains the diagnostic.
+ 	PolicyStatus_POLICY_STATUS_FAILED PolicyStatus = 3
+ 	// A newer version was persisted before the sandbox loaded this one.
+ 	PolicyStatus_POLICY_STATUS_SUPERSEDED PolicyStatus = 4
+@@ -11689,8 +11689,12 @@ type GetSandboxPolicyStatusRequest struct {
+ 	// Explicit workspace scope for sandbox-scoped queries. Omit only when
+ 	// `global` is true; the all-workspaces selection is invalid.
+ 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,5,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
+-	unknownFields  protoimpl.UnknownFields
+-	sizeCache      protoimpl.SizeCache
++	// Omit the policy payload. Invalid stored payloads remain inspectable as
++	// failed revisions with a load_error and no policy_hash. False requires a
++	// valid payload and returns it, including for status-polling callers.
++	MetadataOnly  bool `protobuf:"varint,6,opt,name=metadata_only,json=metadataOnly,proto3" json:"metadata_only,omitempty"`
++	unknownFields protoimpl.UnknownFields
++	sizeCache     protoimpl.SizeCache
+ }
+ 
+ func (x *GetSandboxPolicyStatusRequest) Reset() {
+@@ -11751,6 +11755,13 @@ func (x *GetSandboxPolicyStatusRequest) GetWorkspaceScope() *datamodelv1.Workspa
+ 	return nil
+ }
+ 
++func (x *GetSandboxPolicyStatusRequest) GetMetadataOnly() bool {
++	if x != nil {
++		return x.MetadataOnly
++	}
++	return false
++}
++
+ // Get sandbox policy status response.
+ type GetSandboxPolicyStatusResponse struct {
+ 	state protoimpl.MessageState `protogen:"open.v1"`
+@@ -12251,22 +12262,22 @@ type SandboxPolicyRevision struct {
+ 	state protoimpl.MessageState `protogen:"open.v1"`
+ 	// Policy version (monotonically increasing per sandbox).
+ 	Version uint32 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+-	// SHA-256 hash of the canonical serialized policy payload. Empty in a
+-	// ListSandboxPolicies projection when the stored payload is invalid under
+-	// the current schema and therefore has no trusted canonical identity.
++	// SHA-256 hash of the canonical serialized policy payload. Metadata-only
++	// status and history queries leave this empty when the stored payload is
++	// invalid and therefore has no trusted canonical identity.
+ 	PolicyHash string `protobuf:"bytes,2,opt,name=policy_hash,json=policyHash,proto3" json:"policy_hash,omitempty"`
+-	// Load status of this revision. ListSandboxPolicies reports FAILED when a
+-	// stored historical payload is invalid under the current schema, regardless
+-	// of its persisted sandbox load status.
++	// Load status of this revision. Metadata-only status and history queries
++	// report FAILED for invalid stored payloads, regardless of the persisted
++	// sandbox load status.
+ 	Status PolicyStatus `protobuf:"varint,3,opt,name=status,proto3,enum=openshell.v1.PolicyStatus" json:"status,omitempty"`
+-	// Sandbox load error, or the schema-validation diagnostic for an invalid
+-	// historical row returned by ListSandboxPolicies.
++	// Sandbox load error, or the validation diagnostic for an invalid stored
++	// payload returned by a metadata-only status or history query.
+ 	LoadError string `protobuf:"bytes,4,opt,name=load_error,json=loadError,proto3" json:"load_error,omitempty"`
+ 	// Time when this revision was created.
+ 	CreatedTime *timestamppb.Timestamp `protobuf:"bytes,105,opt,name=created_time,json=createdTime,proto3" json:"created_time,omitempty"`
+ 	// Time when this revision was loaded by the sandbox. Absent if not loaded.
+ 	LoadedTime *timestamppb.Timestamp `protobuf:"bytes,106,opt,name=loaded_time,json=loadedTime,proto3" json:"loaded_time,omitempty"`
+-	// The full policy (only populated when explicitly requested).
++	// The full policy, absent from metadata-only status and history queries.
+ 	Policy *sandboxv1.SandboxPolicy `protobuf:"bytes,7,opt,name=policy,proto3" json:"policy,omitempty"`
+ 	// Immutable provenance supplied with this policy revision.
+ 	Provenance    map[string]string `protobuf:"bytes,8,rep,name=provenance,proto3" json:"provenance,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+@@ -17942,12 +17953,13 @@ const file_openshell_proto_rawDesc = "" +
+ 	"\vannotations\x18\x05 \x03(\v23.openshell.v1.UpdateConfigResponse.AnnotationsEntryR\vannotations\x1a>\n" +
+ 	"\x10AnnotationsEntry\x12\x10\n" +
+ 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xca\x01\n" +
++	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xef\x01\n" +
+ 	"\x1dGetSandboxPolicyStatusRequest\x12\x12\n" +
+ 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+ 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x16\n" +
+ 	"\x06global\x18\x03 \x01(\bR\x06global\x12R\n" +
+-	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScopeJ\x04\b\x04\x10\x05R\tworkspace\"\x88\x01\n" +
++	"\x0fworkspace_scope\x18\x05 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12#\n" +
++	"\rmetadata_only\x18\x06 \x01(\bR\fmetadataOnlyJ\x04\b\x04\x10\x05R\tworkspace\"\x88\x01\n" +
+ 	"\x1eGetSandboxPolicyStatusResponse\x12?\n" +
+ 	"\brevision\x18\x01 \x01(\v2#.openshell.v1.SandboxPolicyRevisionR\brevision\x12%\n" +
+ 	"\x0eactive_version\x18\x02 \x01(\rR\ractiveVersion\"\xe9\x01\n" +
+diff --git a/sdk/go/proto/openshellv1/openshell_grpc.pb.go b/sdk/go/proto/openshellv1/openshell_grpc.pb.go
+index 0609450c893ca0f07d0f6c956b5083099fd969b0..6b017031f1f84e3da9034de76d2fcc1afe125424 100644
+--- a/sdk/go/proto/openshellv1/openshell_grpc.pb.go
++++ b/sdk/go/proto/openshellv1/openshell_grpc.pb.go
+@@ -221,7 +221,7 @@ type OpenShellClient interface {
+ 	GetGatewayConfig(ctx context.Context, in *sandboxv1.GetGatewayConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetGatewayConfigResponse, error)
+ 	// Update settings or policy at sandbox or global scope.
+ 	UpdateConfig(ctx context.Context, in *UpdateConfigRequest, opts ...grpc.CallOption) (*UpdateConfigResponse, error)
+-	// Get the load status of a specific policy version.
++	// Get a policy revision's load status and optionally its payload.
+ 	GetSandboxPolicyStatus(ctx context.Context, in *GetSandboxPolicyStatusRequest, opts ...grpc.CallOption) (*GetSandboxPolicyStatusResponse, error)
+ 	// List policy history for a sandbox.
+ 	ListSandboxPolicies(ctx context.Context, in *ListSandboxPoliciesRequest, opts ...grpc.CallOption) (*ListSandboxPoliciesResponse, error)
+@@ -1260,7 +1260,7 @@ type OpenShellServer interface {
+ 	GetGatewayConfig(context.Context, *sandboxv1.GetGatewayConfigRequest) (*sandboxv1.GetGatewayConfigResponse, error)
+ 	// Update settings or policy at sandbox or global scope.
+ 	UpdateConfig(context.Context, *UpdateConfigRequest) (*UpdateConfigResponse, error)
+-	// Get the load status of a specific policy version.
++	// Get a policy revision's load status and optionally its payload.
+ 	GetSandboxPolicyStatus(context.Context, *GetSandboxPolicyStatusRequest) (*GetSandboxPolicyStatusResponse, error)
+ 	// List policy history for a sandbox.
+ 	ListSandboxPolicies(context.Context, *ListSandboxPoliciesRequest) (*ListSandboxPoliciesResponse, error)
+diff --git a/skills/openshell-cli/SKILL.md b/skills/openshell-cli/SKILL.md
+index 057874fa3a4c2d25dd4b884bc5732166cdc7de14..dabfd2f30b5ca2d04c1c16257faf6b72670e94eb 100644
+--- a/skills/openshell-cli/SKILL.md
++++ b/skills/openshell-cli/SKILL.md
+@@ -587,6 +587,8 @@ Fetch a specific historical revision:
+ openshell policy get dev --rev 3 --full
+ ```
+ 
++If a stored revision cannot be decoded or validated, omit `--full` and `--base` to inspect its metadata and load error, for example `openshell policy get dev --rev 3 --output json`. A failed metadata result does not contain a policy payload or trusted hash and does not change which revision is active. Repair and validate the policy before submitting a replacement.
++
+ Gateway-global policy commands use `--global` and require confirmation unless `--yes` is supplied:
+ 
+ ```bash

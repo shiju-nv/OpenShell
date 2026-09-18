@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Policy metadata Rust verification
+
+# This controller verifies a patch before the implementation branch is committed.
+on:
+  push:
+    branches: [ci/policy-revision-metadata]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: policy-metadata-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PRODUCT_BASE: 473d1e997439c3577fabd9014ba8e8959e3c2444
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.policy-metadata-target
+  OPENSHELL_TELEMETRY_ENABLED: "false"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  rust:
+    if: github.repository == 'shiju-nv/OpenShell'
+    name: Rust ${{ matrix.phase }} (Linux x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        phase: [focused, broad]
+    steps:
+      - name: Check out the immutable controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+          sparse-checkout: .github/policy-metadata-ci
+
+      - name: Check out the exact upstream base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: NVIDIA/OpenShell
+          ref: ${{ env.PRODUCT_BASE }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Materialize and verify the candidate tree
+        run: >-
+          python3 controller/.github/policy-metadata-ci/materialize.py
+          --worktree candidate
+          --bundle controller/.github/policy-metadata-ci
+          --output "$RUNNER_TEMP/policy-metadata-evidence/materialization.json"
+
+      - name: Prepare only the disposable hosted runner
+        run: python3 controller/.github/policy-metadata-ci/prepare-runner.py
+
+      - uses: ./candidate/.github/actions/setup-nix
+
+      - name: Execute source-bound Rust checks
+        working-directory: candidate
+        env:
+          PHASE: ${{ matrix.phase }}
+        run: >-
+          python3 ../controller/.github/policy-metadata-ci/nix-run.py --
+          env -u RUSTC_WRAPPER python3
+          ../controller/.github/policy-metadata-ci/runner.py
+          --phase "$PHASE"
+          --worktree .
+          --bundle ../controller/.github/policy-metadata-ci
+          --output "$RUNNER_TEMP/policy-metadata-evidence/$PHASE"
+
+      - name: Preserve command results and source evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: policy-metadata-${{ matrix.phase }}-${{ github.sha }}
+          path: ${{ runner.temp }}/policy-metadata-evidence
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: error

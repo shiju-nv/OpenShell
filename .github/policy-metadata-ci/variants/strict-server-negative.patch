@@ -1,0 +1,11 @@
+--- a/crates/openshell-server/src/grpc/policy.rs
++++ b/crates/openshell-server/src/grpc/policy.rs
+@@ -4273,7 +4273,7 @@
+     Ok(Response::new(GetSandboxPolicyStatusResponse {
+         // Metadata remains available for repair without exporting an invalid policy.
+         // Full-policy responses still reject invalid stored payloads.
+-        revision: Some(policy_record_to_revision(&record, !req.metadata_only)?),
++        revision: Some(policy_record_to_revision(&record, true)?),
+         active_version,
+     }))
+ }

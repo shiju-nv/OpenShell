@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "base_commit": "473d1e997439c3577fabd9014ba8e8959e3c2444",
+  "candidate_tree": "896568beb992de4c9aa798668e7e6566013835d9",
+  "candidate_patch_sha256": "2509961e026cd8e3775f3de9fb763be896a4475a26cca07782fa942969cc3ea0",
+  "source_blobs": {
+    "architecture/security-policy.md": "0c62de8f9cdbaeeec666e65026f52f567b5025b8",
+    "crates/openshell-cli/src/run.rs": "0ba6cbab76502b6ff677039aa286592b3654c20b",
+    "crates/openshell-cli/tests/sandbox_name_fallback_integration.rs": "397342800b0e9ed7538efccd55e598fdd51df966",
+    "crates/openshell-server/src/grpc/policy.rs": "ad69024623922cfe0f2f08698e9135e140c225b7",
+    "docs/sandboxes/policies.mdx": "77860ac77c7e793b2df22d327684ec3f32bc1bb1",
+    "proto/openshell.proto": "5ae9ae99486a17bbed6d4e85cfd9491cb0e30078",
+    "sdk/go/proto/openshellv1/openshell.pb.go": "a7c8dd442ef9ae27a0a9368f0b6036b0246f1884",
+    "sdk/go/proto/openshellv1/openshell_grpc.pb.go": "6b017031f1f84e3da9034de76d2fcc1afe125424",
+    "skills/openshell-cli/SKILL.md": "dabfd2f30b5ca2d04c1c16257faf6b72670e94eb"
+  },
+  "variants": {
+    "server_old_boundary": {
+      "patch": "variants/strict-server-negative.patch",
+      "sha256": "53cc5c1b282565af8d4dae405b2ea72582fc36803ac4b3bddd18d3f5d19dc212",
+      "expected_tree": "0a8e316ef3d4c04c379bf46b7a62722fcdf259e2"
+    },
+    "cli_old_boundary": {
+      "patch": "variants/strict-cli-negative.patch",
+      "sha256": "6602a97acf3462988a3cc19bffc08ea56b9777e3258d24660e55b31b549f7398",
+      "expected_tree": "dcda83eb0a55a4014134dae74fef9452e9ee5f9f"
+    },
+    "combined_3444": {
+      "patch": "variants/pr-3444-cli-overlap.patch",
+      "sha256": "7703f765bb402e41690cf277eb6af71a7b1acc6677e64b08e550843395b2c390",
+      "expected_tree": "9304de185b31132c72f92c3d279d6effd6ed2bc6"
+    }
+  }
+}
