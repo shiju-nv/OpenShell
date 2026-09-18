@@ -1680,6 +1680,7 @@ impl BoundaryClient {
             .map_err(|error| BackendError::Process(format!("encode control request: {error}")))
     }
 
+    #[cfg(test)]
     async fn open_exchange(
         &self,
         request: Request,

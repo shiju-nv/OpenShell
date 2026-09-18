@@ -65,9 +65,7 @@ impl std::fmt::Display for ProviderPreparationFailure {
 
 impl std::error::Error for ProviderPreparationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+        self.source.as_ref().map(|source| source.as_ref())
     }
 }
 
@@ -3083,6 +3081,9 @@ mod tests {
     #[tokio::test]
     async fn configuration_activation_reconnect_revalidates_the_existing_tuple() {
         let (mut runtime, gateway, boundary, events) = runtime();
+        // Provider responses inherit the gateway's policy identity, so the
+        // reconnect fixture must expose the same already-installed delivery.
+        *gateway.snapshot.lock().expect("snapshot lock") = snapshot(1);
         gateway.provider_revision.store(1, Ordering::Relaxed);
         boundary.ready.send_replace(false);
         runtime
@@ -3286,14 +3287,25 @@ mod tests {
                 prepare_components(&snapshot(2), supplied).expect("fail-closed snapshot installs");
             let installed = credentials.snapshot();
             assert_eq!(installed.revision, 2);
+            // Non-secret classification permits installation; ordinary values
+            // remain placeholders until the supervisor resolves them.
+            let placeholder = installed
+                .child_env
+                .get("SERVICE_ENDPOINT")
+                .expect("non-secret environment entry");
+            assert_eq!(placeholder, "openshell:resolve:env:v2_SERVICE_ENDPOINT");
+            let resolver = credentials.resolver().expect("non-secret value resolver");
             assert_eq!(
-                installed
-                    .child_env
-                    .get("SERVICE_ENDPOINT")
-                    .map(String::as_str),
+                resolver.resolve_placeholder(placeholder),
                 Some("https://service.invalid")
             );
             assert_eq!(installed.child_env.len(), 1);
+            let child = credentials
+                .child_environment_snapshot()
+                .expect("prepared workload environment");
+            assert_eq!(child.installation_id, installed.installation_id);
+            assert_eq!(child.revision, installed.revision);
+            assert_eq!(child.environment, installed.child_env);
         }
         let mut supplied = provider(2);
         supplied.readiness_reason = ProviderReadinessReason::CredentialInstallFailed;

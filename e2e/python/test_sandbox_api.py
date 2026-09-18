@@ -146,10 +146,12 @@ def test_sandbox_interactive_exec_honors_tty(
                 command=[
                     "/bin/sh",
                     "-c",
+                    # Consume the input before printing the TTY status so terminal
+                    # echo cannot split the three descriptor results.
+                    "IFS= read -r stdin_value; "
                     "[ -t 0 ] && printf T || printf N; "
                     "[ -t 1 ] && printf T || printf N; "
                     "[ -t 2 ] && printf T || printf N; printf '\\n'; "
-                    "IFS= read -r stdin_value; "
                     "printf 'stdin:%s\\n' \"$stdin_value\"; "
                     "printf 'stdout-sentinel\\n'; "
                     "printf 'stderr-sentinel\\n' >&2",
