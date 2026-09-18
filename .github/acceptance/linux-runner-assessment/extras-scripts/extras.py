@@ -13,6 +13,7 @@ from build_products import TREE, check_runner, digest, require, run, save, selec
 WORKFLOW = ".github/workflows/branch-checks.yml"
 SCOPES = {
     "nextest": ("Test",),
+    "prover": ("Verify standalone policy prover package",),
     "telemetry": ("Verify telemetry can be compiled out",
                   "Verify the defaults-without-telemetry feature alias tracks the default feature set"),
     "drivers": ("Verify selective gateway compute-driver builds",),
@@ -50,6 +51,10 @@ def shipping_steps(text):
         environment = {"OPENSHELL_TELEMETRY_ENABLED": "false"} if name == "Test" else {}
         if name == "Test":
             require('          OPENSHELL_TELEMETRY_ENABLED: "false"' in lines[:index], "Nextest environment changed")
+        elif name == "Verify standalone policy prover package":
+            require('          CARGO_NET_OFFLINE: "true"' in lines[:index], "Prover offline environment changed")
+            require("        if: matrix.system == 'x86_64-linux'" in lines[:index], "Prover platform selection changed")
+            environment = {"CARGO_NET_OFFLINE": "true"}
         selected[name] = {"script": script, "environment": environment}
     require(set(selected) == names, "Shipping scope inventory changed")
     return selected
@@ -114,6 +119,12 @@ def main():
             run(root, logs, "tool-" + name, argv, env)
         if args.scope == "nextest":
             run(root, logs, "tool-nextest", ["cargo", "nextest", "--version"], env)
+        if args.scope == "prover":
+            # Stock Branch Checks reaches this offline step after building the
+            # workspace. This isolated job first hydrates the same locked graph;
+            # the shipping verification itself retains its offline setting.
+            run(root, logs, "hydrate-locked-dependencies", ["cargo", "fetch", "--locked"],
+                {**env, "CARGO_NET_OFFLINE": "false"})
         for index, name in enumerate(SCOPES[args.scope], 1):
             spec = steps[name]
             script = scripts / f"{args.scope}-{index}.sh"

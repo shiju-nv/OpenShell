@@ -5,6 +5,11 @@
 
 //! Observe admission through the gateway and independent workload/upstream records.
 
+// Keep the image/provider repair and restart regression independent of the
+// controlled-upstream scenarios below.
+#[path = "policy_activation/image_provider_repair.rs"]
+mod image_provider_repair;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

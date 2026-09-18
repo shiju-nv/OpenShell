@@ -542,6 +542,8 @@ pub enum Request {
     PrepareConfiguration {
         identity: ConfigurationActivationIdentity,
         expected: Option<ConfigurationRevision>,
+        expected_publication_generation: u64,
+        provider_env_installation_id: String,
         configuration: ConfigurationRevision,
         provider_env: std::collections::HashMap<String, String>,
     },
@@ -657,12 +659,19 @@ impl fmt::Debug for Request {
             Self::PrepareConfiguration {
                 identity,
                 expected,
+                expected_publication_generation,
+                provider_env_installation_id,
                 configuration,
                 provider_env,
             } => formatter
                 .debug_struct("PrepareConfiguration")
                 .field("identity", identity)
                 .field("expected", expected)
+                .field(
+                    "expected_publication_generation",
+                    expected_publication_generation,
+                )
+                .field("provider_env_installation_id", provider_env_installation_id)
                 .field("configuration", configuration)
                 .field("provider_env_count", &provider_env.len())
                 .finish(),
@@ -1374,7 +1383,10 @@ mod tests {
                 policy_hash: "test-policy".to_string(),
                 policy_source: 1,
                 provider_env_revision: 7,
+                provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
             },
+            publication_generation: 1,
+            provider_env_installation_id: "55555555-5555-4555-8555-555555555555".to_string(),
         }
     }
 
@@ -1384,6 +1396,8 @@ mod tests {
         let request = Request::PrepareConfiguration {
             identity: activation.identity,
             expected: None,
+            expected_publication_generation: 0,
+            provider_env_installation_id: "55555555-5555-4555-8555-555555555555".to_string(),
             configuration: activation.configuration,
             provider_env: std::collections::HashMap::from([(
                 "CREDENTIAL".to_string(),
@@ -1414,6 +1428,8 @@ mod tests {
         let build = |provider_env| Request::PrepareConfiguration {
             identity: test_activation().identity,
             expected: None,
+            expected_publication_generation: 0,
+            provider_env_installation_id: "55555555-5555-4555-8555-555555555555".to_string(),
             configuration: test_activation().configuration,
             provider_env,
         };

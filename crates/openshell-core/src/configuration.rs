@@ -23,6 +23,8 @@ pub struct ConfigurationRevision {
     pub policy_source: i32,
     /// Revision of the exact prepared provider environment.
     pub provider_env_revision: u64,
+    /// Gateway attachment identity; reattachment invalidates earlier receipts.
+    pub provider_attachment_epoch: String,
 }
 
 impl ConfigurationRevision {
@@ -181,6 +183,7 @@ mod tests {
             policy_hash: "global-policy".to_string(),
             policy_source: crate::proto::PolicySource::Global.into(),
             provider_env_revision: 0,
+            provider_attachment_epoch: "attachment-test".to_string(),
         };
         assert_eq!(
             valid.validate(),

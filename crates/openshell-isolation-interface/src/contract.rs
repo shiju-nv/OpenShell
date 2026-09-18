@@ -328,6 +328,10 @@ pub struct BoundaryConfigurationSnapshot {
     pub identity: ConfigurationActivationIdentity,
     /// Last completely installed child environment/configuration tuple.
     pub installed: Option<ConfigurationRevision>,
+    /// Last installed ordered publication; zero before the first installation.
+    pub publication_generation: u64,
+    /// Exact supervisor snapshot installed at that generation.
+    pub provider_env_installation_id: Option<String>,
     /// True only after explicit release of the current installed tuple.
     pub active: bool,
 }
@@ -346,6 +350,12 @@ pub struct PreparedBoundaryConfiguration {
     pub expected: Option<ConfigurationRevision>,
     /// Complete candidate that passed boundary preparation.
     pub configuration: ConfigurationRevision,
+    /// Monotonic boundary publication reserved before installation.
+    pub publication_generation: u64,
+    /// Exact local provider snapshot whose environment was installed.
+    pub provider_env_installation_id: String,
+    /// Installed publication checked together with the previous tuple.
+    pub expected_publication_generation: u64,
 }
 
 /// Installed candidate that remains held until the gateway accepts its identity.
@@ -358,6 +368,10 @@ pub struct InstalledBoundaryConfiguration {
     pub transition_id: String,
     /// Exact installed policy/provider tuple.
     pub configuration: ConfigurationRevision,
+    /// Monotonic boundary publication reserved before installation.
+    pub publication_generation: u64,
+    /// Exact local provider snapshot whose environment was installed.
+    pub provider_env_installation_id: String,
 }
 
 /// Exact released configuration required on workload start and exec requests.
@@ -370,6 +384,10 @@ pub struct ActivatedBoundaryConfiguration {
     pub transition_id: String,
     /// Exact released policy/provider tuple.
     pub configuration: ConfigurationRevision,
+    /// Monotonic boundary publication reserved before installation.
+    pub publication_generation: u64,
+    /// Exact local provider snapshot whose environment was installed.
+    pub provider_env_installation_id: String,
 }
 
 /// Serializes configuration installation with workload execution and recovery.
@@ -389,8 +407,10 @@ pub trait BoundaryConfiguration: Send + Sync {
     async fn prepare(
         &self,
         expected: Option<ConfigurationRevision>,
+        expected_publication_generation: u64,
         candidate: ConfigurationRevision,
         child_env: HashMap<String, String>,
+        installation_id: String,
     ) -> Result<PreparedBoundaryConfiguration, BackendError>;
     /// Install staged child credentials while keeping every workload held.
     async fn commit(
@@ -943,6 +963,30 @@ pub struct ExecSpec {
 pub trait BoundaryExec: Send + Sync {
     /// Spawn `spec` inside the boundary, returning an owned session.
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError>;
+
+    /// Acknowledge the current provider environment for future process launches.
+    ///
+    /// Success requires an authenticated acknowledgment from the running
+    /// boundary. Configuration-gated implementations consume an accepted activation
+    /// receipt and must not independently install an unaccepted environment.
+    async fn synchronize_provider_environment(
+        &self,
+    ) -> Result<ProviderEnvironmentInstallation, BackendError> {
+        Err(BackendError::Unsupported(
+            "provider environment installation acknowledgment is unavailable".to_string(),
+        ))
+    }
+}
+
+/// Evidence that the running workload boundary installed one provider snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderEnvironmentInstallation {
+    /// Local supervisor snapshot that produced the acknowledged environment.
+    pub installation_id: String,
+    /// Opaque provider content fingerprint.
+    pub revision: u64,
+    /// Authenticated and confirmed workload boundary session.
+    pub session_id: SandboxSessionId,
 }
 
 // ============================================================================

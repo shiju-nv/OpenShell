@@ -1836,18 +1836,21 @@ type GetSandboxConfigResponse struct {
 	// False also covers older gateways that do not advertise this capability;
 	// supervisors preserve their legacy unauthenticated connection behavior.
 	ExtensionAuthenticationEnabled bool `protobuf:"varint,12,opt,name=extension_authentication_enabled,json=extensionAuthenticationEnabled,proto3" json:"extension_authentication_enabled,omitempty"`
+	// Gateway-owned attachment identity captured with this desired configuration.
+	// Compare for equality; reattachment invalidates previous installation evidence.
+	ProviderAttachmentEpoch string `protobuf:"bytes,14,opt,name=provider_attachment_epoch,json=providerAttachmentEpoch,proto3" json:"provider_attachment_epoch,omitempty"`
 	// True only after validating this complete policy/provider composition.
 	// Missing (older gateway) is deliberately not admission.
 	ConfigurationAdmitted bool `protobuf:"varint,13,opt,name=configuration_admitted,json=configurationAdmitted,proto3" json:"configuration_admitted,omitempty"`
 	// Bounded, credential-free admission diagnostic. Empty for admitted policy.
-	ConfigurationError string `protobuf:"bytes,14,opt,name=configuration_error,json=configurationError,proto3" json:"configuration_error,omitempty"`
+	ConfigurationError string `protobuf:"bytes,16,opt,name=configuration_error,json=configurationError,proto3" json:"configuration_error,omitempty"`
 	// Registration fence for a new supervisor; capture once and retain on retry.
 	ConfigurationInstanceId           string `protobuf:"bytes,15,opt,name=configuration_instance_id,json=configurationInstanceId,proto3" json:"configuration_instance_id,omitempty"`
-	RuntimeGeneration                 string `protobuf:"bytes,16,opt,name=runtime_generation,json=runtimeGeneration,proto3" json:"runtime_generation,omitempty"`
-	ConfigurationBoundaryInstanceId   string `protobuf:"bytes,17,opt,name=configuration_boundary_instance_id,json=configurationBoundaryInstanceId,proto3" json:"configuration_boundary_instance_id,omitempty"`
-	ConfigurationSnapshot             string `protobuf:"bytes,18,opt,name=configuration_snapshot,json=configurationSnapshot,proto3" json:"configuration_snapshot,omitempty"`
-	ConfigurationRegistrationRevision uint64 `protobuf:"varint,19,opt,name=configuration_registration_revision,json=configurationRegistrationRevision,proto3" json:"configuration_registration_revision,omitempty"`
-	ConfigurationDeliveryRevision     uint64 `protobuf:"varint,20,opt,name=configuration_delivery_revision,json=configurationDeliveryRevision,proto3" json:"configuration_delivery_revision,omitempty"`
+	RuntimeGeneration                 string `protobuf:"bytes,17,opt,name=runtime_generation,json=runtimeGeneration,proto3" json:"runtime_generation,omitempty"`
+	ConfigurationBoundaryInstanceId   string `protobuf:"bytes,18,opt,name=configuration_boundary_instance_id,json=configurationBoundaryInstanceId,proto3" json:"configuration_boundary_instance_id,omitempty"`
+	ConfigurationSnapshot             string `protobuf:"bytes,19,opt,name=configuration_snapshot,json=configurationSnapshot,proto3" json:"configuration_snapshot,omitempty"`
+	ConfigurationRegistrationRevision uint64 `protobuf:"varint,20,opt,name=configuration_registration_revision,json=configurationRegistrationRevision,proto3" json:"configuration_registration_revision,omitempty"`
+	ConfigurationDeliveryRevision     uint64 `protobuf:"varint,21,opt,name=configuration_delivery_revision,json=configurationDeliveryRevision,proto3" json:"configuration_delivery_revision,omitempty"`
 	unknownFields                     protoimpl.UnknownFields
 	sizeCache                         protoimpl.SizeCache
 }
@@ -1964,6 +1967,13 @@ func (x *GetSandboxConfigResponse) GetExtensionAuthenticationEnabled() bool {
 		return x.ExtensionAuthenticationEnabled
 	}
 	return false
+}
+
+func (x *GetSandboxConfigResponse) GetProviderAttachmentEpoch() string {
+	if x != nil {
+		return x.ProviderAttachmentEpoch
+	}
+	return ""
 }
 
 func (x *GetSandboxConfigResponse) GetConfigurationAdmitted() bool {
@@ -2286,7 +2296,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xc0\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xfc\n" +
 	"\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
@@ -2302,15 +2312,16 @@ const file_sandbox_proto_rawDesc = "" +
 	"\tworkspace\x18\n" +
 	" \x01(\tR\tworkspace\x12C\n" +
 	"\x1epolicy_validation_failure_mode\x18\v \x01(\tR\x1bpolicyValidationFailureMode\x12H\n" +
-	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x125\n" +
+	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x12:\n" +
+	"\x19provider_attachment_epoch\x18\x0e \x01(\tR\x17providerAttachmentEpoch\x125\n" +
 	"\x16configuration_admitted\x18\r \x01(\bR\x15configurationAdmitted\x12/\n" +
-	"\x13configuration_error\x18\x0e \x01(\tR\x12configurationError\x12:\n" +
+	"\x13configuration_error\x18\x10 \x01(\tR\x12configurationError\x12:\n" +
 	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x12-\n" +
-	"\x12runtime_generation\x18\x10 \x01(\tR\x11runtimeGeneration\x12K\n" +
-	"\"configuration_boundary_instance_id\x18\x11 \x01(\tR\x1fconfigurationBoundaryInstanceId\x125\n" +
-	"\x16configuration_snapshot\x18\x12 \x01(\tR\x15configurationSnapshot\x12N\n" +
-	"#configuration_registration_revision\x18\x13 \x01(\x04R!configurationRegistrationRevision\x12F\n" +
-	"\x1fconfiguration_delivery_revision\x18\x14 \x01(\x04R\x1dconfigurationDeliveryRevision\x1ac\n" +
+	"\x12runtime_generation\x18\x11 \x01(\tR\x11runtimeGeneration\x12K\n" +
+	"\"configuration_boundary_instance_id\x18\x12 \x01(\tR\x1fconfigurationBoundaryInstanceId\x125\n" +
+	"\x16configuration_snapshot\x18\x13 \x01(\tR\x15configurationSnapshot\x12N\n" +
+	"#configuration_registration_revision\x18\x14 \x01(\x04R!configurationRegistrationRevision\x12F\n" +
+	"\x1fconfiguration_delivery_revision\x18\x15 \x01(\x04R\x1dconfigurationDeliveryRevision\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +

@@ -49,6 +49,7 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+uuid = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 rcgen = { workspace = true }

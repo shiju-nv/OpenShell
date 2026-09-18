@@ -59,11 +59,15 @@ fn selected_workspace(
 
 #[derive(Clone, Default)]
 struct SandboxState {
+    /// Make `ListProviderProfiles` fail while every other RPC keeps working,
+    /// so a catalog lookup failure can be told apart from an empty catalog.
+    fail_list_provider_profiles: Arc<AtomicBool>,
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
     configuration_rejected: Arc<AtomicBool>,
+    configuration_timed_out: Arc<AtomicBool>,
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
@@ -368,6 +372,24 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
+        ))
+    }
+
     async fn get_sandbox_provider_environment(
         &self,
         _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
@@ -477,7 +499,14 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        let profiles = openshell_providers::builtin_profiles()
+        if self
+            .state
+            .fail_list_provider_profiles
+            .load(Ordering::SeqCst)
+        {
+            return Err(Status::unavailable("profile catalog is unavailable"));
+        }
+        let profiles = helpers::example_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect();
@@ -494,7 +523,7 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let id = request.into_inner().id;
-        let profile = openshell_providers::builtin_profiles()
+        let profile = helpers::example_profiles()
             .iter()
             .find(|profile| profile.id == id)
             .ok_or_else(|| Status::not_found("provider profile not found"))?
@@ -592,6 +621,7 @@ impl OpenShell for TestOpenShell {
         let (tx, rx) = mpsc::channel(4);
         let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
         let configuration_rejected = self.state.configuration_rejected.load(Ordering::SeqCst);
+        let configuration_timed_out = self.state.configuration_timed_out.load(Ordering::SeqCst);
         let vm_error_with_observed_exit = self
             .state
             .vm_error_with_observed_exit
@@ -634,13 +664,24 @@ impl OpenShell for TestOpenShell {
                         error: "required provider is unavailable".to_string(),
                         ..Default::default()
                     });
+                if configuration_timed_out {
+                    provisioning.set_phase(SandboxPhase::Error as i32);
+                    provisioning.status.as_mut().unwrap().provisioning =
+                        Some(openshell_core::proto::SandboxProvisioning {
+                            timeout_time: Some(prost_types::Timestamp {
+                                seconds: 300,
+                                nanos: 0,
+                            }),
+                            ..Default::default()
+                        });
+                }
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
                         payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
                     }))
                     .await;
-                // Keep the stream open as a repairable gateway does. The client
-                // must report rejection without waiting for a terminal phase.
+                // Keep the stream open so the client must handle the observed
+                // repair or timeout state without waiting for stream closure.
                 tx.closed().await;
                 return;
             }
@@ -1552,6 +1593,61 @@ async fn configuration_activation_rejected_create_returns_repair_without_deletio
 }
 
 #[tokio::test]
+async fn configuration_activation_timed_out_create_preserves_restart_guidance() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .configuration_rejected
+        .store(true, Ordering::SeqCst);
+    server
+        .openshell
+        .state
+        .configuration_timed_out
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("expired-provider"),
+                command: &["echo".into(), "OK".into()],
+                keep: false,
+                ..test_config()
+            },
+            "default",
+            &tls,
+        ),
+    )
+    .await
+    .expect("terminal timeout must finish promptly")
+    .expect_err("expired provisioning cannot complete create");
+    let message = error.to_string();
+    assert!(
+        message.contains("openshell sandbox start expired-provider"),
+        "{message}"
+    );
+    assert!(message.contains("after cleanup completes"), "{message}");
+    assert!(
+        deleted_names(&server).await.is_empty(),
+        "expired sandbox remains available for repair"
+    );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
 async fn sandbox_delete_continues_after_entry_failure() {
     let server = run_server().await;
     let tls = test_tls(&server);
@@ -1584,6 +1680,50 @@ async fn sandbox_delete_continues_after_entry_failure() {
             vec!["failing-sandbox".to_string()],
             vec!["later-sandbox".to_string()]
         ]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
+    // The catalog's only consumer is the advisory credential warning, so a
+    // failed lookup degrades that warning instead of blocking creation.
+    // Nothing derives provider authority from it: a provider is attached only
+    // when the user names one.
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    server
+        .openshell
+        .state
+        .fail_list_provider_profiles
+        .store(true, Ordering::SeqCst);
+
+    run::sandbox_create(
+        &server.endpoint,
+        "openshell",
+        run::SandboxCreateConfig {
+            name: Some("catalog-unavailable"),
+            command: &["claude".into()],
+            ..test_config()
+        },
+        "default",
+        &tls,
+    )
+    .await
+    .expect("an unreachable catalog must not block sandbox creation");
+
+    let requests = server.openshell.state.create_requests.lock().await;
+    assert_eq!(requests.len(), 1, "the sandbox should still be created");
+    assert!(
+        requests[0]
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.providers.is_empty()),
+        "no provider should be attached without an explicit --provider"
     );
 }
 
@@ -1953,6 +2093,7 @@ async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metada
         "table",
         "team-a",
         &tls,
+        true,
     )
     .await
     .expect("template create should succeed");
@@ -2074,6 +2215,7 @@ async fn sandbox_template_create_allows_omitted_image() {
         "table",
         "default",
         &tls,
+        true,
     )
     .await
     .expect("template create without image should succeed");

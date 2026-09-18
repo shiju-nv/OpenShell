@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ACCEPTANCE_PRODUCT_COMMIT: f092b965f6da77078d4f2594e3ecc0285e57a9a5
+  ACCEPTANCE_PRODUCT_COMMIT: 069807e8a92006078ad196f45493c1b21ae9ff38
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_BUILD_JOBS: "2"
@@ -125,7 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scope: [nextest, telemetry, drivers, roots]
+        scope: [nextest, telemetry, drivers, roots, prover]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

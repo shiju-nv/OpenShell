@@ -21,7 +21,7 @@ Filesystem and process policy are startup controls. A rejected initial configura
 
 `openshell-policy-schema` owns the authored YAML and JSON representation, bounded decoding, and pure language semantics such as access presets, MCP revision vocabulary, effective ports and rule names, protocol classification, and lexical path normalization. It preserves field presence, including the difference between an omitted filesystem section and a present empty object. `openshell-policy` owns protobuf conversion, composition, merge behavior, and validation that depends on runtime components.
 
-The prover uses the schema's `RuntimeStrict` profile, which requires `version: 1` and rejects managed annotations and unknown fields in closed schema objects. Maximum-policy containment uses `ContainmentInput`, which retains managed metadata, review annotations, and unknown closed-object fields for its support audit. Both profiles require the known field types. Middleware configuration, query names, persisted-query names, and recursive MCP parameter names are open user-data namespaces. Recognizing a parameter shape in the schema does not imply that every protocol supports that matcher at runtime.
+Both the proposal-risk prover and standalone containment checker use the schema's `RuntimeStrict` profile, which requires `version: 1` and rejects managed annotations and unknown fields in closed schema objects. The schema also exposes `ContainmentInput`, which retains managed metadata, review annotations, and unknown closed-object fields for a consumer support audit; it does not make those fields supported by either prover entrypoint. Both profiles require the known field types. Middleware configuration, query names, persisted-query names, and recursive MCP parameter names are open user-data namespaces. Recognizing a parameter shape in the schema does not imply that every protocol supports that matcher at runtime.
 
 ### OPA runtime data
 
@@ -150,6 +150,14 @@ flag defaults to `false` and is security-flagged in policy approval flows.
 Incremental merges only ever add the flag to a matching endpoint; clearing it
 requires removing the endpoint or replacing the policy.
 
+Image discovery may persist a desired policy for repair, but does not authorize
+workload activation. The gateway applies the credential gate after full provider
+composition and provenance derivation. A rejected effective configuration keeps
+startup blocked with a bounded diagnostic; the supervisor waits for management
+repair instead of launching with connection-time denials or a fallback policy.
+Accepted runtime state includes the matching provider-environment revision, so
+policy and credential updates cannot activate independently.
+
 The network supervisor independently enforces the same boundary. Credentialed
 WebSocket upgrades use the parsed relay, binary frames fail closed, and text
 placeholders require rewrite. REST bodies continue streaming when body rewrite is disabled. The relay holds
@@ -175,15 +183,7 @@ credential names, placeholders, body content, or secret values.
 
 Credential provenance is gateway-derived and deliberately absent from the authored policy schema. The raw OPA loader preserves supplied runtime provenance but does not derive it for an unstamped policy. Gateway-delivered policy supplies the authoritative provenance for managed sandboxes. A policy without provenance applies neither the raw-tunnel refusal nor the WebSocket binary-frame refusal. The request-body backstop still applies because it keys off the presence of a secret resolver rather than endpoint provenance.
 
-Two supervisor-local paths load a policy without provenance. A supervisor
-booting from an explicitly provisioned policy file has a bounded window before
-that policy is resynchronized to the gateway, which then serves a stamped
-effective policy. An explicit supervisor Rego and data override is permanent,
-because gateway revisions are observed for settings and providers but never
-replace the local policy. Workload-image files and environment variables cannot
-configure the separately isolated supervisor. When a supervisor override is
-combined with injected provider credentials, the supervisor emits a
-high-severity detection finding at startup naming the inactive controls.
+Gateway-managed startup composes and validates image policy through the gateway before workload release, so the installed effective policy includes gateway provenance. Combining a local Rego/data override with a gateway-managed sandbox is rejected. Standalone local-file use can load unstamped data and therefore lacks controls that require gateway-derived provenance. Workload-image files and environment variables cannot configure the separately isolated supervisor.
 
 ## Policy Load Diagnostics
 
@@ -217,6 +217,8 @@ incremental merges and approvals, provider attachment, and profile fanout reject
 ambiguity atomically, without creating an invalid revision or partially
 activating an update. Supervisor validation remains the defense-in-depth
 boundary for startup, concurrent changes, and sources outside those mutations.
+
+L7 allow and deny append operations carry an explicit rule target and the complete affected binary and port scope. The merge engine resolves one non-provider endpoint within that rule, optionally by exact endpoint path, and compares both scope sets before mutation. A partial declaration, ambiguous target, or changed scope rejects the batch before revision persistence. The declaration records operator intent; it does not grant policy-writing authority or change the stored binary and port sets.
 
 The supervisor prepares policy, middleware and matching provider credentials before publication. It stages the boundary environment while the workload is frozen and new exec is blocked, publishes the matching control generation, and commits the boundary installation without resuming execution. Gateway acceptance authorizes release; only an exact release response and final activation report restore readiness and mark the policy loaded. Provider-only updates use the same path. Confirmation or reconnection alone cannot release a workload.
 
@@ -336,7 +338,38 @@ may store such a draft, but existing merge validation rejects it when an
 approval attempts to add it to policy; runtime SSRF protections remain the
 final enforcement boundary.
 
-## What the prover decides
+## Standalone boundary checks
+
+The standalone `openshell-prover check` command compares a fully composed local
+candidate policy with an operator-supplied local boundary. It establishes
+`Allowed(candidate) ⊆ Allowed(boundary)` for the model scope reported in its
+result. It does not fetch gateway state, compose provider rules, apply policy,
+or decide whether an in-boundary change is eligible for automatic approval.
+
+The initial model covers filesystem paths, L4 network authority, and enforced
+REST method and path authority. It returns explicit unsupported or inconclusive
+results when a sound decision depends on authority or runtime context outside
+the model. The result records the model version and covered domains so callers
+can bind a successful check to those semantics.
+
+Before semantic validation, the checker observes cancellation and applies
+aggregate limits across both inputs. Oversized checks therefore return
+`resource_limit` without building validation indexes. Cross-protocol ambiguity
+validation indexes host and port authority rather than comparing every endpoint
+pair, and it checks cancellation while scanning admitted policies.
+
+The Rust containment API has an explicit extensibility contract: options and
+modeled-domain evidence permit additive growth, while the four `CheckResult`
+states remain exhaustive and authorization accepts only `Within`. This Rust
+source-compatibility boundary is separate from the CLI JSON schema and the
+reported containment model version. See the `openshell-prover` crate README for
+the supported construction and matching patterns.
+
+This containment operation is separate from the proposal-risk queries below.
+See the [standalone policy prover documentation](../docs/reference/policy-prover.mdx)
+for installation, command behavior, model limitations, evidence, and exit codes.
+
+## What the proposal prover decides
 
 The prover answers four formal questions about each proposed policy
 change. Each "yes" answer becomes its own categorical finding — there is

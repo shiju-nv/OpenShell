@@ -20,6 +20,7 @@ def main():
         "configuration_revision", "policy_version", "policy_hash", "policy_source",
         "provider_revision", "runtime_generation", "session", "supervisor_instance",
         "boundary_instance", "registration_revision", "transition_id",
+        "provider_attachment_epoch", "publication_generation", "provider_installation_id",
     }
     matrix = [record for record in observations if record.get("scenario") == "exact-activation-mismatch-matrix"]
     assert {record["field"] for record in matrix} == fields, "missing exact boundary mismatch cases"

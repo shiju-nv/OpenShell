@@ -90,11 +90,14 @@ attachment and delete its sandbox after the service exits.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
 
-**Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
+Provider attachment is explicit. Name each provider with `--provider`; the
+trailing command does not select or attach one. If the named provider does not
+exist but a profile with that ID is available, the CLI can create it from local
+credentials:
 
 ```bash
-openshell sandbox create -- claude        # Auto-creates claude provider
-openshell sandbox create -- codex         # Auto-creates codex provider
+openshell sandbox create --provider claude-code -- claude
+openshell sandbox create --provider codex -- codex
 ```
 
 The agent will be prompted interactively if credentials are missing.
@@ -111,7 +114,7 @@ openshell sandbox delete <name>
 
 ## Workflow 2: Provider Management
 
-Providers supply credentials and provider-specific configuration to sandboxes. Provider types come from built-in and custom profiles; do not rely on a hard-coded type list. Discover the profiles available on the selected gateway:
+Providers supply credentials and provider-specific configuration to sandboxes. Provider profiles are import-only: a gateway serves exactly what an operator imported, and a new gateway serves an empty catalog. Never rely on a hard-coded type list or on a legacy alias such as `gh` or `claude` — `--type` matches a profile ID exactly. Discover the profiles available on the selected gateway:
 
 ```bash
 openshell provider list-profiles
@@ -163,6 +166,10 @@ openshell provider profile import --file ./my-profile.yaml
 ```
 
 ### List, inspect, update, delete
+
+Use `openshell sandbox provider status --help` and the attach, detach, and update help to find the installed version's wait options. Add `--wait` when the next step depends on a provider change taking effect. Without it, a successful command only confirms that the gateway saved the change. Save the returned `receipt_id` to check that same change later, and inspect the result for every selected sandbox. Credential refresh status confirms that OpenShell obtained credentials; provider status confirms that the sandbox applied them, activated the policy, and updated the environment for new processes. If the status is `superseded`, explain that a later change replaced the request and inspect that change separately.
+
+If attach, detach, or update reports `CONFIG_OPERATION_STORAGE_UNCERTAIN`, explain that the change may already be saved and its readiness receipt may be unavailable. Do not blindly retry the mutation. Inspect the provider and sandbox state and reconcile the saved change before deciding on another mutation; the error proves neither rollback nor readiness.
 
 ```bash
 openshell provider list
@@ -325,7 +332,7 @@ Most commands with an optional sandbox name use the last-used sandbox. Pass an e
 
 ### Inspect and repair a rejected configuration
 
-A sandbox can remain `Starting` because its policy and attached providers cannot be activated together. Inspect the configuration error before retrying creation:
+A sandbox can remain `Provisioning` or `Starting` because its policy and attached providers cannot be activated together. Inspect the configuration error before retrying creation:
 
 ```fish
 openshell sandbox get my-sandbox
@@ -348,7 +355,7 @@ openshell policy set my-sandbox --policy repair-policy.yaml --wait
 openshell sandbox get my-sandbox --output json
 ```
 
-Choose the repair that matches the diagnostic. Provider profile coverage and credential bindings must agree with the requested endpoints; use `sandbox provider attach` or `detach` when the attachment itself is wrong. If `policy_source` is `global`, inspect the governing global policy and its scope before changing it. Successful repair lets the waiting runtime launch its initial workload once; repeated polls or acknowledgements do not launch another copy.
+Choose the repair that matches the diagnostic. Provider profile coverage and credential bindings must agree with the requested endpoints; use `sandbox provider attach` or `detach` when the attachment itself is wrong. If `policy_source` is `global`, inspect the governing global policy and its scope before changing it. Successful repair within the provisioning repair window lets the waiting runtime launch its initial workload once; repeated polls or acknowledgements do not launch another copy. After `ProvisioningTimedOut`, wait for cleanup and explicitly start the sandbox using the published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md).
 
 Static policy repair is allowed only while the gateway positively records that initial workload release has never been authorized and configuration admission is pending or rejected. In JSON, `configuration_activation_authorized: false` is that durable evidence. The gateway sets it to `true` when it first authorizes release, before the workload may run. A missing field, lost acknowledgement, failed launch, or control restart does not reopen static repair. After release authorization, changes to `filesystem_policy`, `landlock`, or `process` require a new sandbox.
 
@@ -410,13 +417,16 @@ provider instead of passing API keys, tokens, or other secrets to `sandbox exec`
 ```bash
 openshell sandbox provider list my-sandbox
 openshell sandbox provider list my-sandbox --output json
-openshell sandbox provider attach my-sandbox my-github
-openshell sandbox provider detach my-sandbox my-github
+openshell sandbox provider attach my-sandbox my-github --wait --timeout 30
+openshell sandbox provider status my-sandbox my-github --output json
+openshell sandbox provider detach my-sandbox my-github --wait --timeout 30
 ```
 
 Structured attachment output contains provider names, types, and sorted
 credential and config key names. It never contains credential, handle, or
 config values.
+
+Use the provider status or `--wait` result to confirm a provider change. Sandbox configuration activation alone does not prove that the matching credentials, policy, and future-process environment have been installed. A withheld or expired credential snapshot can activate without making that provider usable.
 
 ### View logs
 
@@ -471,7 +481,11 @@ the operation that removes retained state.
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (`filesystem_policy`, `landlock`, `process`) that become immutable at the first authorization to release the workload, and two dynamic fields: `network_policies` and `network_middlewares`. A rejected initial configuration can be repaired as described above while the gateway still records that release has never been authorized. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Runtime acceptance covers the effective policy and matching provider configuration together.
+**Key concept**: Policies have static fields (`filesystem_policy`, `landlock`, `process`) that become immutable at the first authorization to release the workload, and two dynamic fields: `network_policies` and `network_middlewares`. A rejected initial configuration can be repaired as described above while the gateway still records that release has never been authorized. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Runtime acceptance covers the effective policy and matching provider configuration together. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
+
+If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and repair the complete policy or provider set through the gateway. Static fields can be replaced during initial repair only while durable state explicitly records that release has never been authorized. A previously authorized sandbox retains static-field restrictions while restart admission is pending or rejected.
+
+Before the gateway's 300-second repair window expires, successful validation and activation complete startup in place. Effective stored configuration changes and their first failed load reset that window; repeated failures do not. After `ProvisioningTimedOut`, inspect the retained record and cleanup status, repair configuration, and explicitly run `sandbox start` once cleanup completes. A CLI wait timeout is separate from this gateway deadline. Follow the published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md) and confirm current replacement/detach syntax with installed CLI help.
 
 An endpoint with omitted `protocol` retains explicit-proxy behavior. Explicit
 `protocol: tcp` requests policy DNS and transparent TCP and currently requires
@@ -543,11 +557,15 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision. After initial release authorization, changes to `filesystem_policy`, `landlock`, or `process` require a new sandbox. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
-Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
+Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
+messages when the implementation advertises the matching binding. The built-in
+`openshell/regex` supports request bodies and client WebSocket text messages.
+Use the `generate-sandbox-policy` skill to choose attachments and failure policy,
+and `debug-openshell-cluster` to investigate middleware failures.
 
 ### Step 5: Push the updated policy
 
@@ -721,7 +739,7 @@ When denied actions appear:
 
 1. Prefer incremental updates for additive network changes:
    `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
-   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
+   `openshell policy update work-session --rule-name allow_api_github_com_443 --binary /usr/bin/gh --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 
    A rule authorizes every binary it lists to reach every endpoint it lists, so
    an update that adds a binary or an endpoint to an existing rule must declare
@@ -732,10 +750,7 @@ When denied actions appear:
    `--rule-name`; it stays on its own rule instead of folding into the broader
    one.
 
-   `--add-allow` and `--add-deny` select an endpoint by host and port alone. If
-   that host and port appears in more than one rule, or twice in one rule under
-   different paths, the update is rejected as ambiguous. Fall back to full YAML
-   replacement for those endpoints.
+   `--add-allow` and `--add-deny` require `--rule-name` and the complete binary scope through repeated `--binary` or explicit `--any-binary`. Declare every port on the endpoint in the operation, for example `api.example.com:443,8443:POST:/admin`. Use `--endpoint-path` to disambiguate endpoints within the selected rule; an explicitly empty path selects an endpoint without a path selector. The gateway rejects missing or mismatched scope before persistence. Inspect the current policy and confirm the intended affected scope; do not automatically fill declarations from current policy just to make a rejection pass.
 2. Use full YAML replacement for broad changes or non-network fields, including
    any change that would otherwise require restating a large existing scope:
    `openshell policy get work-session --full > policy.yaml`
@@ -758,14 +773,14 @@ endpoint, create the provider, and attach it only to sandboxes that need it:
 ```bash
 openshell provider profile import -f ./inference-provider.yaml
 openshell provider create --name model-provider --type <profile-id> --credential <KEY>
-openshell sandbox provider attach work-session model-provider
+openshell sandbox provider attach work-session model-provider --wait --timeout 30
 openshell sandbox exec work-session -- <client-command>
 ```
 
 The application owns the native base URL, model, request shape, and timeout.
-Launch a new process after attaching a provider so it inherits the provider
-credential placeholder. Use the `debug-inference` skill for endpoint, policy,
-credential-binding, or migration failures.
+Launch a new process after attachment readiness so it inherits the installed provider environment. Use the `debug-inference` skill for endpoint, policy, credential-binding, or migration failures.
+
+For an ordinary static provider update, wait for the update and launch a new client process to obtain the new reference. Do not claim that readiness updates the environment of an existing process or retargets its old reference. Acknowledged detach revokes retained references and removes them from future process environments.
 
 ## Workflow 8: Gateway Management
 
@@ -878,4 +893,4 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
-| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from `inference.local` |
+| `debug-inference` | Diagnosing attached-provider inference, native endpoints, host-backed models, and migration from the retired managed endpoint |

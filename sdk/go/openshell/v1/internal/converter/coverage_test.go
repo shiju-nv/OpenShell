@@ -33,7 +33,12 @@ func TestConverterCoversAllProtoFields_SandboxSpec(t *testing.T) {
 		"tty":                   true,
 	}
 
-	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, nil)
+	// The gateway owns this identity. Provider status exposes it through the
+	// raw API; callers must not supply it when constructing a sandbox spec.
+	skipped := fieldSet{
+		"provider_attachment_epoch": true,
+	}
+	assertAllFieldsCovered(t, (&pb.SandboxSpec{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxTemplate(t *testing.T) {
@@ -123,30 +128,35 @@ func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 		"configuration_desired":               true,
 		"configuration_activation_authorized": true,
 	}
-	// The instance ID coordinates internal gateway/supervisor lifecycle fencing
-	// and idempotent status reconciliation. It is exposed only through the raw protobuf API.
-	skipped := fieldSet{"main_process_instance_id": true}
+	// The instance ID and first-admission marker coordinate gateway lifecycle
+	// reconciliation. Provisioning carries gateway-owned attempt, deadline, and
+	// cleanup state; its outcome is exposed through phase and conditions. Detailed
+	// lifecycle bookkeeping remains available through the raw protobuf API.
+	skipped := fieldSet{"main_process_instance_id": true, "configuration_activated": true, "provisioning": true}
 
 	assertAllFieldsCovered(t, (&pb.SandboxStatus{}).ProtoReflect().Descriptor(), handled, skipped)
 }
 
 func TestConverterCoversAllProtoFields_SandboxConfigurationAdmission(t *testing.T) {
 	handled := fieldSet{
-		"state":                  true,
-		"instance_id":            true,
-		"runtime_generation":     true,
-		"boundary_instance_id":   true,
-		"boundary_session_id":    true,
-		"policy_version":         true,
-		"policy_hash":            true,
-		"config_revision":        true,
-		"provider_env_revision":  true,
-		"policy_source":          true,
-		"configuration_snapshot": true,
-		"registration_revision":  true,
-		"delivery_revision":      true,
-		"activation_confirmed":   true,
-		"error":                  true,
+		"state":                        true,
+		"instance_id":                  true,
+		"runtime_generation":           true,
+		"boundary_instance_id":         true,
+		"boundary_session_id":          true,
+		"policy_version":               true,
+		"policy_hash":                  true,
+		"config_revision":              true,
+		"provider_env_revision":        true,
+		"provider_attachment_epoch":    true,
+		"publication_generation":       true,
+		"provider_env_installation_id": true,
+		"policy_source":                true,
+		"configuration_snapshot":       true,
+		"registration_revision":        true,
+		"delivery_revision":            true,
+		"activation_confirmed":         true,
+		"error":                        true,
 	}
 	assertAllFieldsCovered(t, (&pb.SandboxConfigurationAdmission{}).ProtoReflect().Descriptor(), handled, nil)
 }
@@ -162,6 +172,7 @@ func TestConverterCoversAllProtoFields_SandboxConfigurationSnapshot(t *testing.T
 		"policy_hash":                       true,
 		"config_revision":                   true,
 		"provider_env_revision":             true,
+		"provider_attachment_epoch":         true,
 		"policy_source":                     true,
 		"registration_revision":             true,
 		"delivery_revision":                 true,
@@ -183,6 +194,7 @@ func TestConverterCoversAllProtoFields_GetSandboxConfigResponse(t *testing.T) {
 		"policy_source":                       true,
 		"global_policy_version":               true,
 		"provider_env_revision":               true,
+		"provider_attachment_epoch":           true,
 		"policy_validation_failure_mode":      true,
 		"configuration_admitted":              true,
 		"configuration_error":                 true,

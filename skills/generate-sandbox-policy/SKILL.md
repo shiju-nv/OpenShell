@@ -87,7 +87,7 @@ Regardless of tier, extract (or infer) these from the user's description:
 | **Paths** | Specific URL paths or patterns | Only for custom/fine-grained |
 | **Enforcement** | `enforce` or `audit`? Default to `enforce`. | No — has a default |
 | **Binary** | Which binary/process should have access | Yes — ask if not stated |
-| **Middleware** | Whether admitted HTTP requests or client WebSocket text messages need an ordered built-in or operator-run processing stage | No |
+| **Middleware** | Whether admitted HTTP requests, final HTTP responses, or client WebSocket text messages need an ordered built-in or operator-run processing stage | No |
 
 If the host and access level are clear but binaries are not specified, ask the user which binary or process will be making the requests. Suggest common defaults like `/usr/bin/curl`, `/usr/local/bin/claude`, etc.
 
@@ -185,6 +185,12 @@ When middleware is requested, also read the published [supervisor middleware gui
 
 For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md) and the [default policy reference](https://docs.nvidia.com/openshell/latest/reference/default-policy.md). The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`).
 
+Validate the intended provider combination as well as the authored policy.
+An image endpoint can become credentialed after provider composition and block
+startup with `ConfigurationInvalid`. Repair the complete policy or provider
+selection using the published policy workflow; do not add
+`allow_uninspected_credentials` merely to bypass a startup error.
+
 ## Step 4: Choose Policy Shape
 
 Follow this decision tree based on the detail tier and user intent:
@@ -221,14 +227,13 @@ Is L7 inspection needed?
 
 ### Middleware Decision
 
-Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests or client WebSocket text messages. Middleware runs after network and L7 policy admission and before provider credential injection.
+Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests, final HTTP responses, or client WebSocket text messages. Request middleware runs after network and L7 policy admission and before provider credential injection. Response middleware runs on the matching final response before it returns to the sandbox.
 
 - Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
-- Confirm that a requested WebSocket implementation exposes a `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding. `openshell/regex` exposes this binding. A host-matched HTTP-only implementation may inspect the upgrade GET but does not join the post-upgrade chain; messages pass and OpenShell emits `binding_not_selected` coverage regardless of `on_error`.
-- WebSocket middleware runs for both `ws://` and `wss://` and receives complete client text messages only. Binary messages pass under both error modes and emit `unsupported_message_type` coverage for active stages. Upstream-to-client messages remain uninspected. Do not claim that V1 provides all-message WebSocket inspection.
-- Treat `fail_open` on WebSocket as a session-scoped bypass: if the stage stream fails, OpenShell disables it for later messages on that connection and emits a state-change finding. Prefer `fail_closed` for required redaction or authorization.
-- `on_error` governs failures after an advertised operation binding is selected. It does not apply to an unadvertised WebSocket binding or binary-message pass-through. An explicit HTTP, WebSocket preflight, or WebSocket message denial is authoritative under both `fail_open` and `fail_closed`.
+- Confirm that the implementation advertises the requested binding: `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, or `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. A host match alone does not enable inspection.
+- WebSocket middleware inspects client text messages only, over both `ws://` and `wss://`. Binary and upstream-to-client messages pass without inspection, even with `fail_closed`.
+- `on_error` controls selected-stage failures. Explicit denials always block traffic. A failed WebSocket stage with `fail_open` can remain bypassed for the rest of the connection.
 - Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
 - Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
 - Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
@@ -384,15 +389,19 @@ When repairing a rejected sandbox, inspect the desired configuration error and e
 
 ```fish
 openshell sandbox get my-sandbox --output json
-openshell policy get my-sandbox --base > repair-policy.yaml
+if openshell policy get my-sandbox --base > policy-inspection.txt
+    sed '1,/^---$/d' policy-inspection.txt > repair-policy.yaml
+end
 openshell sandbox provider list my-sandbox
 ```
+
+The default `policy get --base` output includes metadata before its `---` separator. The extraction keeps only the authored YAML payload. Inspect that payload before editing or submitting it; if no policy is available, start from the intended authored policy.
 
 Correct the policy or the attached provider's credentials, profile coverage, or binding, then submit the corrected policy with `openshell policy set my-sandbox --policy repair-policy.yaml --wait` when a policy change is needed. The JSON `policy_source` describes `sandbox` or `global` gateway policy scope; it does not identify whether the sandbox policy came from an image or defaults. Check the governing scope before proposing a repair.
 
 Static fields (`filesystem_policy`, `landlock`, and `process`) can be repaired only while admission is pending or rejected and `configuration_activation_authorized` is explicitly `false`. The first authorization to release the workload consumes that permission before execution may begin. A missing value or restart does not restore it. After authorization, generate a policy for a new sandbox when static fields must change.
 
-Verify `configuration_admission.activation_confirmed` and sandbox readiness after repair. Gateway admission and an accepted held installation are intermediate states; `loaded` follows the final report for matching policy/providers and current runtime instances. A rejected desired candidate can leave an earlier accepted configuration active only under `retain_last_valid`. The default `fail_closed` posture holds workload execution and readiness until a valid configuration activates. A successful initial repair starts the waiting workload once. Standalone network-proxy use retains local-file policy loading and does not use sandbox admission status.
+Verify `configuration_admission.activation_confirmed` and sandbox readiness after repair. Gateway admission and an accepted held installation are intermediate states; `loaded` follows the final report for matching policy/providers and current runtime instances. A rejected desired candidate can leave an earlier accepted configuration active only under `retain_last_valid`. The default `fail_closed` posture holds workload execution and readiness until a valid configuration activates. A successful initial repair within the provisioning repair window starts the waiting workload once; after `ProvisioningTimedOut`, follow the published [policy repair guidance](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md) for cleanup and explicit restart. Standalone network-proxy use retains local-file policy loading and does not use sandbox admission status.
 
 ### Hard Errors (would block sandbox startup)
 
@@ -408,6 +417,7 @@ Verify `configuration_admission.activation_confirmed` and sandbox readiness afte
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
 - [ ] Any required WebSocket control advertises `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and the user understands that V1 does not inspect binary messages
+- [ ] Any required response control advertises `HTTP_RESPONSE/PRE_RETURN`
 - [ ] Endpoints contributed by a credentialed provider are not L4-only or `tls: skip` unless `allow_uninspected_credentials: true` explicitly records the exception
 
 ### Schema Warnings (log-only, but should be fixed)

@@ -4,11 +4,117 @@
 // Included in boundary_server's Linux test module so the matrix exercises the
 // production transitions with the same real child fixture as reconnect tests.
 
+#[tokio::test]
+async fn configuration_activation_same_revision_repair_orders_publications() {
+    let (boundary, _) = availability_test_runtime();
+    register_test_boundary(&boundary);
+    let initial = activate_test_configuration(&boundary, 6, std::collections::HashMap::new());
+    let configuration = initial.configuration.clone();
+    let repair_id = uuid::Uuid::new_v4().to_string();
+    let repaired_environment =
+        std::collections::HashMap::from([("TOKEN".to_string(), "repaired".to_string())]);
+    let prepared = boundary
+        .prepare_configuration(
+            initial.identity.clone(),
+            Some(configuration.clone()),
+            initial.publication_generation,
+            configuration.clone(),
+            repaired_environment.clone(),
+            repair_id.clone(),
+        )
+        .unwrap();
+    assert!(prepared.publication_generation > initial.publication_generation);
+    let installed = boundary.commit_configuration(&prepared).unwrap();
+    let released = boundary.release_configuration(&installed).unwrap();
+    assert_eq!(
+        released.configuration, configuration,
+        "repair retains the logical delivery and fingerprint"
+    );
+    assert_eq!(released.provider_env_installation_id, repair_id);
+    assert_eq!(
+        lock(&boundary.activation).provider_env,
+        repaired_environment
+    );
+    assert_eq!(
+        boundary
+            .prepare_configuration(
+                initial.identity.clone(),
+                Some(configuration.clone()),
+                initial.publication_generation,
+                configuration.clone(),
+                repaired_environment,
+                repair_id.clone(),
+            )
+            .unwrap(),
+        prepared,
+        "an identical uncertain operation retains its token"
+    );
+
+    assert!(
+        boundary
+            .prepare_configuration(
+                initial.identity.clone(),
+                Some(configuration.clone()),
+                initial.publication_generation,
+                configuration.clone(),
+                std::collections::HashMap::new(),
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .is_err(),
+        "a delayed same-tuple publication cannot replace the repair"
+    );
+    assert!(
+        boundary
+            .prepare_configuration(
+                initial.identity.clone(),
+                Some(configuration.clone()),
+                released.publication_generation,
+                configuration.clone(),
+                std::collections::HashMap::new(),
+                repair_id,
+            )
+            .is_err(),
+        "one installation identity cannot name different environment bytes"
+    );
+    assert_eq!(
+        lock(&boundary.activation).released.as_ref(),
+        Some(&released)
+    );
+
+    lock(&boundary.activation).publication_generation = u64::MAX;
+    assert!(
+        boundary
+            .prepare_configuration(
+                initial.identity,
+                Some(configuration.clone()),
+                released.publication_generation,
+                configuration,
+                std::collections::HashMap::new(),
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .is_err(),
+        "generation exhaustion fails before holding an active workload"
+    );
+    assert_eq!(
+        lock(&boundary.activation).released.as_ref(),
+        Some(&released)
+    );
+    assert_eq!(
+        boundary
+            .configuration_snapshot()
+            .unwrap()
+            .publication_generation,
+        released.publication_generation
+    );
+}
+
 fn mutate_activation_receipt(
     field: &str,
     identity: &mut ConfigurationActivationIdentity,
     configuration: &mut ConfigurationRevision,
     transition: &mut String,
+    publication_generation: &mut u64,
+    installation_id: &mut String,
 ) {
     match field {
         "configuration_revision" => configuration.config_revision += 1,
@@ -18,6 +124,7 @@ fn mutate_activation_receipt(
             configuration.policy_source = openshell_core::proto::PolicySource::Global as i32;
         }
         "provider_revision" => configuration.provider_env_revision += 1,
+        "provider_attachment_epoch" => configuration.provider_attachment_epoch.push('x'),
         "runtime_generation" => identity.runtime_generation.push_str("-different"),
         "session" => identity.boundary_session_id = uuid::Uuid::new_v4().to_string(),
         "supervisor_instance" => {
@@ -26,6 +133,8 @@ fn mutate_activation_receipt(
         "boundary_instance" => identity.boundary_instance_id = uuid::Uuid::new_v4().to_string(),
         "registration_revision" => identity.registration_revision += 1,
         "transition_id" => *transition = uuid::Uuid::new_v4().to_string(),
+        "publication_generation" => *publication_generation += 1,
+        "provider_installation_id" => *installation_id = uuid::Uuid::new_v4().to_string(),
         _ => panic!("unknown activation receipt field: {field}"),
     }
 }
@@ -45,12 +154,15 @@ fn configuration_activation_identity_mismatch_matrix_holds_real_workload() {
         "policy_hash",
         "policy_source",
         "provider_revision",
+        "provider_attachment_epoch",
         "runtime_generation",
         "session",
         "supervisor_instance",
         "boundary_instance",
         "registration_revision",
         "transition_id",
+        "publication_generation",
+        "provider_installation_id",
     ] {
         let fixture = RunningActivationFixture::new();
         let old = test_active_receipt(&fixture.boundary);
@@ -64,6 +176,8 @@ fn configuration_activation_identity_mismatch_matrix_holds_real_workload() {
             &mut wrong_preparation.identity,
             &mut wrong_preparation.configuration,
             &mut wrong_preparation.transition_id,
+            &mut wrong_preparation.publication_generation,
+            &mut wrong_preparation.provider_env_installation_id,
         );
         assert_ne!(wrong_preparation, prepared);
         assert!(
@@ -87,6 +201,8 @@ fn configuration_activation_identity_mismatch_matrix_holds_real_workload() {
             &mut wrong_installation.identity,
             &mut wrong_installation.configuration,
             &mut wrong_installation.transition_id,
+            &mut wrong_installation.publication_generation,
+            &mut wrong_installation.provider_env_installation_id,
         );
         assert_ne!(wrong_installation, installed);
         assert!(
@@ -152,6 +268,8 @@ fn configuration_activation_abort_requires_explicit_reactivation_of_real_workloa
         identity: old.identity.clone(),
         transition_id: old.transition_id.clone(),
         configuration: old.configuration.clone(),
+        publication_generation: old.publication_generation,
+        provider_env_installation_id: old.provider_env_installation_id.clone(),
     };
     assert!(
         fixture
@@ -169,8 +287,10 @@ fn configuration_activation_abort_requires_explicit_reactivation_of_real_workloa
         .prepare_configuration(
             snapshot.identity,
             snapshot.installed,
+            snapshot.publication_generation,
             old.configuration.clone(),
             old_environment,
+            uuid::Uuid::new_v4().to_string(),
         )
         .unwrap();
     assert_ne!(retained.transition_id, old.transition_id);
@@ -224,8 +344,10 @@ fn configuration_activation_delayed_release_cannot_resume_a_quiesced_workload() 
         .prepare_configuration(
             snapshot.identity,
             snapshot.installed,
+            snapshot.publication_generation,
             released.configuration.clone(),
             environment,
+            uuid::Uuid::new_v4().to_string(),
         )
         .unwrap();
     let retry_installation = fixture.boundary.commit_configuration(&retry).unwrap();

@@ -29,6 +29,8 @@ bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
 The sandbox probes HTTP/2 connection liveness every five seconds and closes connections that miss a ten-second acknowledgement deadline. Closing a connection freezes the owned workload process tree and cancels its stream bridges before releasing the exclusive DNS mediation lease. The supervisor has 30 seconds to recover. A replacement supervisor uses a new process instance ID and a gateway-signed registration grant bound to the current sandbox, driver generation, authentication epoch, boundary session and incarnation, and registration revision. The boundary rejects stale grants and acknowledges the registered identity. Confirmation proves isolation but leaves the workload frozen. Recovery requires complete configuration installation, gateway acceptance, and an exact release acknowledgement; expiry terminates the workload. Idle healthy connections remain usable.
 
+TCP mediation accepts use the same authenticated transport recovery as process waits. A healthy idle accept has no timeout. An interrupted pending open fails closed, while a replacement accept waits for new workload traffic and confirmed configuration release; decisions and established byte streams are not replayed. Boundary rejections and failed recovery remain terminal to the proxy.
+
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
 
 Unauthenticated TLS handshakes have a separate bounded asynchronous pool and
@@ -278,6 +280,23 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
+The selected middleware chain can also inspect the final HTTP response before
+it returns to the workload. Stages select header-only, whole-body, or streaming
+inspection independently. The relay owns response framing when body bytes can
+change. Preflight exposes upstream `Content-Length`, `Content-Encoding`, and
+`Content-Range` as read-only metadata, while the relay emits final framing
+separately from middleware-visible headers. Stage failures follow policy-local
+`on_error`; explicit denials always block delivery. Once delivery has started,
+blocking aborts the response.
+
+The network supervisor represents the destination-selected request and response
+pair as one `HttpMiddlewareExchange`. It retains the full chain, runner, request
+identity, and policy generation while request and response bindings are selected
+independently. The HTTP response adapter owns wire parsing, downstream commit
+state, generation fences, framing, and transport error classification. The
+generic middleware crate owns stage selection, remote stream lifecycle, ordered
+body processing, limits, and result validation.
+
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
@@ -307,17 +326,11 @@ security logs. See
 [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx) for
 configuration and protocol details.
 
-`https://inference.local` is special. It bypasses OPA network policy and is
-handled by the inference interception path:
-
-1. The proxy terminates the local TLS connection with the sandbox CA.
-2. It detects known OpenAI, Anthropic, and compatible inference request shapes.
-3. It strips caller-supplied credentials and disallowed headers.
-4. It forwards through `openshell-router` using the route bundle fetched from
-   the gateway.
-
-External inference endpoints that do not use `inference.local` are treated like
-ordinary network traffic and must be allowed by policy.
+Inference providers use the same egress path as other external services. An
+attached provider profile contributes endpoint and binary policy. The proxy
+then resolves the provider's credential placeholder only when both policy and
+the profile's endpoint binding authorize the native request. Model selection,
+request shape, headers, streaming, and timeouts remain client concerns.
 
 In proxy-required networks, the supervisor chains upstream TLS tunnels through
 a corporate forward proxy with HTTP CONNECT instead of connecting directly,
@@ -574,17 +587,79 @@ the structured 403 and authors the narrowest rule. Mechanistically mapping L7
 would either over-broaden rules or require path-templating logic that rots
 quickly.
 
+## Configuration Admission
+
+Gateway-managed supervisors reconcile configuration before launching the main
+process or exposing workload services. Admission covers the effective policy,
+provider layers, credential bindings, and gateway-derived provenance. Explicit
+user and global policy precedence is unchanged; an image without a policy uses
+the restrictive baseline. An invalid image policy does not become a launchable
+default.
+
+The gateway tracks configuration admission independently of compute health.
+A blocked startup remains `Provisioning` with a `ConfigurationInvalid` readiness
+condition, even when the container backend reports readiness. Gateway management
+operations remain available. The TUI summarizes configuration rejection in sandbox
+NOTES alongside active port forwards; the detail view wraps the full diagnostic,
+which is also available through sandbox inspection.
+Replacing the policy or repairing providers allows
+the same supervisor to reconcile and launch; it does not recreate the sandbox.
+Startup retries continue reporting readiness, but unchanged configuration rejections
+produce only one log event. A changed configuration or diagnostic emits a new
+rejection event; successful repair emits a recovery event.
+The gateway gives each initial provisioning attempt and explicit restart a
+300-second repair window. Persisted configuration-source clocks reset the window
+from the latest effective stored change, including settings deletion and provider
+attachment changes. The first accepted rejection for that generation grants one
+full window; repeated reports and reconnects do not extend it. Ready disarms the
+timer. Failed desired updates to a running sandbox do not arm it.
+
+A leader-owned scan runs independently of driver inventory. Expiry records
+`Error`/`ProvisioningTimedOut` before reclaiming compute; cleanup progress and
+backoff survive restart. Late runtime reports cannot replace that result. The
+record and restartable storage survive cleanup, including for ephemeral creates.
+Explicit start is blocked while cleanup is pending, then creates a fresh attempt
+using the latest configuration. Configuration edits alone never restart an
+expired sandbox. Legacy provisioning records receive one persisted rollout
+window. Cross-object configuration serialization uses the gateway's existing
+single-writer guard; enabling concurrent configuration writers still requires
+the database-backed invariant work tracked by #1255.
+
+Docker startup health remains unready during policy quarantine. A failed probe
+does not terminate a live provisioning supervisor; the gateway deadline owns
+that decision. Cleanup cancels pending driver startup before stopping compute
+so a late startup failure cannot remove retained workload storage.
+
+Static policy fields can be replaced only while admission is pending or rejected and durable state explicitly records that release has never been authorized. The first authorization closes this repair window before any workload may run, including across stop/start and later rejected configurations. Records without the marker retain static-field immutability.
+Admission validates policy composition; image and host setup failures, such as
+an unresolved OCI user or unavailable isolation facilities, retain their existing
+startup error behavior.
+
+Startup captures the matching effective policy and provider environment before constructing the runtime. Restart requires fresh configuration activation for the new runtime generation. Permanent gateway errors and exhausted transient retries terminate startup; each RPC attempt has a 10-second deadline, including acceptance reports. Only acknowledged configuration rejections wait for repair within the gateway's provisioning deadline. Image discovery uses the authenticated sandbox boundary control request deadline.
+
+Policy and provider refreshes are prepared before publication. Publication
+invalidates prior policy guards before exposing new provider material and swaps
+the policy under the same publication locks. Rejected candidates cannot install
+their credentials alongside the previous policy. Existing runtime fail-closed
+checks remain necessary for in-flight traffic and invalid live updates.
+
+The supervisor reads the workload image policy through an authenticated, read-only `DiscoverPolicy` boundary request before attaching or launching the workload. The boundary reads only the well-known policy paths, bounds the response, and distinguishes missing policy from unreadable or invalid content. Discovery also returns the boundary identity and immutable workload filesystem baseline. The supervisor obtains a gateway-signed registration grant before attaching, then validates the composed configuration before any workload release. Workload image environment variables cannot configure the isolated supervisor.
+
 ## Configuration Activation and Policy Acknowledgement
 
-Gateway-managed activation compares the complete delivered identity: configuration revision, policy version/hash/source, provider environment revision, snapshot token and delivery revision. It also binds that identity to the driver runtime generation, boundary session/incarnation, supervisor instance, and signed registration revision. A matching policy hash alone cannot acknowledge a provider or settings change.
+Gateway-managed activation compares the complete delivered identity: configuration revision, policy version/hash/source, provider attachment epoch and environment revision, snapshot token, and delivery revision. It also binds that identity to the driver runtime generation, boundary session/incarnation, supervisor instance, and signed registration revision. A matching policy hash alone cannot acknowledge a provider or settings change.
 
 The gateway keeps desired configuration separate from accepted installation state. The supervisor prepares the exact candidate, freezes execution, and stages its boundary environment. It publishes OPA and matching credentials together, then commits the boundary installation while the workload stays frozen. The gateway accepts that held installation before authorizing release. The boundary releases only the matching committed transition, and the supervisor sends a final `activation_confirmed` report. Only that matching final report advances `current_policy_version` and marks policy history `loaded`.
+
+Provider readiness remains a separate observation. The supervisor records the actual installed credential snapshot and policy generation, then obtains an authenticated acknowledgement for the exact child-environment publication. A repaired environment may have the same opaque provider revision but a new installation identity; old acknowledgement evidence cannot satisfy that publication. Withheld or expired matching snapshots clear static credentials, and a configuration acceptance does not substitute for this process installation evidence.
 
 Acceptance before release is deliberate. The gateway persists `configuration_activation_authorized = true` before it permits the first release, closing the static-policy repair window before any workload may run. Before that point, an explicit never-authorized marker and pending/rejected admission permit repair of an invalid initial policy. Missing state does not grant repair authority. Rejected initial configuration remains inspectable and authenticatable while execution stays blocked.
 
 A lost or mismatched commit/release response keeps control readiness false. Retries use the same immutable transition; a successful release with a lost response may already have resumed the workload. Replaying the initial start returns the existing process for matching immutable launch inputs and cannot start a second process. Mutable provider state is installed through activation rather than changing that replay identity.
 
-`PolicySource` names the selected gateway scope, `sandbox` or `global`; it does not identify whether sandbox policy originated in an image or from a restrictive default. A local-file standalone network proxy keeps its file-driven reload path and does not report sandbox configuration activation. Workload image files and environment variables do not configure the separately isolated supervisor.
+Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than zero) use the policy revision acknowledgement API. Global policies use the configuration admission contract without a sandbox policy revision acknowledgement. `PolicySource` names the selected gateway scope, `sandbox` or `global`; it does not identify whether sandbox policy originated in an image or from a restrictive default.
+
+Local Rego/data overrides remain available for standalone development; combining them with a gateway-managed sandbox is rejected because the gateway cannot admit the runtime policy it would enforce. A local-file standalone network proxy keeps its file-driven reload path and does not report sandbox configuration activation. Workload image files and environment variables do not configure the separately isolated supervisor.
 
 ## Failure Behavior
 

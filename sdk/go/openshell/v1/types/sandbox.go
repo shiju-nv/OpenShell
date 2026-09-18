@@ -143,40 +143,48 @@ const (
 // SandboxConfigurationAdmission identifies a validated or rejected configuration.
 // Accepted validation only confirms runtime activation when ActivationConfirmed is true.
 type SandboxConfigurationAdmission struct {
-	State                 ConfigurationAdmissionState
-	InstanceID            string
-	RuntimeGeneration     string
-	BoundaryInstanceID    string
-	BoundarySessionID     string
-	PolicyVersion         uint32
-	PolicyHash            string
-	ConfigRevision        uint64
-	ProviderEnvRevision   uint64
-	PolicySource          PolicySource
-	ConfigurationSnapshot string
-	RegistrationRevision  uint64
-	DeliveryRevision      uint64
-	ActivationConfirmed   bool
-	Error                 string
+	State               ConfigurationAdmissionState
+	InstanceID          string
+	RuntimeGeneration   string
+	BoundaryInstanceID  string
+	BoundarySessionID   string
+	PolicyVersion       uint32
+	PolicyHash          string
+	ConfigRevision      uint64
+	ProviderEnvRevision uint64
+	// ProviderAttachmentEpoch distinguishes provider detach/reattach generations.
+	ProviderAttachmentEpoch string
+	// PublicationGeneration orders installed environments within the registered control session.
+	PublicationGeneration uint64
+	// ProviderEnvInstallationID identifies the exact locally installed credential snapshot.
+	ProviderEnvInstallationID string
+	PolicySource              PolicySource
+	ConfigurationSnapshot     string
+	RegistrationRevision      uint64
+	DeliveryRevision          uint64
+	ActivationConfirmed       bool
+	Error                     string
 }
 
 // SandboxConfigurationSnapshot identifies an immutable gateway configuration delivery.
 // Admitted describes gateway validation; runtime activation is reported separately.
 type SandboxConfigurationSnapshot struct {
-	SnapshotID           string
-	InstanceID           string
-	RuntimeGeneration    string
-	BoundaryInstanceID   string
-	BoundarySessionID    string
-	PolicyVersion        uint32
-	PolicyHash           string
-	ConfigRevision       uint64
-	ProviderEnvRevision  uint64
-	PolicySource         PolicySource
-	RegistrationRevision uint64
-	DeliveryRevision     uint64
-	Admitted             bool
-	Error                string
+	SnapshotID          string
+	InstanceID          string
+	RuntimeGeneration   string
+	BoundaryInstanceID  string
+	BoundarySessionID   string
+	PolicyVersion       uint32
+	PolicyHash          string
+	ConfigRevision      uint64
+	ProviderEnvRevision uint64
+	// ProviderAttachmentEpoch is the provider attachment generation bound to this delivery.
+	ProviderAttachmentEpoch string
+	PolicySource            PolicySource
+	RegistrationRevision    uint64
+	DeliveryRevision        uint64
+	Admitted                bool
+	Error                   string
 	// PolicyValidationFailureMode is the failure posture bound to this delivery.
 	PolicyValidationFailureMode string
 	// GatewayConfigurationFingerprint identifies the gateway services and auth configuration.

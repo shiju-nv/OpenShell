@@ -26,6 +26,10 @@ The live supervisor session identifies the current main-process instance. Readin
 
 The supervisor reports its normalized result through the sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects results from stale instance IDs. Foreground creation carries a one-shot attachment intent to the process supervisor. The supervisor durably reports the result immediately, accepts that declared SSH attachment even when the process has already exited, sends the retained output and exit status, and waits for the peer's channel close before finalizing the result for ephemeral cleanup. Detached commands carry no attachment intent, so they finalize and exit immediately without a grace period. Finalization is persisted separately from the exit result; the gateway deletes an ephemeral sandbox only after the finalized supervisor session disconnects.
 
+Local Docker development builds the supervisor image separately from the
+`openshell-sandbox` workload runtime. Cross-platform runtime extraction uses
+the sandbox image, which exports `/openshell-sandbox`.
+
 ## Configuration Boundary
 
 The gateway accepts exactly schema version 2. Missing, legacy, and future
@@ -42,7 +46,7 @@ The gateway validates this requirement before constructing the selected driver.
 
 ### Effective configuration admission
 
-The gateway stores the desired delivered snapshot separately from the accepted installation in sandbox status. A registered control poll issues an immutable snapshot/token covering the selected policy, runtime settings and provider revision. Provider fetches must match that revision. New provider/global changes become desired at the next authoritative poll; ordinary CLI reads do not issue generations or establish runtime acceptance.
+The gateway stores the desired delivered snapshot separately from the accepted installation in sandbox status. A registered control poll issues an immutable snapshot/token covering the selected policy, runtime settings, provider attachment epoch, and provider environment revision. Provider fetches must match the attachment epoch, provider revision, and effective policy hash. New provider/global changes become desired at the next authoritative poll; ordinary CLI reads do not issue generations or establish runtime acceptance.
 
 Pending registration uses compare-and-swap against the current control/boundary pair. The gateway signs a registration grant bound to the sandbox, driver runtime generation, authentication epoch, control instance, boundary session/incarnation and monotonic registration revision. This permits a replacement control to take over a surviving boundary while fencing old grants and reports. A destroyed boundary requires a new driver runtime generation.
 
@@ -227,11 +231,12 @@ observation or evaluation failures outside binding policy emit warnings and the
 The gateway reconstructs the original response frames, including trailers and
 body errors, before evaluating the observer.
 
-Interceptor manifests can also vend provider profile catalogs. Gateway
-configuration selects the exact ordered source set from the in-tree built-in
-source, the stored user source, and named profile-capable interceptors. Omitting
-the setting selects `builtin + user`; selecting only an interceptor makes it
-authoritative by omission. Every selected source uses the same snapshot,
+Interceptor manifests can also vend provider profile catalogs. No profile is
+compiled into the gateway: configuration selects the exact ordered source set
+from the stored user source and named profile-capable interceptors. Omitting the
+setting selects the user source alone, so a gateway with nothing imported serves
+an empty catalog; selecting only an interceptor makes it authoritative by
+omission. Every selected source uses the same snapshot,
 semantic-validation, and duplicate-detection path. Duplicate normalized profile
 IDs fail instead of creating source precedence. The gateway treats configured
 interceptors as trusted sources and does not verify signature annotations in
@@ -382,6 +387,10 @@ Public RPC contracts and durable protobuf formats have separate ownership. The `
 
 `ReportEndpointStatus` is a sandbox-authenticated public gateway RPC. Its request, response, and `EndpointObservation` messages belong only to the public closure. `EndpointStatus` and `EndpointResult` also belong to the durable closure because `Sandbox.status.endpoint_statuses` persists them. The repeated status field uses a new wire tag; stored sandboxes without it decode with an empty endpoint list and retain their lifecycle fields. A fixed payload encoded with the earlier sandbox schema verifies that no database rewrite is required.
 
+Allow and deny append requests carry `L7RuleTarget` to declare the rule, endpoint, and complete affected scope. The removed `host` and `port` fields remain reserved by number and name, and requests without a target are rejected. These mutation requests are not persisted formats.
+
+`GetSandboxProviderStatus` and `ReportProviderReadiness` are unary public gateway RPCs. The first lets authorized users inspect a provider change; the second accepts installation reports only from the sandbox's current authenticated supervisor session.
+
 The removed `NetworkBinary.harness` field remains reserved by number and name,
 so protobuf implementations cannot reuse its wire slot or source identifier.
 The durable-policy compatibility decoder reads the former boolean before Prost
@@ -403,8 +412,10 @@ than extending the frozen message.
 | SQL materializations | `StoredPolicyRevision`, `StoredDraftChunk` | Server-only typed results assembled from indexed columns and decoded payloads; not public RPC messages. |
 | Public messages used directly as encoded storage roots | `Sandbox`, `SandboxWorkloadTemplate`, `Provider`, `Workspace`, `WorkspaceMember`, `SshSession`, `ServiceEndpoint` | The generated public type is also the persisted payload. `SshSession` is not in the current public RPC message closure. |
 | Embedded encoded root | `SandboxPolicy` | Stored in policy rows and inside the JSON settings envelope. |
+| Configuration operation storage root | `StoredConfigUpdateOperation` | One common operation resource stores the exact provider target, receipt projection, snapshot failure reason, and historical outcome. |
+| Public dependencies of an operation | `ConfigUpdateOperation`, `ProviderMutationReceipt`, `ProviderReadinessReason` | Their complete message and enum closures are durable contracts. |
 
-The descriptor-derived tests own the complete durable message and enum inventories, their fingerprints, and their overlap with public RPC contracts. The tables here record the reviewed storage roots and classifications. Configuration admission and desired-configuration status are governed by the durable `Sandbox` dependency closure. Optional mutation request IDs extend public request fields without adding messages to these closures or changing the durable protobuf schema.
+The descriptor-derived tests own the complete public, durable, and intersecting inventories and their reviewed fingerprints. The tables here record their roots and classifications. Configuration admission and desired-configuration status are governed by the durable `Sandbox` dependency closure. A synthetic sandbox-spec byte fixture verifies that an absent server-owned attachment epoch decodes to the valid empty initial identity; direct and template creation tests separately require the gateway to replace any caller-supplied epoch. Optional mutation request IDs extend public request fields without adding messages to these closures or changing the durable protobuf schema.
 
 Public delete, membership-removal, and SSH-revocation responses use
 `DeletionOutcome`, not a transport-success boolean. `COMPLETED` establishes
@@ -424,6 +435,29 @@ and number; this coordinated pre-1.0 API change does not alter durable schemas.
 The outcome alone does not provide request deduplication. Opted-in unary methods
 require a request UUID for the admission contract.
 
+Configuration admission adds `SandboxStatus.configuration_admission` at field
+11 and optional `configuration_activated` at field 12, extending the public and
+durable closures. New sandboxes explicitly store `false` until first acceptance;
+acceptance stores `true` permanently, including across restart. Legacy rows
+have neither field and conservatively retain static-policy restrictions. No
+database rewrite is required. A pre-admission byte fixture verifies that legacy
+phase and policy-version fields survive without fabricated admission or activation.
+`SandboxStatus.provisioning` uses field 13 for gateway-owned attempt timing and
+compute reclamation progress. Its timestamps survive supervisor reconnects and
+ordinary driver status updates. Older records decode with no provisioning
+record; timing must be adopted once and persisted, never reconstructed from the
+object's frequently changing update timestamp. The additive message requires
+no rewrite of existing payloads and leaves the frozen storage-v1 schema intact.
+Stored settings JSON also carries per-key change IDs and commit timestamps,
+including deletion tombstones. Legacy values acquire stable source identities
+on read; a subsequent write preserves them. These clocks distinguish effective
+edits from no-op writes without treating status updates as configuration edits.
+With timestamp types, deletion outcomes, and optional mutation request IDs, the
+admission contract brings the public closure to 298 messages and 21 enums, the
+durable closure to 92 messages and 16 enums, and their overlap to 80 messages
+and 16 enums. Mutation request IDs extend public request fields without adding
+messages to these closures or changing the durable protobuf schema.
+
 | Dual-purpose encoded root | Current decision |
 |---|---|
 | `Sandbox` | Defer a storage twin; govern its complete dependency closure as durable. |
@@ -434,6 +468,9 @@ require a request UUID for the admission contract.
 | `SshSession` | Defer a storage twin; govern its complete dependency closure as durable. |
 | `ServiceEndpoint` | Defer a storage twin; govern its complete dependency closure as durable. |
 | `SandboxPolicy` | Defer a storage twin; govern its complete dependency closure as durable. |
+| `ConfigUpdateOperation` | Persist the common historical outcome within `StoredConfigUpdateOperation`; govern its complete dependency closure as durable. |
+| `ProviderMutationReceipt` | Persist the immutable provider projection within `StoredConfigUpdateOperation`; govern its complete dependency closure as durable. |
+| `ProviderReadinessReason` | Persist only the closed snapshot failure category within the operation; govern its enum values as durable. |
 
 The public/storage overlap is deliberate for the current format. Storage twins
 for the public roots are deferred: introducing them would require a broad
@@ -734,11 +771,33 @@ configuration, valid endpoint-bound static credentials from other attached
 providers, and the dynamic credential snapshot. Provider environment revisions
 include profile endpoint and binding changes.
 
+The supervisor owns provider fetching, support negotiation, and credential resolution outside the workload. The authenticated sandbox boundary receives a revision and its prepared child environment from one snapshot; it preserves the issued placeholders without receiving the secret resolver or turning those placeholders into new references.
+
+Provider mutations return immutable per-sandbox receipts that separate saved desired state from observed runtime installation. A receipt pins sandbox and provider identity, the attachment epoch, and the exact provider/configuration/policy fingerprints. Attachment-set changes replace the epoch in the same sandbox CAS write; credential updates stage distinct backend objects before publishing their handles and provider revision. This prevents a published revision from referring to an unfinished in-place credential write. Update receipts retain the sandbox target set selected before publication.
+
+Each receipt projects a common configuration operation in the `config_update_operation` store; its receipt ID is the operation ID. The provider status path evaluates current installation evidence and records historical terminal outcomes through resource-version CAS. A previously applied operation does not bypass current session, freshness, or authority checks. The live provider projection can be pending after disconnection or superseded after another change even when historical operation state remains applied. Pending operations are evaluated through provider status queries; this path adds no background delivery engine or mutation replay contract.
+
+When a provider mutation opts into admission with `request_id`, its replay record retains references to the original configuration operations and the original mutation ID. Replay returns those immutable receipts even if sandbox attachments have since changed; it does not select new targets or create replacement receipts. Missing operation evidence makes replay unavailable without executing the mutation again. Provider resources still require their original recorded version, and sandbox resources retain the replay contract's current-state projection.
+
+Provider mutation and operation-result writes are separate. A result-storage failure can follow a saved mutation and returns structured uncertainty without a rollback or safe-retry claim. A failed initial snapshot remains failed rather than acquiring a different target during a later lookup. Operations contain only identities, revisions, timestamps, and closed reason categories.
+
+The CLI recognizes the gateway's `CONFIG_OPERATION_STORAGE_UNCERTAIN` error reason and domain for attach, detach, and update. It reports fixed guidance to inspect and reconcile the saved change before retrying, while withholding arbitrary server messages and error metadata. An uncertain mutation never starts a readiness wait or automatic replay.
+
+Provider receipts, installation status, and common operations represent absolute times with protobuf `Timestamp`; report intervals and evidence lifetimes use protobuf `Duration`. Receipt identity compares the full canonical timestamp without truncating nanoseconds. An absent observation or completion time represents missing evidence or an unfinished operation, independently of the Unix epoch.
+
+Provider installation reports belong to the existing `ConnectSupervisor` session. Each report names that session, has an increasing sequence, and expires unless the supervisor reports again. Reconnection or disconnect invalidates prior observations; stored change records survive a gateway restart, but runtime evidence does not. Replaying an identical report cannot extend its lifetime.
+
+Reports and status also compare the supervisor instance with the sandbox's persisted current instance. A different supervisor becoming current invalidates an older connection, including one retained by another gateway replica. Observations stay local to the gateway holding the supervisor session; a status request reaching a replica without that session returns pending. Multi-replica deployments therefore retain the existing supervisor-session routing requirement.
+
+The supervisor reports success only after it installs the matching credentials, activates the effective policy, and receives an acknowledgment from the authenticated workload boundary that it installed the environment for future processes. Environment synchronization shares the process-launch lock, and its acknowledgment identifies the exact publication, including retries at the same provider revision. Failed policy installation cannot reuse evidence for a different installed policy. Ready and revoked statuses also recheck the requested sandbox, provider, attachment and configuration identities; revision fingerprints are compared only for equality. Revocation applies to future credential resolution and future processes. Requests already forwarded upstream can still finish.
+
+Ordinary static credentials retain revision-scoped references. After update readiness, a newly launched process receives the updated reference; an existing process keeps its original revision. Installation completion does not retarget that reference or establish that an old upstream key can be retired.
+
 ## Provider Environment Resolution
 
 The gateway resolves only the providers attached to a sandbox. It combines each provider instance with its profile, returns non-secret configuration, and marks credentials with the profile's host, port, and path boundaries. The supervisor uses those bindings when it replaces credential placeholders in policy-allowed requests.
 
-A gateway-managed supervisor fetches the provider revision named by its delivered configuration and prepares it with the matching policy. Provider-only updates follow the same staged activation path; a mismatching or invalid fetch cannot publish credentials independently.
+A gateway-managed supervisor fetches the provider environment named by its delivered configuration and checks the attachment epoch, provider revision, and effective policy hash before preparation. Provider-only updates follow the same staged activation path; a mismatching or invalid fetch cannot publish credentials independently. A matching snapshot with withheld or expired credentials can install an empty credential set so stale credentials remain unavailable. Configuration activation alone does not complete a provider operation: the independent provider readiness report also requires current credential, policy-generation, and authenticated process-environment installation evidence.
 
 Model selection, API protocol, request and response shapes, streaming behavior,
 and endpoint URL construction remain responsibilities of the workload's native

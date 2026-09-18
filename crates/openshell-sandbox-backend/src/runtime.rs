@@ -26,8 +26,9 @@ use openshell_isolation_interface::contract::{
     BoundarySignal, BoundaryTerminal, ConfigurationActivationIdentity, ConfigurationRevision,
     ConfirmedBoundary, ExecSession, ExecSpec, InstalledBoundaryConfiguration, IsolationBackend,
     LoopbackTarget, MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen,
-    PreparedBoundaryConfiguration, ProcessAttachment, ReadyBoundary, RunningBoundary,
-    SandboxContext, TcpOpenDecision, TcpOpenDenial, VerifiedBackendDescriptor,
+    PreparedBoundaryConfiguration, ProcessAttachment, ProviderEnvironmentInstallation,
+    ReadyBoundary, RunningBoundary, SandboxContext, TcpOpenDecision, TcpOpenDenial,
+    VerifiedBackendDescriptor,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -499,9 +500,13 @@ impl ReadyBoundary for RemoteReady {
         } else {
             (None, None)
         };
-        let activation = self
-            .client
-            .active_configuration(self.provider_credentials.revision())?;
+        let current = self.provider_credentials.snapshot();
+        let activation = self.client.active_configuration(current.revision)?;
+        if activation.provider_env_installation_id != current.installation_id {
+            return Err(BackendError::Denied(
+                "provider snapshot does not match active configuration".to_string(),
+            ));
+        }
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
@@ -708,10 +713,51 @@ impl BoundaryExec for RemoteExec {
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
         // Exec consumes the accepted environment. It cannot independently install
         // provider updates ahead of the policy/configuration activation transaction.
-        let activation = self
-            .client
-            .active_configuration(self.provider_credentials.revision())?;
+        let current = self.provider_credentials.snapshot();
+        let activation = self.client.active_configuration(current.revision)?;
+        if activation.provider_env_installation_id != current.installation_id {
+            return Err(BackendError::Denied(
+                "provider snapshot does not match active configuration".to_string(),
+            ));
+        }
         open_exec_session(self.client.clone(), spec, activation).await
+    }
+
+    async fn synchronize_provider_environment(
+        &self,
+    ) -> Result<ProviderEnvironmentInstallation, BackendError> {
+        // Reporting consumes the exact accepted installation and proves peer
+        // liveness. It cannot install credentials ahead of configuration release.
+        let current = self.provider_credentials.snapshot();
+        let activation = self.client.active_configuration(current.revision)?;
+        if activation.provider_env_installation_id != current.installation_id {
+            return Err(BackendError::Denied(
+                "provider snapshot does not match active configuration".to_string(),
+            ));
+        }
+        let snapshot = self.client.snapshot().await?;
+        self.client.require_active(&activation)?;
+        if !snapshot.active
+            || snapshot.installed.as_ref() != Some(&activation.configuration)
+            || snapshot.publication_generation != activation.publication_generation
+            || snapshot.provider_env_installation_id.as_ref() != Some(&current.installation_id)
+        {
+            return Err(BackendError::Denied(
+                "boundary did not acknowledge the active provider installation".to_string(),
+            ));
+        }
+        let latest = self.provider_credentials.snapshot();
+        if latest.installation_id != current.installation_id || latest.revision != current.revision
+        {
+            return Err(BackendError::Denied(
+                "provider snapshot changed during boundary acknowledgement".to_string(),
+            ));
+        }
+        Ok(ProviderEnvironmentInstallation {
+            installation_id: current.installation_id.clone(),
+            revision: current.revision,
+            session_id: self.client.runtime_descriptor.session_id,
+        })
     }
 }
 
@@ -896,7 +942,10 @@ impl NetworkMediationSource for RemoteNetworkMediation {
     async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
         let (stream, response) = self
             .client
-            .accept_mediation(|_| self.client.open_exchange(Request::AcceptNetwork))
+            .accept_mediation(|epoch| {
+                self.client
+                    .call_wait_stream(Request::AcceptNetwork, Some(epoch))
+            })
             .await?;
         let Response::NetworkConnected {
             identity,
@@ -1317,6 +1366,7 @@ impl BoundaryClient {
                 self.configuration_attempt_epoch(cancellation_epoch)?;
                 self.ensure_current_credential_connection().await?;
                 let attempt_epoch = self.configuration_attempt_epoch(cancellation_epoch)?;
+                let generation = self.connection_generation().await;
                 match self.exchange_envelope(&envelope).await {
                     Ok(response) => {
                         let response_epoch =
@@ -1332,7 +1382,7 @@ impl BoundaryClient {
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1481,6 +1531,7 @@ impl BoundaryClient {
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(timeout, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.exchange_envelope(&envelope).await {
                     Ok(response) => {
                         // Cache only verified lifecycle acknowledgements. Recovery
@@ -1515,7 +1566,7 @@ impl BoundaryClient {
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1531,10 +1582,25 @@ impl BoundaryClient {
     }
 
     async fn call_wait(&self, request: Request) -> Result<Response, BackendError> {
+        let (_, response) = self.call_wait_stream(request, None).await?;
+        Ok(response)
+    }
+
+    /// Idle accepts have no operation deadline. Only transport failure starts
+    /// recovery; activation loss returns to the caller's fresh-release wait.
+    async fn call_wait_stream(
+        &self,
+        request: Request,
+        activation_epoch: Option<u64>,
+    ) -> Result<(BoundaryDuplexStream, Response), BackendError> {
         let envelope = Self::prepare_request(request)?;
         let mut recovery_deadline = None;
         loop {
-            match self.exchange_envelope(&envelope).await {
+            if let Some(epoch) = activation_epoch {
+                self.require_epoch(epoch)?;
+            }
+            let generation = self.connection_generation().await;
+            match self.open_exchange_envelope(&envelope).await {
                 Ok(response) => return Ok(response),
                 Err(BackendError::Unavailable(message)) if is_transport_unavailable(&message) => {
                     let deadline =
@@ -1542,7 +1608,10 @@ impl BoundaryClient {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(BackendError::Unavailable(message));
                     }
-                    self.recover_after_unavailable().await?;
+                    self.recover_after_unavailable(generation).await?;
+                    if let Some(epoch) = activation_epoch {
+                        self.require_epoch(epoch)?;
+                    }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 Err(error) => return Err(error),
@@ -1557,12 +1626,13 @@ impl BoundaryClient {
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.open_exchange_envelope(&envelope).await {
                     Ok(response) => return Ok(response),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1580,12 +1650,13 @@ impl BoundaryClient {
         let envelope = Self::prepare_request(request)?;
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.open_exchange_envelope(&envelope).await {
                     Ok(response) => return Ok(response),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => return Err(error),
@@ -1772,15 +1843,20 @@ impl BoundaryClient {
         Ok(())
     }
 
-    /// Replace a failed physical transport and replay the authenticated
-    /// lifecycle needed to make the new HTTP/2 connection authoritative.
-    async fn recover_after_unavailable(&self) -> Result<(), BackendError> {
-        let observed_generation = self
-            .grpc_channel
+    async fn connection_generation(&self) -> Option<u64> {
+        self.grpc_channel
             .lock()
             .await
             .as_ref()
-            .map(|cached| cached.generation);
+            .map(|cached| cached.generation)
+    }
+
+    /// Replace only the physical connection observed before the failed attempt.
+    /// A late failure cannot retire another caller's recovered connection.
+    async fn recover_after_unavailable(
+        &self,
+        observed_generation: Option<u64>,
+    ) -> Result<(), BackendError> {
         let _reconnect = self.reconnect.lock().await;
         if self
             .grpc_channel
@@ -1939,13 +2015,14 @@ impl BoundaryClient {
         // waiting. Never multiply that deadline with message-matching retries.
         let session = tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
+                let generation = self.connection_generation().await;
                 match self.open_mediation_session(activation_epoch).await {
                     Ok(session) => return Ok(session),
                     Err(BackendError::Unavailable(message))
                         if is_transport_unavailable(&message) =>
                     {
                         self.require_epoch(activation_epoch)?;
-                        self.recover_after_unavailable().await?;
+                        self.recover_after_unavailable(generation).await?;
                         // Recovery holds the boundary. Return to the outer
                         // readiness wait instead of reopening while held.
                         self.require_epoch(activation_epoch)?;
@@ -2093,6 +2170,26 @@ impl BoundaryConfiguration for BoundaryClient {
             configuration
                 .validate()
                 .map_err(|error| BackendError::Confirm(error.to_string()))?;
+            let installation_id = snapshot
+                .provider_env_installation_id
+                .as_deref()
+                .ok_or_else(|| {
+                    BackendError::Confirm(
+                        "installed boundary snapshot has no provider identity".to_string(),
+                    )
+                })?;
+            validate_installation_id(installation_id)?;
+            if snapshot.publication_generation == 0 {
+                return Err(BackendError::Confirm(
+                    "installed boundary snapshot has no publication generation".to_string(),
+                ));
+            }
+        } else if snapshot.publication_generation != 0
+            || snapshot.provider_env_installation_id.is_some()
+        {
+            return Err(BackendError::Confirm(
+                "uninstalled boundary snapshot carries provider publication evidence".to_string(),
+            ));
         } else if snapshot.active {
             return Err(BackendError::Confirm(
                 "boundary reported active without installed configuration".to_string(),
@@ -2105,7 +2202,11 @@ impl BoundaryConfiguration for BoundaryClient {
             .activated
             .as_ref()
             .is_some_and(|activated| {
-                snapshot.active && snapshot.installed.as_ref() != Some(&activated.configuration)
+                snapshot.active
+                    && (snapshot.installed.as_ref() != Some(&activated.configuration)
+                        || snapshot.publication_generation != activated.publication_generation
+                        || snapshot.provider_env_installation_id.as_ref()
+                            != Some(&activated.provider_env_installation_id))
             });
         if released_tuple_changed {
             self.invalidate_activation();
@@ -2132,8 +2233,10 @@ impl BoundaryConfiguration for BoundaryClient {
     async fn prepare(
         &self,
         expected: Option<ConfigurationRevision>,
+        expected_publication_generation: u64,
         candidate: ConfigurationRevision,
         child_env: HashMap<String, String>,
+        installation_id: String,
     ) -> Result<PreparedBoundaryConfiguration, BackendError> {
         let _operation = self.activation_operations.lock().await;
         candidate
@@ -2152,11 +2255,14 @@ impl BoundaryConfiguration for BoundaryClient {
                 "provider environment contains an invalid variable".to_string(),
             ));
         }
+        validate_installation_id(&installation_id)?;
         let identity = self.identity();
         self.validate_identity(&identity, true)?;
         let request = Request::PrepareConfiguration {
             identity: identity.clone(),
             expected: expected.clone(),
+            expected_publication_generation,
+            provider_env_installation_id: installation_id.clone(),
             configuration: candidate.clone(),
             provider_env: child_env,
         };
@@ -2172,7 +2278,14 @@ impl BoundaryConfiguration for BoundaryClient {
         let Response::ConfigurationPrepared { prepared } = response else {
             return Err(unexpected_response("configuration_prepared", &response));
         };
-        validate_prepared_receipt(&prepared, &identity, &expected, &candidate)?;
+        validate_prepared_receipt(
+            &prepared,
+            &identity,
+            &expected,
+            expected_publication_generation,
+            &candidate,
+            &installation_id,
+        )?;
         self.require_epoch(epoch)?;
         Ok(*prepared)
     }
@@ -2187,7 +2300,9 @@ impl BoundaryConfiguration for BoundaryClient {
             prepared,
             &self.identity(),
             &prepared.expected,
+            prepared.expected_publication_generation,
             &prepared.configuration,
+            &prepared.provider_env_installation_id,
         )?;
         let (_, cancellation_epoch) = self.hold_activation(true);
         let (response, epoch) = self
@@ -2217,6 +2332,12 @@ impl BoundaryConfiguration for BoundaryClient {
             .validate()
             .map_err(|error| BackendError::Configuration(error.to_string()))?;
         validate_transition_id(&installed.transition_id)?;
+        validate_installation_id(&installed.provider_env_installation_id)?;
+        if installed.publication_generation == 0 {
+            return Err(BackendError::Configuration(
+                "configuration has no provider publication".to_string(),
+            ));
+        }
         let (_, cancellation_epoch) = self.hold_activation(true);
         let (response, epoch) = self
             .call_configuration(
@@ -2301,6 +2422,20 @@ impl BoundaryConfiguration for BoundaryClient {
     }
 }
 
+fn validate_installation_id(installation_id: &str) -> Result<(), BackendError> {
+    let id = uuid::Uuid::parse_str(installation_id).map_err(|_| {
+        BackendError::Configuration(
+            "invalid provider environment installation identity".to_string(),
+        )
+    })?;
+    if id.is_nil() || id.hyphenated().to_string() != installation_id {
+        return Err(BackendError::Configuration(
+            "invalid provider environment installation identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_transition_id(transition_id: &str) -> Result<(), BackendError> {
     if transition_id.is_empty()
         || transition_id.len() > 256
@@ -2317,7 +2452,9 @@ fn validate_prepared_receipt(
     receipt: &PreparedBoundaryConfiguration,
     identity: &ConfigurationActivationIdentity,
     expected: &Option<ConfigurationRevision>,
+    expected_publication_generation: u64,
     candidate: &ConfigurationRevision,
+    installation_id: &str,
 ) -> Result<(), BackendError> {
     identity
         .validate()
@@ -2331,7 +2468,11 @@ fn validate_prepared_receipt(
             .map_err(|error| BackendError::Configuration(error.to_string()))?;
     }
     validate_transition_id(&receipt.transition_id)?;
-    if &receipt.identity != identity
+    validate_installation_id(&receipt.provider_env_installation_id)?;
+    if receipt.expected_publication_generation != expected_publication_generation
+        || receipt.publication_generation <= expected_publication_generation
+        || receipt.provider_env_installation_id != installation_id
+        || &receipt.identity != identity
         || &receipt.expected != expected
         || &receipt.configuration != candidate
     {
@@ -2347,6 +2488,8 @@ fn validate_installed_receipt(
     if receipt.identity != prepared.identity
         || receipt.transition_id != prepared.transition_id
         || receipt.configuration != prepared.configuration
+        || receipt.publication_generation != prepared.publication_generation
+        || receipt.provider_env_installation_id != prepared.provider_env_installation_id
     {
         return Err(BackendError::Confirm(
             "installed configuration receipt does not match preparation".to_string(),
@@ -2362,6 +2505,8 @@ fn validate_released_receipt(
     if receipt.identity != installed.identity
         || receipt.transition_id != installed.transition_id
         || receipt.configuration != installed.configuration
+        || receipt.publication_generation != installed.publication_generation
+        || receipt.provider_env_installation_id != installed.provider_env_installation_id
     {
         return Err(BackendError::Confirm(
             "released configuration receipt does not match installation".to_string(),
@@ -2663,6 +2808,8 @@ fn is_transport_unavailable(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     mod credential_renewal;
+    mod network_recovery;
+    mod provider_publication;
 
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -2700,8 +2847,11 @@ mod tests {
                 policy_hash: "sha256:test".to_string(),
                 policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
                 provider_env_revision: 1,
+                provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
             },
             transition_id: "test-transition".to_string(),
+            publication_generation: 1,
+            provider_env_installation_id: "55555555-5555-4555-8555-555555555555".to_string(),
         }
     }
 
@@ -2712,6 +2862,9 @@ mod tests {
             transition_id: activation.transition_id,
             expected: None,
             configuration: activation.configuration,
+            publication_generation: activation.publication_generation,
+            provider_env_installation_id: activation.provider_env_installation_id.clone(),
+            expected_publication_generation: 0,
         }
     }
 
@@ -2721,6 +2874,8 @@ mod tests {
             identity: activation.identity,
             transition_id: activation.transition_id,
             configuration: activation.configuration,
+            publication_generation: activation.publication_generation,
+            provider_env_installation_id: activation.provider_env_installation_id.clone(),
         }
     }
 
@@ -2901,7 +3056,13 @@ mod tests {
         let (client, server) = configuration_client(None).await;
         let readiness = client.readiness();
         let prepared = client
-            .prepare(None, test_activation().configuration, HashMap::new())
+            .prepare(
+                None,
+                0,
+                test_activation().configuration,
+                HashMap::new(),
+                "55555555-5555-4555-8555-555555555555".to_string(),
+            )
             .await
             .unwrap();
         assert!(!*readiness.borrow());
@@ -2948,7 +3109,13 @@ mod tests {
         .await;
         assert!(
             client
-                .prepare(None, test_activation().configuration, HashMap::new())
+                .prepare(
+                    None,
+                    0,
+                    test_activation().configuration,
+                    HashMap::new(),
+                    "55555555-5555-4555-8555-555555555555".to_string(),
+                )
                 .await
                 .is_err()
         );
@@ -2966,7 +3133,14 @@ mod tests {
             activation: wrong_activated.clone(),
         }))
         .await;
-        client.publish_activation(0, &test_activation()).unwrap();
+        let credentials =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                1,
+                HashMap::new(),
+            );
+        let mut accepted = test_activation();
+        accepted.provider_env_installation_id = credentials.snapshot().installation_id.clone();
+        client.publish_activation(0, &accepted).unwrap();
         let context = sandbox();
         let ready = RemoteReady {
             client,
@@ -2974,7 +3148,7 @@ mod tests {
             policy: context.policy,
             sandbox_id: context.sandbox_id,
             ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
-            provider_credentials: openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(1, HashMap::new()),
+            provider_credentials: credentials,
         };
         assert!(Box::new(ready).start_agent().await.is_err());
         server.abort();
@@ -3013,6 +3187,10 @@ mod tests {
                 identity: test_activation().identity,
                 installed: Some(unexpected),
                 active: true,
+                publication_generation: 1,
+                provider_env_installation_id: Some(
+                    "55555555-5555-4555-8555-555555555555".to_string(),
+                ),
             },
         }))
         .await;
@@ -3029,14 +3207,27 @@ mod tests {
         client.publish_activation(0, &test_activation()).unwrap();
         let mut invalid = test_activation().configuration;
         invalid.config_revision = 0;
-        assert!(client.prepare(None, invalid, HashMap::new()).await.is_err());
+        assert!(
+            client
+                .prepare(
+                    None,
+                    0,
+                    invalid,
+                    HashMap::new(),
+                    "55555555-5555-4555-8555-555555555555".to_string(),
+                )
+                .await
+                .is_err()
+        );
         assert!(*client.readiness().borrow());
         assert!(
             client
                 .prepare(
                     None,
+                    0,
                     test_activation().configuration,
-                    HashMap::from([("BAD=KEY".to_string(), "redacted".to_string())])
+                    HashMap::from([("BAD=KEY".to_string(), "redacted".to_string())]),
+                    "55555555-5555-4555-8555-555555555555".to_string(),
                 )
                 .await
                 .is_err()
@@ -3199,6 +3390,10 @@ mod tests {
                 identity: test_activation().identity,
                 installed: Some(test_activation().configuration),
                 active: true,
+                publication_generation: 1,
+                provider_env_installation_id: Some(
+                    "55555555-5555-4555-8555-555555555555".to_string(),
+                ),
             },
         }))
         .await;
@@ -3278,6 +3473,15 @@ mod tests {
         variants.push(changed);
         let mut changed = original.clone();
         changed.configuration.policy_source += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.configuration.provider_attachment_epoch.push('x');
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.publication_generation += 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.provider_env_installation_id = uuid::Uuid::new_v4().to_string();
         variants.push(changed);
         let mut changed = original.clone();
         changed.configuration.provider_env_revision += 1;
@@ -3489,10 +3693,12 @@ mod tests {
                                     snapshot: crate::boundary_protocol::SessionSnapshotWire {
                                         generation: "test-generation".to_string(),
                                         configuration: BoundaryConfigurationSnapshot {
-                                            identity,
-                                            installed: None,
-                                            active: false,
-                                        },
+identity,
+installed: None,
+active: false,
+publication_generation: 0,
+provider_env_installation_id: None,
+},
                                         processes: Vec::new(),
                                     },
                                 }
@@ -3500,41 +3706,52 @@ mod tests {
                             Request::ConfigurationSnapshot { identity } => {
                                 Response::ConfigurationSnapshot {
                                     snapshot: BoundaryConfigurationSnapshot {
-                                        identity,
-                                        installed: None,
-                                        active: false,
-                                    },
+identity,
+installed: None,
+active: false,
+publication_generation: 0,
+provider_env_installation_id: None,
+},
                                 }
                             }
                             Request::PrepareConfiguration {
                                 identity,
                                 expected,
+                                expected_publication_generation,
+                                provider_env_installation_id,
                                 configuration,
                                 ..
                             } => Response::ConfigurationPrepared {
                                 prepared: Box::new(PreparedBoundaryConfiguration {
-                                    identity,
-                                    expected,
-                                    configuration,
-                                    transition_id: "test-transition".to_string(),
-                                }),
+identity,
+expected,
+configuration,
+transition_id: "test-transition".to_string(),
+publication_generation: expected_publication_generation.checked_add(1).unwrap(),
+provider_env_installation_id,
+expected_publication_generation,
+}),
                             },
                             Request::CommitConfiguration { prepared } => {
                                 Response::ConfigurationCommitted {
                                     installed: Box::new(InstalledBoundaryConfiguration {
-                                        identity: prepared.identity,
-                                        configuration: prepared.configuration,
-                                        transition_id: prepared.transition_id,
-                                    }),
+identity: prepared.identity,
+configuration: prepared.configuration,
+transition_id: prepared.transition_id,
+publication_generation: prepared.publication_generation,
+provider_env_installation_id: prepared.provider_env_installation_id.clone(),
+}),
                                 }
                             }
                             Request::ReleaseConfiguration { installed } => {
                                 Response::ConfigurationReleased {
                                     activated: Box::new(ActivatedBoundaryConfiguration {
-                                        identity: installed.identity,
-                                        configuration: installed.configuration,
-                                        transition_id: installed.transition_id,
-                                    }),
+identity: installed.identity,
+configuration: installed.configuration,
+transition_id: installed.transition_id,
+publication_generation: installed.publication_generation,
+provider_env_installation_id: installed.provider_env_installation_id.clone(),
+}),
                                 }
                             }
                             Request::AbortConfiguration { .. } => Response::ConfigurationAborted,
@@ -3748,7 +3965,10 @@ mod tests {
         client.publish_activation(0, &test_activation()).unwrap();
         let readiness = client.readiness();
         assert!(*readiness.borrow());
-        client.recover_after_unavailable().await.unwrap();
+        client
+            .recover_after_unavailable(client.connection_generation().await)
+            .await
+            .unwrap();
         assert!(!*readiness.borrow());
         assert!(client.active_configuration(1).is_err());
         tokio::time::timeout(Duration::from_secs(1), server)

@@ -14,16 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use super::provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracker};
 use miette::{IntoDiagnostic as _, Result};
 use openshell_core::configuration::{ConfigurationActivationIdentity, ConfigurationRevision};
 use openshell_core::grpc_client::{ProviderEnvironmentResult, SettingsPollResult};
-use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+use openshell_core::proto::{
+    ConfigurationAdmissionState, ProviderReadinessReason, SandboxConfigurationAdmission,
+};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{
     ActivatedBoundaryConfiguration, BoundaryBootstrap, BoundaryConfiguration, ImagePolicyDiscovery,
     InstalledBoundaryConfiguration, PreparedBoundaryConfiguration,
 };
-use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_network::opa::{OpaEngine, PolicyGenerationGuard};
 use tokio::sync::watch;
 
 use super::{
@@ -36,6 +39,62 @@ use super::{
 
 const STARTUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_FAILURE_LIMIT: u32 = 5;
+
+/// Credential failures carry only a closed diagnostic to logging. A fetched
+/// invalid binding snapshot is retained solely for fail-closed dynamic grants.
+struct ProviderPreparationFailure {
+    reason: ProviderReadinessReason,
+    provider: Option<Box<ProviderEnvironmentResult>>,
+    source: Option<miette::Report>,
+}
+
+impl std::fmt::Debug for ProviderPreparationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderPreparationFailure")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ProviderPreparationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Provider environment could not be installed")
+    }
+}
+
+impl std::error::Error for ProviderPreparationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl miette::Diagnostic for ProviderPreparationFailure {}
+
+fn provider_preparation_failure(
+    reason: ProviderReadinessReason,
+    provider: Option<ProviderEnvironmentResult>,
+    source: Option<miette::Report>,
+) -> miette::Report {
+    miette::Report::new(ProviderPreparationFailure {
+        reason,
+        provider: provider.map(Box::new),
+        source,
+    })
+}
+
+/// Withheld and expired material is absent by design. Those complete snapshots
+/// are installable while operational failures cannot acknowledge installation.
+fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool {
+    matches!(
+        reason,
+        ProviderReadinessReason::Unspecified
+            | ProviderReadinessReason::CredentialsWithheld
+            | ProviderReadinessReason::CredentialExpired
+    )
+}
 
 /// Bound connection setup and the complete unary response, including a peer
 /// that keeps its transport healthy without completing the requested operation.
@@ -171,6 +230,7 @@ pub(super) struct ConfigurationSession {
     identity: Option<ConfigurationActivationIdentity>,
     startup_pending: bool,
     startup_failures: AtomicU32,
+    last_startup_rejection: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl ConfigurationSession {
@@ -215,6 +275,7 @@ impl ConfigurationSession {
             identity: None,
             startup_pending: true,
             startup_failures: AtomicU32::new(0),
+            last_startup_rejection: std::sync::Mutex::new(None),
         };
         let registration = session
             .retry_operation("Control registration snapshot", || {
@@ -480,6 +541,7 @@ impl ConfigurationSession {
                 ConfigurationAdmissionState::Rejected,
                 false,
                 error,
+                None,
             )
             .await
         {
@@ -499,7 +561,9 @@ impl ConfigurationSession {
                 }
             }
         }
-        emit_rejection(error);
+        if self.startup_rejection_changed(snapshot, error)? {
+            emit_rejection(error);
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
         Ok(())
     }
@@ -522,6 +586,25 @@ impl ConfigurationSession {
         Ok(())
     }
 
+    fn startup_rejection_changed(
+        &self,
+        snapshot: &SettingsPollResult,
+        error: &str,
+    ) -> Result<bool> {
+        // Reports continue on every attempt, but unchanged authored failures
+        // need only one log event. Retain the latest pair so A -> B -> A logs all changes.
+        let rejection = (snapshot.configuration_snapshot.clone(), error.to_string());
+        let mut previous = self
+            .last_startup_rejection
+            .lock()
+            .map_err(|_| miette::miette!("Startup rejection state is unavailable"))?;
+        if previous.as_ref() == Some(&rejection) {
+            return Ok(false);
+        }
+        *previous = Some(rejection);
+        Ok(true)
+    }
+
     async fn prepare(
         &self,
         snapshot: &SettingsPollResult,
@@ -533,10 +616,17 @@ impl ConfigurationSession {
             .operation("Provider environment", self.gateway.provider())
             .await
             .map_err(|error| {
-                preparation_operation_error(error, "Provider environment is unavailable")
+                provider_preparation_failure(
+                    ProviderReadinessReason::CredentialInstallFailed,
+                    None,
+                    Some(preparation_operation_error(
+                        error,
+                        "Provider environment is unavailable",
+                    )),
+                )
             })?;
-        let provider_revision_changed =
-            provider.provider_env_revision != snapshot.provider_env_revision;
+        let provider_revision_changed = EnvironmentIdentity::from_environment(&provider)
+            != EnvironmentIdentity::from_settings(snapshot);
         if self.startup_pending && snapshot.configuration_admitted && provider_revision_changed {
             // A concurrently rotated provider requires a fresh snapshot, not
             // an authored-policy rejection that resets the startup budget.
@@ -546,6 +636,12 @@ impl ConfigurationSession {
                 ),
             ));
         }
+        let provider_expires_at_ms = provider
+            .credential_expires_at_ms
+            .values()
+            .copied()
+            .filter(|expiry| *expiry > 0)
+            .min();
         let (engine, policy, credentials) = prepare_components(snapshot, provider)?;
         let registry_changed = previous.is_none_or(|previous| {
             previous.supervisor_middleware_services != snapshot.supervisor_middleware_services
@@ -586,6 +682,7 @@ impl ConfigurationSession {
             policy,
             engine,
             credentials,
+            provider_expires_at_ms,
             middleware_registry,
         })
     }
@@ -596,6 +693,7 @@ impl ConfigurationSession {
         state: ConfigurationAdmissionState,
         activation_confirmed: bool,
         error: &str,
+        publication: Option<(&str, u64)>,
     ) -> Result<()> {
         self.validate_snapshot(snapshot)?;
         let identity = self.identity()?;
@@ -606,6 +704,10 @@ impl ConfigurationSession {
             policy_hash: snapshot.policy_hash.clone(),
             config_revision: snapshot.config_revision,
             provider_env_revision: snapshot.provider_env_revision,
+            provider_attachment_epoch: snapshot.provider_attachment_epoch.clone(),
+            publication_generation: publication.map_or(0, |(_, generation)| generation),
+            provider_env_installation_id: publication
+                .map_or_else(String::new, |(id, _)| id.to_string()),
             error: error.to_string(),
             runtime_generation: identity.runtime_generation.clone(),
             boundary_instance_id: identity.boundary_instance_id.clone(),
@@ -652,20 +754,45 @@ impl ConfigurationSession {
             ));
         }
         let expected = current.installed;
+        let expected_publication_generation = current.publication_generation;
+        let child_environment = credentials.child_environment_snapshot().into_diagnostic()?;
+        let installation_id = child_environment.installation_id.clone();
         let candidate = revision(snapshot);
         let prepared = boundary
             .prepare(
                 expected.clone(),
+                expected_publication_generation,
                 candidate.clone(),
-                credentials.child_env_with_gcp_resolved(),
+                child_environment.environment.clone(),
+                installation_id.clone(),
             )
             .await
             .map_err(backend_error)?;
-        validate_preparation(&prepared, self.identity()?, &expected, &candidate)?;
+        validate_preparation(
+            &prepared,
+            self.identity()?,
+            &expected,
+            expected_publication_generation,
+            &candidate,
+            &installation_id,
+        )?;
+        if let Err(error) = validate_published_environment(credentials, &child_environment) {
+            let _ = boundary.abort(&prepared).await;
+            return Err(error);
+        }
         let installed = boundary.commit(&prepared).await.map_err(backend_error)?;
         validate_installation(&installed, &prepared)?;
-        self.report(snapshot, ConfigurationAdmissionState::Accepted, false, "")
-            .await?;
+        self.report(
+            snapshot,
+            ConfigurationAdmissionState::Accepted,
+            false,
+            "",
+            Some((
+                &installed.provider_env_installation_id,
+                installed.publication_generation,
+            )),
+        )
+        .await?;
         let released = boundary.release(&installed).await.map_err(backend_error)?;
         if let Err(error) = validate_release(&released, &installed) {
             let _ = boundary.quiesce().await;
@@ -675,11 +802,22 @@ impl ConfigurationSession {
     }
 
     /// Report readiness only after the boundary acknowledges actual activation.
-    pub(super) async fn confirm_activation(&self, snapshot: &SettingsPollResult) -> Result<()> {
+    pub(super) async fn confirm_activation(
+        &self,
+        snapshot: &SettingsPollResult,
+        installation_id: &str,
+        publication_generation: u64,
+    ) -> Result<()> {
         use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 
-        self.report(snapshot, ConfigurationAdmissionState::Accepted, true, "")
-            .await?;
+        self.report(
+            snapshot,
+            ConfigurationAdmissionState::Accepted,
+            true,
+            "",
+            Some((installation_id, publication_generation)),
+        )
+        .await?;
         ocsf_emit!(
             ConfigStateChangeBuilder::new(super::ocsf_ctx())
                 .severity(SeverityId::Informational)
@@ -707,16 +845,18 @@ pub(super) struct PreparedConfiguration {
     pub(super) policy: SandboxPolicy,
     pub(super) engine: OpaEngine,
     pub(super) credentials: ProviderCredentialState,
+    pub(super) provider_expires_at_ms: Option<i64>,
     middleware_registry: Option<openshell_supervisor_middleware::MiddlewareRegistry>,
 }
 
 impl PreparedConfiguration {
     /// Attach the prepared middleware registry before networking can consume OPA.
-    pub(super) fn install_startup_registry(&mut self) -> Result<()> {
+    pub(super) fn install_startup_registry(&mut self) -> Result<PolicyGenerationGuard> {
         if let Some(registry) = self.middleware_registry.take() {
             self.engine.replace_middleware_registry(registry)?;
         }
-        Ok(())
+        self.engine
+            .generation_guard(self.engine.current_generation())
     }
 }
 
@@ -729,9 +869,20 @@ fn prepare_components(
             "Effective configuration admission rejected"
         ));
     }
-    if snapshot.provider_env_revision != provider.provider_env_revision {
-        return Err(miette::miette!(
-            "Provider revision changed during configuration preparation"
+    if EnvironmentIdentity::from_settings(snapshot)
+        != EnvironmentIdentity::from_environment(&provider)
+    {
+        return Err(provider_preparation_failure(
+            ProviderReadinessReason::SnapshotMismatch,
+            None,
+            None,
+        ));
+    }
+    if !provider_environment_is_installable(provider.readiness_reason) {
+        return Err(provider_preparation_failure(
+            provider.readiness_reason,
+            None,
+            None,
         ));
     }
     revision(snapshot).validate().into_diagnostic()?;
@@ -745,13 +896,19 @@ fn prepare_components(
         .map_err(|_| miette::miette!("Process or filesystem policy failed validation"))?;
     let credentials = ProviderCredentialState::from_bound_environment(
         provider.provider_env_revision,
-        provider.environment,
-        provider.credential_expires_at_ms,
-        provider.dynamic_credentials,
-        provider.static_credential_bindings,
-        provider.non_secret_environment_keys,
+        provider.environment.clone(),
+        provider.credential_expires_at_ms.clone(),
+        provider.dynamic_credentials.clone(),
+        provider.static_credential_bindings.clone(),
+        provider.non_secret_environment_keys.clone(),
     )
-    .map_err(|_| miette::miette!("Provider credential bindings are invalid"))?;
+    .map_err(|_| {
+        provider_preparation_failure(
+            ProviderReadinessReason::CredentialInstallFailed,
+            Some(provider),
+            None,
+        )
+    })?;
     Ok((engine, process_policy, credentials))
 }
 
@@ -774,19 +931,42 @@ fn revision(snapshot: &SettingsPollResult) -> ConfigurationRevision {
         policy_hash: snapshot.policy_hash.clone(),
         policy_source: snapshot.policy_source.into(),
         provider_env_revision: snapshot.provider_env_revision,
+        provider_attachment_epoch: snapshot.provider_attachment_epoch.clone(),
     }
+}
+
+/// Confirm the exact staged child map survived publication into the live store.
+fn validate_published_environment(
+    credentials: &ProviderCredentialState,
+    expected: &openshell_core::provider_credentials::ChildEnvironmentSnapshot,
+) -> Result<()> {
+    let installed = credentials.child_environment_snapshot().into_diagnostic()?;
+    if installed.installation_id != expected.installation_id
+        || installed.revision != expected.revision
+        || installed.environment != expected.environment
+    {
+        return Err(miette::miette!(
+            "Provider environment changed during held publication"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_preparation(
     prepared: &PreparedBoundaryConfiguration,
     identity: &ConfigurationActivationIdentity,
     expected: &Option<ConfigurationRevision>,
+    expected_publication_generation: u64,
     candidate: &ConfigurationRevision,
+    installation_id: &str,
 ) -> Result<()> {
     if &prepared.identity != identity
         || &prepared.expected != expected
+        || prepared.expected_publication_generation != expected_publication_generation
         || &prepared.configuration != candidate
         || prepared.transition_id.is_empty()
+        || prepared.publication_generation <= expected_publication_generation
+        || prepared.provider_env_installation_id != installation_id
     {
         return Err(miette::miette!(
             "Boundary prepared a different configuration"
@@ -802,6 +982,8 @@ fn validate_installation(
     if installed.identity != prepared.identity
         || installed.configuration != prepared.configuration
         || installed.transition_id != prepared.transition_id
+        || installed.publication_generation != prepared.publication_generation
+        || installed.provider_env_installation_id != prepared.provider_env_installation_id
     {
         return Err(miette::miette!(
             "Boundary acknowledged a different installation"
@@ -817,6 +999,8 @@ fn validate_release(
     if released.identity != installed.identity
         || released.configuration != installed.configuration
         || released.transition_id != installed.transition_id
+        || released.publication_generation != installed.publication_generation
+        || released.provider_env_installation_id != installed.provider_env_installation_id
     {
         return Err(miette::miette!(
             "Boundary acknowledged a different activation"
@@ -864,6 +1048,7 @@ pub(super) struct RuntimeConfiguration {
     pub(super) snapshot: SettingsPollResult,
     pub(super) engine: Arc<OpaEngine>,
     pub(super) credentials: ProviderCredentialState,
+    pub(super) provider_readiness: ProviderReadinessTracker,
     pub(super) readiness: watch::Sender<bool>,
     pub(super) ocsf_enabled: Arc<AtomicBool>,
     pub(super) agent_proposals: openshell_core::proposals::AgentProposals,
@@ -900,6 +1085,50 @@ impl Drop for ConfigurationTask {
 }
 
 impl RuntimeConfiguration {
+    /// Bind credentials to the generation actually installed by OPA; the
+    /// independent boundary reporter must still acknowledge process installation.
+    fn record_provider_installation(
+        &self,
+        snapshot: &SettingsPollResult,
+        expires_at_ms: Option<i64>,
+        generation: PolicyGenerationGuard,
+    ) {
+        let identity = EnvironmentIdentity::from_settings(snapshot);
+        self.provider_readiness.credentials_installed(
+            identity.clone(),
+            &self.credentials,
+            expires_at_ms,
+        );
+        self.provider_readiness
+            .policy_activated(&identity, snapshot.config_revision, generation);
+    }
+
+    /// Revoke static material only after the workload is held, preserving
+    /// independently bound dynamic grants from a rejected binding snapshot.
+    fn revoke_failed_provider(
+        &self,
+        snapshot: &SettingsPollResult,
+        failure: &ProviderPreparationFailure,
+    ) {
+        self.provider_readiness
+            .credentials_failed(EnvironmentIdentity::from_settings(snapshot), failure.reason);
+        if let Some(provider) = failure.provider.as_ref() {
+            // The workload is already held. Repeating failed binding validation
+            // revokes static material but preserves independently bound grants.
+            let _ = self.credentials.install_bound_environment(
+                provider.provider_env_revision,
+                provider.environment.clone(),
+                provider.credential_expires_at_ms.clone(),
+                provider.dynamic_credentials.clone(),
+                provider.static_credential_bindings.clone(),
+                provider.non_secret_environment_keys.clone(),
+            );
+        } else {
+            self.credentials
+                .revoke_static_provider_environment(snapshot.provider_env_revision);
+        }
+    }
+
     /// Consume the launch handle once, retaining its workload through acknowledgement repair.
     pub(super) async fn start_workload(
         &mut self,
@@ -965,7 +1194,7 @@ impl RuntimeConfiguration {
                 // The boundary remains held, and its future launch now uses
                 // this prepared static policy. Publish its matching network
                 // policy and credentials before committing child inputs.
-                self.engine.reload_configuration_from_proto_with_pid(
+                let generation = self.engine.reload_configuration_from_proto_with_pid(
                     prepared
                         .snapshot
                         .policy
@@ -977,6 +1206,11 @@ impl RuntimeConfiguration {
                         self.credentials.install_prepared(&prepared.credentials);
                     },
                 )?;
+                self.record_provider_installation(
+                    &prepared.snapshot,
+                    prepared.provider_expires_at_ms,
+                    generation,
+                );
                 self.reset_endpoint_inventory(&prepared.snapshot).await;
                 self.snapshot = prepared.snapshot;
                 break;
@@ -986,7 +1220,31 @@ impl RuntimeConfiguration {
 
     /// Finish acknowledgement while retaining the already-started workload handle.
     pub(super) async fn confirm_startup(&mut self) -> Result<()> {
-        match self.session.confirm_activation(&self.snapshot).await {
+        let installed = self.boundary.snapshot().await.map_err(backend_error)?;
+        let installation_id = installed
+            .provider_env_installation_id
+            .as_deref()
+            .ok_or_else(|| miette::miette!("Boundary activation has no provider installation"))?;
+        if installed.identity != *self.session.identity()?
+            || installed.installed.as_ref() != Some(&revision(&self.snapshot))
+            || installation_id != self.credentials.snapshot().installation_id
+            || !installed.active
+        {
+            self.readiness.send_replace(false);
+            self.boundary.quiesce().await.map_err(backend_error)?;
+            return Err(miette::miette!(
+                "Boundary activation differs from the installed configuration"
+            ));
+        }
+        match self
+            .session
+            .confirm_activation(
+                &self.snapshot,
+                installation_id,
+                installed.publication_generation,
+            )
+            .await
+        {
             Ok(()) => return self.record_activation(self.snapshot.clone()).await,
             Err(error) => {
                 // Main may already be running. Recovery must stop it before
@@ -1131,8 +1389,22 @@ impl RuntimeConfiguration {
             ));
         }
         if current.active
+            && current.installed.as_ref() == Some(&revision(&self.snapshot))
+            && current.provider_env_installation_id.as_deref()
+                == Some(self.credentials.snapshot().installation_id.as_str())
             && revision(&snapshot) == revision(&self.snapshot)
             && snapshot.configuration_snapshot == self.snapshot.configuration_snapshot
+            && !self
+                .provider_readiness
+                .needs_environment(&EnvironmentIdentity::from_settings(&snapshot))
+            && self
+                .provider_readiness
+                .observation(&self.credentials)
+                .policy_active
+            && self
+                .provider_readiness
+                .observation(&self.credentials)
+                .credentials_installed
         {
             self.session
                 .operation(
@@ -1152,13 +1424,28 @@ impl RuntimeConfiguration {
                 return Err(error);
             }
             Err(error) => {
-                let diagnostic = format!("{error}; previous credentials remain installed");
-                if snapshot.policy_validation_failure_mode
-                    == openshell_core::PolicyValidationFailureMode::FailClosed
+                let provider_failure = error.downcast_ref::<ProviderPreparationFailure>();
+                let diagnostic = if provider_failure.is_some() {
+                    "Provider environment could not be installed; static credentials were revoked"
+                        .to_string()
+                } else {
+                    format!("{error}; previous credentials remain installed")
+                };
+                self.provider_readiness.policy_install_failed(
+                    EnvironmentIdentity::from_settings(&snapshot),
+                    snapshot.config_revision,
+                );
+                if provider_failure.is_some()
+                    || snapshot.policy_validation_failure_mode
+                        == openshell_core::PolicyValidationFailureMode::FailClosed
                     || !current.active
                 {
                     self.readiness.send_replace(false);
                     self.boundary.quiesce().await.map_err(backend_error)?;
+                }
+                if let Some(failure) = provider_failure {
+                    self.revoke_failed_provider(&snapshot, failure);
+                    self.reset_endpoint_inventory(&self.snapshot).await;
                 }
                 let disposition = apply_policy_validation_failure(
                     &self.engine,
@@ -1179,6 +1466,7 @@ impl RuntimeConfiguration {
                         ConfigurationAdmissionState::Rejected,
                         false,
                         &diagnostic,
+                        None,
                     )
                     .await?;
                 if self.session.startup_pending {
@@ -1189,22 +1477,44 @@ impl RuntimeConfiguration {
         };
         self.readiness.send_replace(false);
         let expected = current.installed;
+        let expected_publication_generation = current.publication_generation;
+        prepared
+            .credentials
+            .inherit_suppressed_environment_keys(&self.credentials);
+        let child_environment = prepared
+            .credentials
+            .child_environment_snapshot()
+            .into_diagnostic()?;
+        let installation_id = child_environment.installation_id.clone();
         let candidate = revision(&snapshot);
         let staged = self
             .boundary
             .prepare(
                 expected.clone(),
+                expected_publication_generation,
                 candidate.clone(),
-                prepared.credentials.child_env_with_gcp_resolved(),
+                child_environment.environment.clone(),
+                installation_id.clone(),
             )
             .await
             .map_err(backend_error)?;
-        validate_preparation(&staged, self.session.identity()?, &expected, &candidate)?;
+        validate_preparation(
+            &staged,
+            self.session.identity()?,
+            &expected,
+            expected_publication_generation,
+            &candidate,
+            &installation_id,
+        )?;
         let policy = snapshot
             .policy
             .as_ref()
             .ok_or_else(|| miette::miette!("Prepared configuration lost its policy"))?;
-        if let Err(error) = self.engine.reload_configuration_from_proto_with_pid(
+        self.provider_readiness.credentials_failed(
+            EnvironmentIdentity::from_settings(&snapshot),
+            ProviderReadinessReason::WaitingForCredentials,
+        );
+        let generation = match self.engine.reload_configuration_from_proto_with_pid(
             policy,
             0,
             prepared.middleware_registry,
@@ -1212,11 +1522,29 @@ impl RuntimeConfiguration {
                 self.credentials.install_prepared(&prepared.credentials);
             },
         ) {
-            // No local callback runs on failed validation. Abort discards
-            // staged child inputs and leaves the boundary held for repair.
+            Ok(generation) => generation,
+            Err(error) => {
+                // No local callback runs on failed validation. Abort discards
+                // staged child inputs and leaves the boundary held for repair.
+                self.provider_readiness.policy_install_failed(
+                    EnvironmentIdentity::from_settings(&snapshot),
+                    snapshot.config_revision,
+                );
+                let _ = self.boundary.abort(&staged).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_published_environment(&self.credentials, &child_environment) {
+            // A service can suppress an environment key while preparation is
+            // in flight. Never commit or release the earlier staged child map.
+            self.provider_readiness.credentials_failed(
+                EnvironmentIdentity::from_settings(&snapshot),
+                ProviderReadinessReason::SnapshotMismatch,
+            );
             let _ = self.boundary.abort(&staged).await;
             return Err(error);
         }
+        self.record_provider_installation(&snapshot, prepared.provider_expires_at_ms, generation);
         // The local policy and provider state now agree while the workload is
         // still held. Retire old observation handles before releasing traffic;
         // rejected preparations never replace the last installed inventory.
@@ -1224,7 +1552,16 @@ impl RuntimeConfiguration {
         let installed = self.boundary.commit(&staged).await.map_err(backend_error)?;
         validate_installation(&installed, &staged)?;
         self.session
-            .report(&snapshot, ConfigurationAdmissionState::Accepted, false, "")
+            .report(
+                &snapshot,
+                ConfigurationAdmissionState::Accepted,
+                false,
+                "",
+                Some((
+                    &installed.provider_env_installation_id,
+                    installed.publication_generation,
+                )),
+            )
             .await?;
         let released = self
             .boundary
@@ -1232,7 +1569,13 @@ impl RuntimeConfiguration {
             .await
             .map_err(backend_error)?;
         validate_release(&released, &installed)?;
-        self.session.confirm_activation(&snapshot).await?;
+        self.session
+            .confirm_activation(
+                &snapshot,
+                &released.provider_env_installation_id,
+                released.publication_generation,
+            )
+            .await?;
 
         self.record_activation(snapshot).await
     }
@@ -1320,6 +1663,7 @@ mod tests {
             settings: HashMap::new(),
             global_policy_version: 0,
             provider_env_revision: generation,
+            provider_attachment_epoch: "attachment-1".into(),
             supervisor_middleware_services: Vec::new(),
             workspace: "test-workspace".into(),
             policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode::FailClosed,
@@ -1331,6 +1675,9 @@ mod tests {
         ProviderEnvironmentResult {
             environment: HashMap::new(),
             provider_env_revision: revision,
+            provider_attachment_epoch: "attachment-1".into(),
+            policy_hash: format!("policy-{revision}"),
+            readiness_reason: ProviderReadinessReason::Unspecified,
             credential_expires_at_ms: HashMap::new(),
             dynamic_credentials: HashMap::new(),
             static_credential_bindings: HashMap::new(),
@@ -1357,6 +1704,8 @@ mod tests {
     struct Gateway {
         snapshot: Mutex<SettingsPollResult>,
         provider_revision: AtomicU64,
+        provider_reason: Mutex<ProviderReadinessReason>,
+        provider_environment: Mutex<HashMap<String, String>>,
         reject_authorization: AtomicBool,
         report_faults: Mutex<std::collections::VecDeque<ReportFault>>,
         report_attempts: Mutex<Vec<SandboxConfigurationAdmission>>,
@@ -1692,6 +2041,10 @@ mod tests {
                 assert_eq!(grpc_status_code(&error), Some(code));
                 assert_eq!(fault.calls.load(Ordering::Relaxed), 1);
                 assert!(!error.to_string().contains("private remote failure payload"));
+                assert!(!format!("{error:?}").contains("private remote failure payload"));
+                for cause in error.chain() {
+                    assert!(!cause.to_string().contains("private remote failure payload"));
+                }
                 assert!(
                     !events
                         .lock()
@@ -1766,6 +2119,7 @@ mod tests {
                 ConfigurationAdmissionState::Accepted,
                 false,
                 "",
+                Some(("00000000-0000-4000-8000-000000000001", 1)),
             )
             .await
             .expect("live reconciliation retains retry behavior");
@@ -1787,7 +2141,20 @@ mod tests {
         }
 
         async fn provider(&self) -> Result<ProviderEnvironmentResult> {
-            Ok(provider(self.provider_revision.load(Ordering::Relaxed)))
+            let mut response = provider(self.provider_revision.load(Ordering::Relaxed));
+            response.readiness_reason = *self.provider_reason.lock().expect("provider reason");
+            response.environment = self
+                .provider_environment
+                .lock()
+                .expect("provider environment")
+                .clone();
+            response.non_secret_environment_keys = response.environment.keys().cloned().collect();
+            let snapshot = self.snapshot.lock().expect("snapshot lock");
+            response.policy_hash.clone_from(&snapshot.policy_hash);
+            response
+                .provider_attachment_epoch
+                .clone_from(&snapshot.provider_attachment_epoch);
+            Ok(response)
         }
 
         async fn sync_policy(
@@ -1887,8 +2254,10 @@ mod tests {
     struct Boundary {
         identity: Mutex<ConfigurationActivationIdentity>,
         installed: Mutex<Option<ConfigurationRevision>>,
+        publication: Mutex<(u64, Option<String>)>,
         ready: watch::Sender<bool>,
         wrong_commit: AtomicBool,
+        suppress_on_prepare: Mutex<Option<String>>,
         credentials: ProviderCredentialState,
         events: Arc<Mutex<Vec<String>>>,
     }
@@ -1906,30 +2275,50 @@ mod tests {
         async fn snapshot(
             &self,
         ) -> std::result::Result<BoundaryConfigurationSnapshot, BackendError> {
+            let publication = self.publication.lock().expect("publication lock").clone();
             Ok(BoundaryConfigurationSnapshot {
                 identity: self.identity(),
                 installed: self.installed.lock().expect("installation lock").clone(),
                 active: *self.ready.borrow(),
+                publication_generation: publication.0,
+                provider_env_installation_id: publication.1,
             })
         }
 
         async fn prepare(
             &self,
             expected: Option<ConfigurationRevision>,
+            expected_publication_generation: u64,
             candidate: ConfigurationRevision,
             _child_env: HashMap<String, String>,
+            installation_id: String,
         ) -> std::result::Result<PreparedBoundaryConfiguration, BackendError> {
             self.events.lock().expect("events lock").push(format!(
                 "prepare:credentials:{}",
                 self.credentials.snapshot().revision
             ));
             self.ready.send_replace(false);
+            if let Some(key) = self
+                .suppress_on_prepare
+                .lock()
+                .expect("suppression lock")
+                .take()
+            {
+                self.credentials.remove_env_key(&key);
+            }
             assert_eq!(*self.installed.lock().expect("installation lock"), expected);
+            assert_eq!(
+                self.publication.lock().expect("publication lock").0,
+                expected_publication_generation
+            );
             Ok(PreparedBoundaryConfiguration {
                 identity: self.identity(),
                 transition_id: "transition-1".into(),
                 expected,
                 configuration: candidate,
+                publication_generation: expected_publication_generation + 1,
+                expected_publication_generation,
+                provider_env_installation_id: installation_id,
             })
         }
 
@@ -1944,10 +2333,16 @@ mod tests {
             assert!(!*self.ready.borrow());
             *self.installed.lock().expect("installation lock") =
                 Some(prepared.configuration.clone());
+            *self.publication.lock().expect("publication lock") = (
+                prepared.publication_generation,
+                Some(prepared.provider_env_installation_id.clone()),
+            );
             let mut installed = InstalledBoundaryConfiguration {
                 identity: prepared.identity.clone(),
                 transition_id: prepared.transition_id.clone(),
                 configuration: prepared.configuration.clone(),
+                publication_generation: prepared.publication_generation,
+                provider_env_installation_id: prepared.provider_env_installation_id.clone(),
             };
             if self.wrong_commit.load(Ordering::Relaxed) {
                 installed.configuration.provider_env_revision += 1;
@@ -1968,6 +2363,8 @@ mod tests {
                 identity: installed.identity.clone(),
                 transition_id: installed.transition_id.clone(),
                 configuration: installed.configuration.clone(),
+                publication_generation: installed.publication_generation,
+                provider_env_installation_id: installed.provider_env_installation_id.clone(),
             })
         }
 
@@ -2012,6 +2409,8 @@ mod tests {
         let gateway = Arc::new(Gateway {
             snapshot: Mutex::new(snapshot(2)),
             provider_revision: AtomicU64::new(2),
+            provider_reason: Mutex::new(ProviderReadinessReason::Unspecified),
+            provider_environment: Mutex::new(HashMap::new()),
             reject_authorization: AtomicBool::new(false),
             report_faults: Mutex::new(std::collections::VecDeque::new()),
             report_attempts: Mutex::new(Vec::new()),
@@ -2024,8 +2423,10 @@ mod tests {
         let boundary = Arc::new(Boundary {
             identity: Mutex::new(identity()),
             installed: Mutex::new(Some(revision(&initial))),
+            publication: Mutex::new((1, Some(credentials.snapshot().installation_id.clone()))),
             ready,
             wrong_commit: AtomicBool::new(false),
+            suppress_on_prepare: Mutex::new(None),
             credentials: credentials.clone(),
             events: events.clone(),
         });
@@ -2040,6 +2441,7 @@ mod tests {
                 // This fixture starts with an installed active generation.
                 startup_pending: false,
                 startup_failures: AtomicU32::new(0),
+                last_startup_rejection: std::sync::Mutex::new(None),
             },
             boundary: boundary.clone(),
             snapshot: initial.clone(),
@@ -2048,6 +2450,7 @@ mod tests {
                     .expect("initial engine"),
             ),
             credentials,
+            provider_readiness: ProviderReadinessTracker::new(),
             readiness,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
@@ -2058,6 +2461,11 @@ mod tests {
             endpoint_observation_tx: None,
             interval: Duration::from_secs(1),
         };
+        let generation = runtime
+            .engine
+            .generation_guard(runtime.engine.current_generation())
+            .expect("installed policy guard");
+        runtime.record_provider_installation(&initial, None, generation);
         (runtime, gateway, boundary, events)
     }
 
@@ -2539,11 +2947,14 @@ mod tests {
 
     #[tokio::test]
     async fn configuration_activation_rejected_pair_preserves_endpoint_inventory() {
-        let (mut runtime, gateway, _, _) = runtime();
+        let (mut runtime, _, _, _) = runtime();
         let (sender, mut receiver) = openshell_core::endpoint_status::endpoint_status_channel();
         runtime.endpoint_observation_tx = Some(sender);
-        gateway.provider_revision.store(3, Ordering::Relaxed);
         let mut candidate = snapshot(2);
+        candidate.policy.as_mut().expect("policy").landlock =
+            Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "invalid".into(),
+            });
         candidate.policy_validation_failure_mode =
             openshell_core::PolicyValidationFailureMode::RetainLastValid;
 
@@ -2562,7 +2973,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configuration_activation_provider_mismatch_preserves_the_accepted_generation() {
+    async fn configuration_activation_provider_mismatch_holds_workload_and_retains_policy_generation()
+     {
         let (mut runtime, gateway, boundary, events) = runtime();
         gateway.provider_revision.store(3, Ordering::Relaxed);
         let mut candidate = snapshot(2);
@@ -2572,14 +2984,23 @@ mod tests {
             .reconcile_snapshot(candidate)
             .await
             .expect("repairable rejection");
-        assert_eq!(runtime.credentials.snapshot().revision, 1);
+        assert_eq!(runtime.credentials.snapshot().revision, 2);
         assert_eq!(runtime.engine.current_generation(), 0);
-        assert!(*boundary.ready.borrow());
-        assert!(*runtime.readiness.borrow());
+        assert!(!*boundary.ready.borrow());
+        assert!(!*runtime.readiness.borrow());
         assert_eq!(
             *events.lock().expect("events lock"),
-            ["report:Rejected:false"]
+            ["quiesce", "report:Rejected:false"]
         );
+        let observation = runtime.provider_readiness.observation(&runtime.credentials);
+        assert!(!observation.credentials_installed && !observation.policy_active);
+        gateway.provider_revision.store(2, Ordering::Relaxed);
+        runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect("matching provider repair");
+        assert!(*boundary.ready.borrow());
+        assert_eq!(runtime.credentials.snapshot().revision, 2);
     }
 
     #[tokio::test]
@@ -2590,7 +3011,8 @@ mod tests {
             .reconcile_snapshot(snapshot(2))
             .await
             .expect("repairable rejection");
-        assert_eq!(runtime.credentials.snapshot().revision, 1);
+        assert_eq!(runtime.credentials.snapshot().revision, 2);
+        assert!(runtime.credentials.snapshot().child_env.is_empty());
         assert!(!*boundary.ready.borrow());
         assert!(!*runtime.readiness.borrow());
         assert_eq!(
@@ -2793,19 +3215,374 @@ mod tests {
     }
 
     #[test]
+    fn configuration_startup_rejection_logs_only_changed_delivery_or_error() {
+        let (runtime, _, _, _) = runtime();
+        let session = runtime.session;
+        assert!(
+            session
+                .startup_rejection_changed(&snapshot(2), "invalid")
+                .expect("record first rejection")
+        );
+        assert!(
+            !session
+                .startup_rejection_changed(&snapshot(2), "invalid")
+                .expect("same rejection")
+        );
+        assert!(
+            session
+                .startup_rejection_changed(&snapshot(2), "middleware")
+                .expect("changed error")
+        );
+        assert!(
+            session
+                .startup_rejection_changed(&snapshot(3), "invalid")
+                .expect("changed delivery")
+        );
+        assert!(
+            session
+                .startup_rejection_changed(&snapshot(2), "invalid")
+                .expect("return to earlier rejection")
+        );
+    }
+
+    #[test]
+    fn configuration_provider_preparation_requires_complete_environment_identity() {
+        for field in ["attachment", "policy", "revision"] {
+            let mut supplied = provider(2);
+            match field {
+                "attachment" => supplied.provider_attachment_epoch.push('x'),
+                "policy" => supplied.policy_hash.push('x'),
+                "revision" => supplied.provider_env_revision += 1,
+                _ => unreachable!("fixed fields"),
+            }
+            let error = prepare_components(&snapshot(2), supplied)
+                .err()
+                .expect("mixed identity rejected");
+            assert_eq!(
+                error
+                    .downcast_ref::<ProviderPreparationFailure>()
+                    .expect("provider failure")
+                    .reason,
+                ProviderReadinessReason::SnapshotMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_provider_preparation_installs_withheld_and_expired_snapshots() {
+        for reason in [
+            ProviderReadinessReason::CredentialsWithheld,
+            ProviderReadinessReason::CredentialExpired,
+        ] {
+            let mut supplied = provider(2);
+            supplied.readiness_reason = reason;
+            supplied
+                .environment
+                .insert("SERVICE_ENDPOINT".into(), "https://service.invalid".into());
+            supplied
+                .non_secret_environment_keys
+                .push("SERVICE_ENDPOINT".into());
+            let (_, _, credentials) =
+                prepare_components(&snapshot(2), supplied).expect("fail-closed snapshot installs");
+            let installed = credentials.snapshot();
+            assert_eq!(installed.revision, 2);
+            assert_eq!(
+                installed
+                    .child_env
+                    .get("SERVICE_ENDPOINT")
+                    .map(String::as_str),
+                Some("https://service.invalid")
+            );
+            assert_eq!(installed.child_env.len(), 1);
+        }
+        let mut supplied = provider(2);
+        supplied.readiness_reason = ProviderReadinessReason::CredentialInstallFailed;
+        assert!(prepare_components(&snapshot(2), supplied).is_err());
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_tracks_policy_generation_and_requires_process_evidence() {
+        let (mut runtime, _, _, _) = runtime();
+        runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect("complete activation");
+        let installed = runtime.provider_readiness.observation(&runtime.credentials);
+        assert!(installed.credentials_installed && installed.policy_active);
+        assert!(
+            !installed.launch_environment_installed,
+            "configuration acceptance cannot invent a process receipt"
+        );
+        assert_eq!(installed.config_revision, 2);
+        runtime
+            .engine
+            .enter_fail_closed("test invalidates installed generation")
+            .expect("quarantine");
+        assert!(
+            !runtime
+                .provider_readiness
+                .observation(&runtime.credentials)
+                .policy_active
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_aborts_when_suppression_changes_staged_environment() {
+        let (mut runtime, gateway, boundary, events) = runtime();
+        gateway
+            .provider_environment
+            .lock()
+            .expect("provider environment")
+            .insert("SERVICE_ENDPOINT".into(), "https://service.invalid".into());
+        *boundary.suppress_on_prepare.lock().expect("suppression") =
+            Some("SERVICE_ENDPOINT".into());
+        let error = runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect_err("late suppression cannot release staged bytes");
+        assert!(
+            error
+                .to_string()
+                .contains("changed during held publication")
+        );
+        assert!(!*boundary.ready.borrow());
+        assert!(!*runtime.readiness.borrow());
+        assert!(
+            !runtime
+                .credentials
+                .snapshot()
+                .child_env
+                .contains_key("SERVICE_ENDPOINT")
+        );
+        assert!(
+            events
+                .lock()
+                .expect("events")
+                .iter()
+                .all(|event| !event.starts_with("commit:")
+                    && !event.starts_with("report:Accepted")
+                    && event != "release")
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_prepares_the_already_suppressed_child_environment() {
+        let (mut runtime, gateway, boundary, _) = runtime();
+        runtime.credentials.remove_env_key("SERVICE_ENDPOINT");
+        gateway
+            .provider_environment
+            .lock()
+            .expect("provider environment")
+            .insert("SERVICE_ENDPOINT".into(), "https://service.invalid".into());
+        runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect("prepared suppression matches live publication");
+        assert!(*boundary.ready.borrow());
+        assert!(
+            !runtime
+                .credentials
+                .snapshot()
+                .child_env
+                .contains_key("SERVICE_ENDPOINT")
+        );
+        assert_eq!(
+            boundary
+                .publication
+                .lock()
+                .expect("publication")
+                .1
+                .as_deref(),
+            Some(runtime.credentials.snapshot().installation_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_installs_withheld_credentials_then_repairs_same_fingerprint()
+    {
+        let (mut runtime, gateway, boundary, _) = runtime();
+        *gateway.provider_reason.lock().expect("provider reason") =
+            ProviderReadinessReason::CredentialsWithheld;
+        runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect("withheld environment is valid fail-closed input");
+        assert!(*boundary.ready.borrow());
+        assert_eq!(runtime.credentials.snapshot().revision, 2);
+        let first_installation = runtime.credentials.snapshot().installation_id.clone();
+        // A failed delivery invalidates the old local installation even when
+        // the gateway's desired environment fingerprint has not advanced.
+        runtime.provider_readiness.credentials_failed(
+            EnvironmentIdentity::from_settings(&snapshot(2)),
+            ProviderReadinessReason::CredentialInstallFailed,
+        );
+        *gateway.provider_reason.lock().expect("provider reason") =
+            ProviderReadinessReason::CredentialInstallFailed;
+        runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect("failed provider delivery stays repairable");
+        assert!(!*boundary.ready.borrow());
+        assert!(
+            !runtime
+                .provider_readiness
+                .observation(&runtime.credentials)
+                .credentials_installed
+        );
+        *gateway.provider_reason.lock().expect("provider reason") =
+            ProviderReadinessReason::Unspecified;
+        runtime
+            .reconcile_snapshot(snapshot(2))
+            .await
+            .expect("repair same desired fingerprint");
+        assert!(*boundary.ready.borrow());
+        assert_ne!(
+            runtime.credentials.snapshot().installation_id,
+            first_installation
+        );
+        let publication = boundary.publication.lock().expect("publication");
+        assert_eq!(publication.0, 3);
+        assert_eq!(
+            publication.1.as_deref(),
+            Some(runtime.credentials.snapshot().installation_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_same_identity_repairs_a_stale_policy_guard() {
+        let (mut runtime, gateway, _, _) = runtime();
+        *gateway.snapshot.lock().expect("snapshot") = snapshot(1);
+        gateway.provider_revision.store(1, Ordering::Relaxed);
+        runtime
+            .engine
+            .reload_from_proto(snapshot(1).policy.as_ref().expect("policy"))
+            .expect("another installed generation");
+        assert!(
+            !runtime
+                .provider_readiness
+                .observation(&runtime.credentials)
+                .policy_active
+        );
+        runtime
+            .reconcile_snapshot(snapshot(1))
+            .await
+            .expect("reconcile exact identity with stale guard");
+        assert!(
+            runtime
+                .provider_readiness
+                .observation(&runtime.credentials)
+                .policy_active
+        );
+        assert_eq!(runtime.engine.current_generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_retries_same_identity_after_middleware_failure() {
+        let (mut runtime, _, boundary, _) = runtime();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let calls = attempts.clone();
+        runtime.connector = Arc::new(move |_, _| {
+            let attempt = calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                if attempt == 0 {
+                    Err(miette::miette!("test middleware unavailable"))
+                } else {
+                    Ok(openshell_supervisor_middleware::MiddlewareRegistry::default())
+                }
+            })
+        });
+        let mut desired = snapshot(2);
+        desired
+            .supervisor_middleware_services
+            .push(openshell_core::proto::SupervisorMiddlewareService::default());
+        runtime
+            .reconcile_snapshot(desired.clone())
+            .await
+            .expect("repairable preparation failure");
+        assert!(!*boundary.ready.borrow());
+        assert_eq!(runtime.credentials.snapshot().revision, 1);
+        assert!(
+            !runtime
+                .provider_readiness
+                .observation(&runtime.credentials)
+                .policy_active
+        );
+        runtime
+            .reconcile_snapshot(desired.clone())
+            .await
+            .expect("same fingerprint repair");
+        assert!(*boundary.ready.borrow());
+        assert!(
+            runtime
+                .provider_readiness
+                .observation(&runtime.credentials)
+                .policy_active
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        runtime
+            .reconcile_snapshot(desired)
+            .await
+            .expect("unchanged accepted generation");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "accepted unchanged runtime does not reconnect middleware"
+        );
+    }
+
+    #[test]
+    fn configuration_preparation_rejects_stale_publication_receipts() {
+        let expected = Some(revision(&snapshot(1)));
+        let candidate = revision(&snapshot(2));
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut prepared = PreparedBoundaryConfiguration {
+            identity: identity(),
+            transition_id: "transition".into(),
+            expected: expected.clone(),
+            configuration: candidate.clone(),
+            publication_generation: 2,
+            expected_publication_generation: 1,
+            provider_env_installation_id: id.into(),
+        };
+        assert!(validate_preparation(&prepared, &identity(), &expected, 1, &candidate, id).is_ok());
+        prepared.publication_generation = 1;
+        assert!(
+            validate_preparation(&prepared, &identity(), &expected, 1, &candidate, id).is_err()
+        );
+        prepared.publication_generation = 2;
+        prepared.provider_env_installation_id.push('x');
+        assert!(
+            validate_preparation(&prepared, &identity(), &expected, 1, &candidate, id).is_err()
+        );
+    }
+    #[test]
     fn configuration_activation_rejects_each_wrong_receipt_identity() {
         let prepared = PreparedBoundaryConfiguration {
             identity: identity(),
             transition_id: "transition-1".into(),
             expected: Some(revision(&snapshot(1))),
             configuration: revision(&snapshot(2)),
+            publication_generation: 2,
+            expected_publication_generation: 1,
+            provider_env_installation_id: "00000000-0000-4000-8000-000000000001".into(),
         };
         let installed = InstalledBoundaryConfiguration {
             identity: prepared.identity.clone(),
             transition_id: prepared.transition_id.clone(),
             configuration: prepared.configuration.clone(),
+            publication_generation: prepared.publication_generation,
+            provider_env_installation_id: prepared.provider_env_installation_id.clone(),
         };
         let mut candidates = Vec::new();
+        let mut changed = installed.clone();
+        changed.publication_generation += 1;
+        candidates.push(changed);
+        let mut changed = installed.clone();
+        changed.provider_env_installation_id.push('x');
+        candidates.push(changed);
+        let mut changed = installed.clone();
+        changed.configuration.provider_attachment_epoch.push('x');
+        candidates.push(changed);
         let mut changed = installed.clone();
         changed.configuration.config_revision += 1;
         candidates.push(changed);

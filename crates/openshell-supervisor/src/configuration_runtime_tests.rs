@@ -192,9 +192,14 @@ impl ConfigurationGateway for RuntimeDelivery {
     }
 
     async fn provider(&self) -> Result<ProviderEnvironmentResult> {
-        Ok(copy_runtime_provider(
-            &self.providers.lock().expect("provider delivery lock"),
-        ))
+        let mut result =
+            copy_runtime_provider(&self.providers.lock().expect("provider delivery lock"));
+        let snapshot = self.snapshot.lock().expect("snapshot lock");
+        result.policy_hash.clone_from(&snapshot.policy_hash);
+        result
+            .provider_attachment_epoch
+            .clone_from(&snapshot.provider_attachment_epoch);
+        Ok(result)
     }
 
     async fn sync_policy(
@@ -254,10 +259,21 @@ impl BoundaryConfiguration for PausedRuntimeBoundary {
     async fn prepare(
         &self,
         expected: Option<ConfigurationRevision>,
+        expected_publication_generation: u64,
         candidate: ConfigurationRevision,
         child_env: HashMap<String, String>,
+        installation_id: String,
     ) -> std::result::Result<PreparedBoundaryConfiguration, BackendError> {
-        let receipt = self.actual.prepare(expected, candidate, child_env).await?;
+        let receipt = self
+            .actual
+            .prepare(
+                expected,
+                expected_publication_generation,
+                candidate,
+                child_env,
+                installation_id,
+            )
+            .await?;
         // This barrier follows the actual remote acknowledgement. A process
         // observation made here proves the kernel hold precedes publication.
         if self.armed.swap(false, Ordering::AcqRel) {
@@ -403,6 +419,9 @@ fn copy_runtime_provider(provider: &ProviderEnvironmentResult) -> ProviderEnviro
     ProviderEnvironmentResult {
         environment: provider.environment.clone(),
         provider_env_revision: provider.provider_env_revision,
+        provider_attachment_epoch: provider.provider_attachment_epoch.clone(),
+        policy_hash: provider.policy_hash.clone(),
+        readiness_reason: provider.readiness_reason,
         credential_expires_at_ms: provider.credential_expires_at_ms.clone(),
         dynamic_credentials: provider.dynamic_credentials.clone(),
         static_credential_bindings: provider.static_credential_bindings.clone(),
@@ -600,7 +619,8 @@ impl RuntimeProcessFixture {
                 *case,
             ));
         }
-        let provider_a = runtime_provider(5, endpoint_a.port, "cred-A");
+        let mut provider_a = runtime_provider(5, endpoint_a.port, "cred-A");
+        provider_a.policy_hash.clone_from(&initial.policy_hash);
         let (engine, policy, credentials) =
             prepare_components(&initial, provider_a).expect("initial actual OPA and providers");
         let backend = Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
@@ -706,8 +726,10 @@ impl RuntimeProcessFixture {
         let prepared = actual
             .prepare(
                 None,
+                0,
                 revision(&initial),
                 credentials.child_env_with_gcp_resolved(),
+                credentials.snapshot().installation_id.clone(),
             )
             .await
             .expect("initial prepare");
@@ -735,7 +757,8 @@ impl RuntimeProcessFixture {
             "b",
             endpoint_b.port,
         ));
-        let provider_b = runtime_provider(6, endpoint_b.port, "cred-B");
+        let mut provider_b = runtime_provider(6, endpoint_b.port, "cred-B");
+        provider_b.policy_hash.clone_from(&candidate.policy_hash);
         let gateway = Arc::new(RuntimeDelivery {
             snapshot: Mutex::new(candidate.clone()),
             providers: Mutex::new(copy_runtime_provider(&provider_b)),
@@ -751,11 +774,13 @@ impl RuntimeProcessFixture {
                 identity: Some(identity),
                 startup_pending: false,
                 startup_failures: AtomicU32::new(0),
+                last_startup_rejection: std::sync::Mutex::new(None),
             },
             boundary: boundary.clone(),
             snapshot: initial,
             engine: Arc::new(engine),
             credentials,
+            provider_readiness: ProviderReadinessTracker::new(),
             readiness,
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
@@ -766,6 +791,11 @@ impl RuntimeProcessFixture {
             endpoint_observation_tx: None,
             interval: Duration::from_secs(1),
         };
+        let generation = runtime
+            .engine
+            .generation_guard(runtime.engine.current_generation())
+            .expect("installed policy guard");
+        runtime.record_provider_installation(&runtime.snapshot, None, generation);
         let fixture = Self {
             process,
             running,

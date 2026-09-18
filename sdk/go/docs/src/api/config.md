@@ -19,6 +19,8 @@ fmt.Printf("Sandbox config: policy_version=%d, revision=%d\n",
 
 `ConfigurationAdmitted` reports gateway validation of the complete policy and provider composition. When validation fails, `ConfigurationError` explains the rejected input. Inspect `Sandbox.Status.ConfigurationAdmission.ActivationConfirmed` to determine whether the runtime activated a configuration; gateway validation alone does not establish activation. This SDK read observes configuration without advancing the control instance's configuration delivery.
 
+Provider environment identity includes both `ProviderAttachmentEpoch` and `ProviderEnvRevision`. Detaching and reattaching providers can produce a new attachment epoch even when the credential input revision is unchanged.
+
 ## GetGateway
 
 Retrieve the gateway-level configuration.

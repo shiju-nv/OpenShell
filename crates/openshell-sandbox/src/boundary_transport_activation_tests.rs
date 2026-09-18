@@ -334,8 +334,10 @@ impl ConfigurationTransportFixture {
         let prepared = controller
             .prepare(
                 snapshot.installed,
+                snapshot.publication_generation,
                 initial,
                 providers.snapshot().child_env.clone(),
+                providers.snapshot().installation_id.clone(),
             )
             .await
             .unwrap();
@@ -366,12 +368,23 @@ impl ConfigurationTransportFixture {
             "CONFIGURATION_TEST_TOKEN".to_string(),
             "credential-b".to_string(),
         )]);
+        let prepared_providers =
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                7,
+                child_env.clone(),
+            );
         let prepared = self
             .controller
-            .prepare(snapshot.installed, candidate, child_env.clone())
+            .prepare(
+                snapshot.installed,
+                snapshot.publication_generation,
+                candidate,
+                child_env.clone(),
+                prepared_providers.snapshot().installation_id.clone(),
+            )
             .await
             .unwrap();
-        self.providers.install_child_env_snapshot(7, child_env);
+        self.providers.install_prepared(&prepared_providers);
         prepared
     }
 

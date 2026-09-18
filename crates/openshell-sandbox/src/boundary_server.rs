@@ -1517,6 +1517,9 @@ mod linux {
     struct ConfigurationState {
         identity: Option<ConfigurationActivationIdentity>,
         installed: Option<ConfigurationRevision>,
+        installed_generation: u64,
+        publication_generation: u64,
+        provider_env_installation_id: Option<String>,
         prepared: Option<PendingConfiguration>,
         committed: Option<InstalledBoundaryConfiguration>,
         released: Option<ActivatedBoundaryConfiguration>,
@@ -1784,6 +1787,8 @@ mod linux {
             Ok(BoundaryConfigurationSnapshot {
                 identity,
                 installed: activation.installed.clone(),
+                publication_generation: activation.installed_generation,
+                provider_env_installation_id: activation.provider_env_installation_id.clone(),
                 active: activation.released.is_some(),
             })
         }
@@ -1831,20 +1836,30 @@ mod linux {
             &self,
             identity: ConfigurationActivationIdentity,
             expected: Option<ConfigurationRevision>,
+            expected_publication_generation: u64,
             configuration: ConfigurationRevision,
             provider_env: std::collections::HashMap<String, String>,
+            installation_id: String,
         ) -> Result<PreparedBoundaryConfiguration, String> {
             configuration
                 .validate()
                 .map_err(|error| error.to_string())?;
             validate_child_environment(&provider_env)?;
+            let id = uuid::Uuid::parse_str(&installation_id)
+                .map_err(|_| "invalid provider environment installation identity".to_string())?;
+            if id.is_nil() || id.hyphenated().to_string() != installation_id {
+                return Err("invalid provider environment installation identity".to_string());
+            }
             let mut activation = lock(&self.activation);
             Self::require_configuration_identity(&activation, &identity)?;
             // Identical preparation retries retain their transition token even
-            // after commit; different bytes under a reused revision are rejected.
+            // after commit; one installation ID cannot name different bytes.
             if let Some(pending) = &activation.prepared {
                 if pending.receipt.identity == identity
                     && pending.receipt.expected == expected
+                    && pending.receipt.expected_publication_generation
+                        == expected_publication_generation
+                    && pending.receipt.provider_env_installation_id == installation_id
                     && pending.receipt.configuration == configuration
                     && pending.provider_env == provider_env
                 {
@@ -1854,24 +1869,39 @@ mod linux {
                     return Err("another configuration transition is pending".to_string());
                 }
             }
-            if activation.installed != expected {
+            if activation.installed != expected
+                || activation.installed_generation != expected_publication_generation
+            {
                 return Err(
                     "configuration preparation expected a different installed revision".to_string(),
                 );
             }
-            if activation.installed.as_ref().is_some_and(|current| {
-                current.provider_env_revision == configuration.provider_env_revision
-            }) && activation.provider_env != provider_env
+            if activation.provider_env_installation_id.as_ref() == Some(&installation_id)
+                && (activation.provider_env != provider_env
+                    || activation.installed.as_ref().is_some_and(|current| {
+                        current.provider_env_revision != configuration.provider_env_revision
+                    }))
             {
                 return Err(
-                    "provider environment bytes conflict with the installed revision".to_string(),
+                    "provider environment bytes conflict with the installed snapshot identity"
+                        .to_string(),
                 );
             }
+            // Reserve a checked order before holding work. Cancellation may skip
+            // a generation, but a delayed publication can never reuse its order.
+            let publication_generation = activation
+                .publication_generation
+                .checked_add(1)
+                .ok_or_else(|| "provider environment publication exhausted".to_string())?;
             self.hold_configuration(&mut activation)?;
+            activation.publication_generation = publication_generation;
             let receipt = PreparedBoundaryConfiguration {
                 identity,
                 transition_id: uuid::Uuid::new_v4().to_string(),
                 expected,
+                expected_publication_generation,
+                publication_generation,
+                provider_env_installation_id: installation_id,
                 configuration,
             };
             activation.prepared = Some(PendingConfiguration {
@@ -1895,7 +1925,10 @@ mod linux {
             if let Some(installed) = &activation.committed {
                 return Ok(installed.clone());
             }
-            if activation.installed != prepared.expected || activation.released.is_some() {
+            if activation.installed != prepared.expected
+                || activation.installed_generation != prepared.expected_publication_generation
+                || activation.released.is_some()
+            {
                 return Err("configuration installation does not match the held state".to_string());
             }
             let provider_env = pending.provider_env.clone();
@@ -1920,7 +1953,12 @@ mod linux {
                 identity: prepared.identity.clone(),
                 transition_id: prepared.transition_id.clone(),
                 configuration: prepared.configuration.clone(),
+                publication_generation: prepared.publication_generation,
+                provider_env_installation_id: prepared.provider_env_installation_id.clone(),
             };
+            activation.installed_generation = installed.publication_generation;
+            activation.provider_env_installation_id =
+                Some(installed.provider_env_installation_id.clone());
             activation.installed = Some(prepared.configuration.clone());
             activation.provider_env = provider_env;
             activation.committed = Some(installed.clone());
@@ -1942,6 +1980,8 @@ mod linux {
                 identity: installed.identity.clone(),
                 transition_id: installed.transition_id.clone(),
                 configuration: installed.configuration.clone(),
+                publication_generation: installed.publication_generation,
+                provider_env_installation_id: installed.provider_env_installation_id.clone(),
             };
             if activation.released.as_ref() == Some(&released) {
                 return Ok(released);
@@ -2333,6 +2373,10 @@ mod linux {
                             snapshot: BoundaryConfigurationSnapshot {
                                 identity,
                                 installed: activation.installed.clone(),
+                                publication_generation: activation.installed_generation,
+                                provider_env_installation_id: activation
+                                    .provider_env_installation_id
+                                    .clone(),
                                 active: activation.released.is_some(),
                             },
                         },
@@ -2342,10 +2386,19 @@ mod linux {
                 Request::PrepareConfiguration {
                     identity,
                     expected,
+                    expected_publication_generation,
+                    provider_env_installation_id,
                     configuration,
                     provider_env,
                 } => self
-                    .prepare_configuration(identity, expected, configuration, provider_env)
+                    .prepare_configuration(
+                        identity,
+                        expected,
+                        expected_publication_generation,
+                        configuration,
+                        provider_env,
+                        provider_env_installation_id,
+                    )
                     .map_or_else(
                         |error| guest_error(BoundaryErrorKind::Configuration, error),
                         |prepared| Response::ConfigurationPrepared {
@@ -4244,13 +4297,16 @@ mod linux {
                 policy_hash: "test-policy-hash".to_string(),
                 policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
                 provider_env_revision: revision,
+                provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
             };
             let prepared = runtime
                 .prepare_configuration(
                     snapshot.identity,
                     snapshot.installed,
+                    snapshot.publication_generation,
                     configuration,
                     provider_env,
+                    uuid::Uuid::new_v4().to_string(),
                 )
                 .unwrap();
             let installed = runtime.commit_configuration(&prepared).unwrap();
@@ -4453,11 +4509,13 @@ mod linux {
                     .prepare_configuration(
                         snapshot.identity,
                         snapshot.installed,
+                        snapshot.publication_generation,
                         configuration,
                         std::collections::HashMap::from([(
                             "CONFIGURATION_TEST_TOKEN".to_string(),
                             "credential-b".to_string(),
                         )]),
+                        uuid::Uuid::new_v4().to_string(),
                     )
                     .unwrap()
             }
@@ -4502,11 +4560,13 @@ mod linux {
                     .prepare_configuration(
                         prepared.identity.clone(),
                         prepared.expected.clone(),
+                        prepared.expected_publication_generation,
                         prepared.configuration.clone(),
                         std::collections::HashMap::from([(
                             "CONFIGURATION_TEST_TOKEN".to_string(),
                             "credential-b".to_string()
-                        ),])
+                        ),]),
+                        prepared.provider_env_installation_id.clone(),
                     )
                     .unwrap(),
                 prepared
@@ -4614,6 +4674,8 @@ mod linux {
                 identity: old.identity.clone(),
                 configuration: old.configuration.clone(),
                 transition_id: old.transition_id.clone(),
+                publication_generation: old.publication_generation,
+                provider_env_installation_id: old.provider_env_installation_id.clone(),
             };
             assert!(fixture.boundary.release_configuration(&stale).is_err());
             let before = fixture.heartbeat();
@@ -4624,8 +4686,10 @@ mod linux {
                 .prepare_configuration(
                     snapshot.identity,
                     snapshot.installed.clone(),
+                    snapshot.publication_generation,
                     snapshot.installed.unwrap(),
                     current_environment,
+                    uuid::Uuid::new_v4().to_string(),
                 )
                 .unwrap();
             let installed = fixture.boundary.commit_configuration(&prepared).unwrap();
@@ -4662,8 +4726,10 @@ mod linux {
                     .prepare_configuration(
                         receipt.identity.clone(),
                         None,
+                        0,
                         receipt.configuration.clone(),
-                        std::collections::HashMap::new()
+                        std::collections::HashMap::new(),
+                        uuid::Uuid::new_v4().to_string(),
                     )
                     .is_err()
             );
@@ -4673,6 +4739,8 @@ mod linux {
                         identity: receipt.identity.clone(),
                         transition_id: receipt.transition_id.clone(),
                         configuration: receipt.configuration.clone(),
+                        publication_generation: receipt.publication_generation,
+                        provider_env_installation_id: receipt.provider_env_installation_id.clone(),
                     })
                     .is_err()
             );
@@ -4815,13 +4883,16 @@ mod linux {
                 policy_hash: "startup-a".to_string(),
                 policy_source: openshell_core::proto::PolicySource::Sandbox as i32,
                 provider_env_revision: 4,
+                provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
             };
             let prepared = boundary
                 .prepare_configuration(
                     snapshot.identity,
                     None,
+                    snapshot.publication_generation,
                     configuration.clone(),
                     std::collections::HashMap::new(),
+                    uuid::Uuid::new_v4().to_string(),
                 )
                 .unwrap();
             let installed = boundary.commit_configuration(&prepared).unwrap();
@@ -4855,8 +4926,10 @@ mod linux {
                 .prepare_configuration(
                     snapshot.identity,
                     snapshot.installed,
+                    snapshot.publication_generation,
                     candidate,
                     std::collections::HashMap::new(),
+                    uuid::Uuid::new_v4().to_string(),
                 )
                 .unwrap();
             let installed = boundary.commit_configuration(&prepared).unwrap();
@@ -6272,8 +6345,10 @@ mod linux {
                     .prepare_configuration(
                         current.identity.clone(),
                         original,
+                        current.publication_generation,
                         candidate.clone(),
-                        std::collections::HashMap::new()
+                        std::collections::HashMap::new(),
+                        uuid::Uuid::new_v4().to_string(),
                     )
                     .is_err()
             );
@@ -6281,8 +6356,10 @@ mod linux {
                 .prepare_configuration(
                     current.identity,
                     current.installed,
+                    current.publication_generation,
                     candidate,
                     std::collections::HashMap::new(),
+                    uuid::Uuid::new_v4().to_string(),
                 )
                 .unwrap();
             let installed = boundary.commit_configuration(&prepared).unwrap();

@@ -364,6 +364,7 @@ impl<K: MockKind> IsolationBackend for MockBackend<K> {
 struct MockConfiguration {
     ready: tokio::sync::watch::Sender<bool>,
     installed: Mutex<Option<ConfigurationRevision>>,
+    installed_publication: Mutex<Option<(u64, String)>>,
     prepared: Mutex<Option<PreparedBoundaryConfiguration>>,
 }
 
@@ -373,6 +374,7 @@ impl MockConfiguration {
         Arc::new(Self {
             ready,
             installed: Mutex::new(None),
+            installed_publication: Mutex::new(None),
             prepared: Mutex::new(None),
         })
     }
@@ -387,19 +389,32 @@ impl BoundaryConfiguration for MockConfiguration {
         self.ready.subscribe()
     }
     async fn snapshot(&self) -> Result<BoundaryConfigurationSnapshot, BackendError> {
+        let publication = self.installed_publication.lock().unwrap().clone();
         Ok(BoundaryConfigurationSnapshot {
             identity: self.identity(),
             installed: self.installed.lock().unwrap().clone(),
             active: *self.ready.borrow(),
+            publication_generation: publication.as_ref().map_or(0, |value| value.0),
+            provider_env_installation_id: publication.map(|value| value.1),
         })
     }
     async fn prepare(
         &self,
         expected: Option<ConfigurationRevision>,
+        expected_publication_generation: u64,
         candidate: ConfigurationRevision,
         _child_env: HashMap<String, String>,
+        installation_id: String,
     ) -> Result<PreparedBoundaryConfiguration, BackendError> {
-        if *self.installed.lock().unwrap() != expected {
+        if *self.installed.lock().unwrap() != expected
+            || self
+                .installed_publication
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |value| value.0)
+                != expected_publication_generation
+        {
             return Err(BackendError::Configuration(
                 "installed revision changed".to_string(),
             ));
@@ -410,6 +425,9 @@ impl BoundaryConfiguration for MockConfiguration {
             transition_id: format!("mock-transition-{}", candidate.config_revision),
             expected,
             configuration: candidate,
+            publication_generation: expected_publication_generation.checked_add(1).unwrap(),
+            provider_env_installation_id: installation_id,
+            expected_publication_generation,
         };
         *self.prepared.lock().unwrap() = Some(prepared.clone());
         Ok(prepared)
@@ -424,10 +442,16 @@ impl BoundaryConfiguration for MockConfiguration {
             ));
         }
         *self.installed.lock().unwrap() = Some(prepared.configuration.clone());
+        *self.installed_publication.lock().unwrap() = Some((
+            prepared.publication_generation,
+            prepared.provider_env_installation_id.clone(),
+        ));
         Ok(InstalledBoundaryConfiguration {
             identity: prepared.identity.clone(),
             transition_id: prepared.transition_id.clone(),
             configuration: prepared.configuration.clone(),
+            publication_generation: prepared.publication_generation,
+            provider_env_installation_id: prepared.provider_env_installation_id.clone(),
         })
     }
     async fn release(
@@ -450,6 +474,8 @@ impl BoundaryConfiguration for MockConfiguration {
             identity: installed.identity.clone(),
             transition_id: installed.transition_id.clone(),
             configuration: installed.configuration.clone(),
+            publication_generation: installed.publication_generation,
+            provider_env_installation_id: installed.provider_env_installation_id.clone(),
         })
     }
     async fn abort(&self, prepared: &PreparedBoundaryConfiguration) -> Result<(), BackendError> {
@@ -494,14 +520,17 @@ async fn release_configuration(
     let prepared = configuration
         .prepare(
             None,
+            0,
             ConfigurationRevision {
                 config_revision: 1,
                 policy_version: 1,
                 policy_hash: "mock-policy".to_string(),
                 policy_source: 1,
                 provider_env_revision: 0,
+                provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
             },
             HashMap::new(),
+            "55555555-5555-4555-8555-555555555555".to_string(),
         )
         .await?;
     let installed = configuration.commit(&prepared).await?;
@@ -754,14 +783,17 @@ async fn configuration_activation_confirmation_and_installation_keep_workload_he
     let prepared = configuration
         .prepare(
             None,
+            0,
             ConfigurationRevision {
                 config_revision: 1,
                 policy_version: 1,
                 policy_hash: "mock-policy".to_string(),
                 policy_source: 1,
                 provider_env_revision: 0,
+                provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
             },
             HashMap::new(),
+            "55555555-5555-4555-8555-555555555555".to_string(),
         )
         .await
         .expect("prepare");
@@ -809,9 +841,16 @@ async fn configuration_activation_startup_policy_repair_requires_fresh_held_admi
             policy_hash: "original-policy".to_string(),
             policy_source: 1,
             provider_env_revision: 0,
+            provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
         };
         let prepared = configuration
-            .prepare(None, original.clone(), HashMap::new())
+            .prepare(
+                None,
+                0,
+                original.clone(),
+                HashMap::new(),
+                "55555555-5555-4555-8555-555555555555".to_string(),
+            )
             .await
             .expect("prepare original");
         let installed = configuration.commit(&prepared).await.expect("commit held");
@@ -829,14 +868,17 @@ async fn configuration_activation_startup_policy_repair_requires_fresh_held_admi
         let replacement = configuration
             .prepare(
                 Some(original),
+                1,
                 ConfigurationRevision {
                     config_revision: 2,
                     policy_version: 2,
                     policy_hash: "repaired-policy".to_string(),
                     policy_source: 1,
                     provider_env_revision: 0,
+                    provider_attachment_epoch: "66666666-6666-4666-8666-666666666666".to_string(),
                 },
                 HashMap::new(),
+                "55555555-5555-4555-8555-555555555555".to_string(),
             )
             .await
             .expect("prepare repaired policy");

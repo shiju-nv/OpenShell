@@ -1,5 +1,5 @@
 {
-  "candidate_tree": "c3a043f816af3243d29dcc9cc6750ba2541a7b30",
+  "candidate_tree": "fcdcfe206a67939ecf30903b6b46bc6953402ce4",
   "execution_run": false,
   "schema_version": 1,
   "scopes": {
@@ -8,6 +8,9 @@
     ],
     "nextest": [
       "Test"
+    ],
+    "prover": [
+      "Verify standalone policy prover package"
     ],
     "roots": [
       "Verify system CA roots build mode compiles and excludes bundled Mozilla roots"
@@ -24,7 +27,7 @@
   ],
   "source_inputs": {
     ".config/nextest.toml": "47b1bb8d620fafcc3bc0ee0a4704cbcc8763e7b7b1680c0e3a683148e52e06c5",
-    ".github/workflows/branch-checks.yml": "499a3ddb3a769f126491783ee9496628e3c0c21859b27177c6395739c64e962c",
+    ".github/workflows/branch-checks.yml": "b0d79f5ad8e0e7fc1d31496e38393bba85da0c3ba1cb0fe8572a6181aa3dad80",
     "tasks/scripts/verify-defaults-without-telemetry.sh": "4301e793e780c0e4f2636d38d829cd129da27ddd16820fe0b3ed0c3d5af4049b",
     "tasks/scripts/verify-telemetry-compiled-out.sh": "fa640a70b2617531259fd7a036b9e94370204e8f066d043a9d4ac06bb1e9e097"
   },
@@ -33,11 +36,17 @@
       "environment": {
         "OPENSHELL_TELEMETRY_ENABLED": "false"
       },
-      "script": "cargo nextest run --profile ci --workspace --features openshell-server/test-support\n"
+      "script": "cargo nextest run --profile ci --workspace --features openshell-server/test-support\ncargo nextest run --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml\n"
     },
     "Verify selective gateway compute-driver builds": {
       "environment": {},
       "script": "cargo test -p openshell-gateway --all-targets --no-default-features\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc\ncargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm\n"
+    },
+    "Verify standalone policy prover package": {
+      "environment": {
+        "CARGO_NET_OFFLINE": "true"
+      },
+      "script": "cargo test --locked -p openshell-prover-cli\ncargo build --locked --release -p openshell-prover-cli --bin openshell-prover\ncargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt\nif grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then\n  echo \"ERROR: standalone prover includes an OpenShell control-plane dependency\" >&2\n  cat /tmp/openshell-prover-dependencies.txt >&2\n  exit 1\nfi\ntarget/release/openshell-prover check \\\n  crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \\\n  --boundary crates/openshell-prover-cli/tests/fixtures/boundary.yaml \\\n  --output json > /tmp/openshell-prover-result.json\ngrep -q '\"result\"[[:space:]]*:[[:space:]]*\"within_boundary\"' /tmp/openshell-prover-result.json\n"
     },
     "Verify system CA roots build mode compiles and excludes bundled Mozilla roots": {
       "environment": {},

@@ -20,6 +20,7 @@ mod configuration;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod provider_readiness;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
@@ -276,6 +277,7 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::skills;
+use provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracker};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
@@ -718,8 +720,20 @@ pub async fn run_sandbox(
             Err(error) => return Err(miette::miette!(error.to_string())),
         }
     };
-    initial_configuration.install_startup_registry()?;
+    let initial_generation = initial_configuration.install_startup_registry()?;
+    let provider_readiness = ProviderReadinessTracker::new();
     provider_credentials.install_prepared(&initial_configuration.credentials);
+    let provider_identity = EnvironmentIdentity::from_settings(&initial_configuration.snapshot);
+    provider_readiness.credentials_installed(
+        provider_identity.clone(),
+        &provider_credentials,
+        initial_configuration.provider_expires_at_ms,
+    );
+    provider_readiness.policy_activated(
+        &provider_identity,
+        initial_configuration.snapshot.config_revision,
+        initial_generation,
+    );
     let initial_snapshot = initial_configuration.snapshot;
     let policy = initial_configuration.policy;
     let retained_proto = initial_snapshot.policy.clone();
@@ -936,7 +950,7 @@ pub async fn run_sandbox(
             client,
             id.clone(),
             receiver,
-            supervisor_session_id,
+            supervisor_session_id.clone(),
         ))
     } else {
         None
@@ -949,6 +963,7 @@ pub async fn run_sandbox(
             .clone()
             .ok_or_else(|| miette::miette!("Configuration engine is unavailable"))?,
         credentials: provider_credentials.clone(),
+        provider_readiness: provider_readiness.clone(),
         readiness: configuration_readiness_tx,
         ocsf_enabled: ocsf_enabled.clone(),
         agent_proposals: agent_proposals.clone(),
@@ -1004,6 +1019,19 @@ pub async fn run_sandbox(
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
+        let _provider_reporter =
+            sandbox_id
+                .as_ref()
+                .zip(openshell_endpoint.as_ref())
+                .map(|(id, endpoint)| {
+                    provider_readiness.start_reporter(
+                        endpoint.clone(),
+                        id.clone(),
+                        provider_credentials.clone(),
+                        supervisor_session_id.clone(),
+                        running.exec(),
+                    )
+                });
         let mut control_readiness = if let Some(path) = health_socket_path {
             Some(ControlReadiness::start(
                 path,

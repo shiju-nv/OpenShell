@@ -313,6 +313,7 @@ fn protocol_runtime_report_tail(
     expected: &SettingsPollResult,
     identity: &ConfigurationActivationIdentity,
     state: ConfigurationAdmissionState,
+    boundary: &BoundaryConfigurationSnapshot,
 ) -> Vec<serde_json::Value> {
     let reports = gateway.reports.lock().expect("reports lock");
     let appended = reports
@@ -322,6 +323,20 @@ fn protocol_runtime_report_tail(
         !appended.is_empty(),
         "the current attempt did not report admission"
     );
+    assert_eq!(&boundary.identity, identity);
+    if state == ConfigurationAdmissionState::Accepted {
+        // The authenticated boundary acknowledgement supplies the installed
+        // publication independently of the gateway report being checked.
+        assert!(boundary.active);
+        assert_eq!(boundary.installed, Some(revision(expected)));
+        assert!(boundary.publication_generation > 0);
+        assert!(
+            boundary
+                .provider_env_installation_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+        );
+    }
     let policy_source: i32 = expected.policy_source.into();
     for report in appended {
         assert_eq!(report.state, i32::from(state));
@@ -330,6 +345,10 @@ fn protocol_runtime_report_tail(
         assert_eq!(report.policy_hash, expected.policy_hash);
         assert_eq!(report.config_revision, expected.config_revision);
         assert_eq!(report.provider_env_revision, expected.provider_env_revision);
+        assert_eq!(
+            report.provider_attachment_epoch,
+            expected.provider_attachment_epoch
+        );
         assert_eq!(report.runtime_generation, expected.runtime_generation);
         assert_eq!(
             report.boundary_instance_id,
@@ -352,8 +371,20 @@ fn protocol_runtime_report_tail(
         if state == ConfigurationAdmissionState::Rejected {
             assert!(!report.activation_confirmed);
             assert!(!report.error.is_empty());
+            // Rejection reports describe the candidate without claiming a
+            // publication, even when the boundary retains an older installation.
+            assert_eq!(report.publication_generation, 0);
+            assert!(report.provider_env_installation_id.is_empty());
         } else {
             assert!(report.error.is_empty());
+            assert_eq!(
+                report.publication_generation,
+                boundary.publication_generation
+            );
+            assert_eq!(
+                Some(report.provider_env_installation_id.as_str()),
+                boundary.provider_env_installation_id.as_deref()
+            );
         }
     }
     if state == ConfigurationAdmissionState::Accepted {
@@ -389,6 +420,9 @@ fn protocol_runtime_report_tail(
                 "policy_hash": report.policy_hash,
                 "config_revision": report.config_revision,
                 "provider_env_revision": report.provider_env_revision,
+                "provider_attachment_epoch": report.provider_attachment_epoch,
+                "publication_generation": report.publication_generation,
+                "provider_env_installation_id": report.provider_env_installation_id,
                 "error": report.error,
                 "runtime_generation": report.runtime_generation,
                 "boundary_instance_id": report.boundary_instance_id,
@@ -491,6 +525,7 @@ async fn protocol_runtime_validate_startup(
         identity: Some(identity.clone()),
         startup_pending: true,
         startup_failures: AtomicU32::new(0),
+        last_startup_rejection: std::sync::Mutex::new(None),
     };
     let connector = super::super::default_middleware_connector();
     let mut observations = Vec::new();
@@ -510,18 +545,19 @@ async fn protocol_runtime_validate_startup(
                     }
                 }
             }
+            let observed = actual
+                .snapshot()
+                .await
+                .expect("actual held boundary snapshot");
             let reports = protocol_runtime_report_tail(
                 &gateway,
                 before,
                 snapshot,
                 &identity,
                 ConfigurationAdmissionState::Rejected,
+                &observed,
             );
             before += reports.len();
-            let observed = actual
-                .snapshot()
-                .await
-                .expect("actual held boundary snapshot");
             assert!(!observed.active);
             assert!(observed.installed.is_none());
             assert!(!*actual.readiness().borrow());
@@ -619,6 +655,7 @@ async fn protocol_runtime_start_fixture(
         snapshot: configuration.snapshot,
         engine: Arc::new(configuration.engine),
         credentials: input.credentials,
+        provider_readiness: ProviderReadinessTracker::new(),
         readiness,
         ocsf_enabled: Arc::new(AtomicBool::new(false)),
         agent_proposals: openshell_core::proposals::AgentProposals::default(),
@@ -629,19 +666,25 @@ async fn protocol_runtime_start_fixture(
         endpoint_observation_tx: None,
         interval: Duration::from_secs(1),
     };
+    let generation = runtime
+        .engine
+        .generation_guard(runtime.engine.current_generation())
+        .expect("installed policy guard");
+    runtime.record_provider_installation(&runtime.snapshot, None, generation);
     let before = gateway.reports.lock().expect("reports lock").len();
     let running = runtime.start_workload(input.ready, &input.bootstrap).await.expect("production startup installs, releases, starts, and confirms the repaired configuration");
+    let state = boundary
+        .snapshot()
+        .await
+        .expect("accepted startup boundary");
     let accepted = protocol_runtime_report_tail(
         &gateway,
         before,
         &runtime.snapshot,
         &boundary.identity(),
         ConfigurationAdmissionState::Accepted,
+        &state,
     );
-    let state = boundary
-        .snapshot()
-        .await
-        .expect("accepted startup boundary");
     assert!(state.active);
     assert_eq!(state.installed, Some(revision(&runtime.snapshot)));
     let candidate = protocol_runtime_delivery(
@@ -777,6 +820,7 @@ async fn configuration_activation_protocol_startup_matrix() {
             &fixture.runtime.snapshot,
             &fixture.boundary.identity(),
             ConfigurationAdmissionState::Accepted,
+            &state,
         );
         println!(
             "configuration_protocol_runtime_observation {}",
@@ -838,21 +882,22 @@ async fn configuration_activation_protocol_update_matrix() {
                     .reconcile_snapshot(candidate.clone())
                     .await
                     .expect("repairable protocol rejection");
+                let state = fixture
+                    .boundary
+                    .snapshot()
+                    .await
+                    .expect("boundary snapshot after rejection");
                 let reports = protocol_runtime_report_tail(
                     &fixture.gateway,
                     report_count,
                     &candidate,
                     &fixture.boundary.identity(),
                     ConfigurationAdmissionState::Rejected,
+                    &state,
                 );
                 assert_eq!(*fixture.runtime.readiness.borrow(), retains);
                 assert_eq!(fixture.runtime.credentials.snapshot().revision, 5);
                 assert_eq!(revision(&fixture.runtime.snapshot), initial);
-                let state = fixture
-                    .boundary
-                    .snapshot()
-                    .await
-                    .expect("boundary snapshot after rejection");
                 assert_eq!(state.installed, Some(initial.clone()));
                 assert_eq!(state.active, retains);
                 assert_eq!(
@@ -899,12 +944,18 @@ async fn configuration_activation_protocol_update_matrix() {
                 .reconcile_snapshot(fixture.candidate.clone())
                 .await
                 .expect("valid protocol repair");
+            let state = fixture
+                .boundary
+                .snapshot()
+                .await
+                .expect("repaired boundary snapshot");
             let reports = protocol_runtime_report_tail(
                 &fixture.gateway,
                 report_count,
                 &fixture.candidate,
                 &fixture.boundary.identity(),
                 ConfigurationAdmissionState::Accepted,
+                &state,
             );
             fixture.wait_heartbeat(beat).await;
             assert_eq!(fixture.pid(), pid);
@@ -931,11 +982,6 @@ async fn configuration_activation_protocol_update_matrix() {
                 Some("cred-B"),
             )
             .await;
-            let state = fixture
-                .boundary
-                .snapshot()
-                .await
-                .expect("repaired boundary snapshot");
             assert!(state.active);
             assert_eq!(state.installed, Some(revision(&fixture.candidate)));
             assert_eq!(fixture.runtime.credentials.snapshot().revision, 6);

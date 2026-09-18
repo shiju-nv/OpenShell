@@ -18,9 +18,13 @@ import time
 import uuid
 
 
-CANDIDATE_TREE = "c3a043f816af3243d29dcc9cc6750ba2541a7b30"
+CANDIDATE_TREE = "fcdcfe206a67939ecf30903b6b46bc6953402ce4"
 HISTORICAL_SOURCE_SHA256 = "41ab5ee8614cee7910b58ed5c5600036f3c32bbc3ae567446d9ec6c357c54030"
 HARNESSES = {"policy_activation", "configuration_composition_acceptance"}
+EXAMPLE_MANIFEST = "examples/supervisor-middleware-content-guard/Cargo.toml"
+EXAMPLE_PACKAGE = "openshell-supervisor-middleware-content-guard"
+EXAMPLE_COMMAND = ["nextest", "run", "--config-file", ".config/nextest.toml",
+                   "--manifest-path", EXAMPLE_MANIFEST]
 # No prefix-based expansion is allowed: hosted credentials may share familiar
 # GitHub, Actions, Cargo, or product prefixes with innocent execution settings.
 ENV_KEYS = frozenset({
@@ -42,6 +46,8 @@ ENV_KEYS = frozenset({
     "OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE", "OPENSHELL_ACCEPTANCE_UPSTREAM_HOST",
     "OPENSHELL_E2E_HOST_GATEWAY_IP", "OPENSHELL_MCP_CONFORMANCE_HOST_BRIDGE_HOSTNAME",
     "ACCEPTANCE_PRODUCT_COMMIT", "ACCEPTANCE_CAPTURE_CONTEXT",
+    "NEXTEST", "NEXTEST_RUN_ID", "NEXTEST_BINARY_ID", "NEXTEST_TEST_NAME",
+    "NEXTEST_ATTEMPT", "NEXTEST_PROFILE", "NEXTEST_VERSION", "NEXTEST_WORKSPACE_ROOT",
 })
 
 
@@ -246,7 +252,7 @@ def observe_cargo_execution(evidence, phase, environment, tools):
     return record["execution"]
 
 
-def tool_context(root, environment, evidence, phase):
+def tool_context(root, environment, evidence, phase, *, include_nextest=False):
     """Observe selected launchers and versions inside the actual task environment."""
     require(evidence.is_absolute() and evidence.resolve(strict=True) == evidence
             and not evidence.is_relative_to(Path(root).resolve(strict=True)), "Tool probes must be outside the product workspace")
@@ -268,12 +274,27 @@ def tool_context(root, environment, evidence, phase):
     # Launcher versions are stable; process IDs and probe paths belong only in
     # the separate receipts so before/after tool equality remains meaningful.
     result["cargo"]["execution"] = observe_cargo_execution(evidence, phase, environment, result)
+    if not include_nextest:
+        return result
+    selected = shutil.which("cargo-nextest", path=environment.get("PATH"))
+    require(selected, "Missing selected cargo-nextest")
+    path = Path(selected).absolute()
+    # The locked Nix package installs an ELF directly. A wrapper requires an
+    # explicit launcher-to-process observation, never a basename exception.
+    elf_identity(path, 62 if result["host"].startswith("x86_64-") else 183)
+    completed = subprocess.run([str(path), "--version"], cwd=root, env=environment,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    require(completed.returncode == 0, "Nextest version probe failed")
+    result["cargo-nextest"] = {"path": str(path), "resolved_path": str(path.resolve()),
+                              "sha256": digest(path), "argv": [str(path), "--version"],
+                              "exit_status": completed.returncode,
+                              "output": completed.stdout.decode(errors="replace")}
     return result
 
 
 def prepare_metadata(source, evidence, mode, environment, tools):
     """Resolve locked metadata before Cargo holds build locks or launches tests."""
-    leaves = ["docker-e2e"] if mode == "docker" else ["test-workspace", "test-server-support"]
+    leaves = ["docker-e2e"] if mode == "docker" else ["test-workspace", "test-server-support", "test-content-guard"]
     for leaf in leaves:
         directory = evidence / "metadata" / leaf
         directory.mkdir(parents=True)
@@ -282,6 +303,8 @@ def prepare_metadata(source, evidence, mode, environment, tools):
             argv += ["--manifest-path", "e2e/rust/Cargo.toml", "--features", "e2e-docker"]
         elif leaf == "test-server-support":
             argv += ["--features", "openshell-server/test-support"]
+        elif leaf == "test-content-guard":
+            argv += ["--manifest-path", EXAMPLE_MANIFEST]
         started = time.time()
         completed = subprocess.run(argv, cwd=source, env=environment, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, check=False)
@@ -307,9 +330,11 @@ def prepare_capture(source_root, evidence_root, mode, environment, task_argv):
     require(not any(key.startswith("CARGO_TARGET_") and key.endswith("_RUNNER") and value
                     for key, value in environment.items()), "Inherited Cargo runner is not admitted")
     require(not environment.get("ACCEPTANCE_CAPTURE_CONTEXT"), "Nested capture is not admitted")
+    require(not any(key.startswith("NEXTEST_") for key in environment),
+            "Inherited Nextest selectors are not admitted")
     before = source_snapshot(root, environment.get("ACCEPTANCE_PRODUCT_COMMIT"), environment)
     evidence.mkdir(parents=True, exist_ok=False)
-    tools = tool_context(root, environment, evidence, "before")
+    tools = tool_context(root, environment, evidence, "before", include_nextest=mode == "native")
     runner_key = "CARGO_TARGET_" + tools["host"].upper().replace("-", "_") + "_RUNNER"
     runner = [sys.executable, str(Path(__file__).resolve()), "runner"]
     require(all(not re.search(r"\s", value) for value in runner), "Cargo runner path contains whitespace")
@@ -467,7 +492,7 @@ def depfile_inputs(path, executable, source, target, workspace):
     return values
 
 
-def capture_provenance(original, directory, context, environment):
+def capture_provenance(original, directory, context, environment, *, example_nextest=False):
     """Bind one executed target to metadata, selected features, and source inputs."""
     evidence, source = Path(context["evidence_root"]), Path(context["source_root"])
     require(original.is_absolute() and original.resolve() == original and original.parent.name == "deps",
@@ -479,7 +504,9 @@ def capture_provenance(original, directory, context, environment):
     require(len(roots) == 1, "Missing or ambiguous executed test fingerprint")
     fingerprint = roots[0]
     package_name = fingerprint.parent.name.removesuffix("-" + suffix)
-    leaf = ("docker-e2e" if context["mode"] == "docker" else
+    require(not example_nextest or context["mode"] == "native" and package_name == EXAMPLE_PACKAGE,
+            "Nextest did not select the standalone content-guard package")
+    leaf = ("test-content-guard" if example_nextest else "docker-e2e" if context["mode"] == "docker" else
             "test-server-support" if package_name == "openshell-server" else "test-workspace")
     metadata_directory = evidence / "metadata" / leaf
     metadata = json.loads((metadata_directory / "metadata.json").read_text())
@@ -708,6 +735,39 @@ def cargo_parent():
             "sha256": digest(parent / "exe")}
 
 
+def nextest_invocation(parent, tool, context, argv, environment):
+    """Authenticate the standalone shipping scope and distinguish list/run calls."""
+    source = Path(context["source_root"])
+    require(context["mode"] == "native" and parent["argv"][1:] == EXAMPLE_COMMAND
+            and parent["cwd"] == str(source), "Changed or filtered content-guard Nextest parent")
+    require(parent["executable"] == tool["resolved_path"] and parent["sha256"] == tool["sha256"]
+            and Path(parent["argv"][0]).resolve(strict=True) == Path(tool["resolved_path"]),
+            "Nextest parent differs from the observed selected tool")
+    workspace = str(source / Path(EXAMPLE_MANIFEST).parent)
+    require(environment.get("NEXTEST_WORKSPACE_ROOT") == workspace
+            and environment.get("CARGO_MANIFEST_DIR") == workspace
+            and environment.get("CARGO_PKG_NAME") == EXAMPLE_PACKAGE,
+            "Nextest selected a foreign workspace/package")
+    run_id = environment.get("NEXTEST_RUN_ID", "")
+    require(str(uuid.UUID(run_id)) == run_id and environment.get("NEXTEST_BINARY_ID"),
+            "Nextest run/binary identity is absent")
+    listing = argv[1:] in (["--list", "--format", "terse"],
+                          ["--list", "--format", "terse", "--ignored"])
+    name = environment.get("NEXTEST_TEST_NAME")
+    if listing:
+        require(not name, "Discovery invocation claims an executed test")
+    else:
+        require(name and argv[1:] in (["--exact", name, "--nocapture"],
+                                     ["--exact", name, "--nocapture", "--ignored"]),
+                "Unexpected Nextest test selection")
+        require(environment.get("NEXTEST") == "1"
+                and re.fullmatch(r"[1-9][0-9]*", environment.get("NEXTEST_ATTEMPT", "")),
+                "Missing Nextest execution identity")
+    return {"phase": "list" if listing else "run", "run_id": run_id,
+            "binary_id": environment["NEXTEST_BINARY_ID"], "test_name": name,
+            "attempt": environment.get("NEXTEST_ATTEMPT")}
+
+
 def run_invocation(argv, environment):
     """Capture an actual Cargo runner invocation and preserve its child status."""
     context_path = Path(environment["ACCEPTANCE_CAPTURE_CONTEXT"])
@@ -733,11 +793,19 @@ def run_invocation(argv, environment):
         require(digest(Path(__file__)) == context["adapter_sha256"], "Capture adapter changed")
         require(environment.get(context["runner_key"]) == context["environment"][context["runner_key"]],
                 "Owned runner environment changed")
-        record["cargo_parent"] = cargo_parent()
+        parent = process_snapshot(os.getppid())
+        tools = json.loads((evidence / "tools.json").read_text())
+        example_nextest = parent["executable"] == tools.get("cargo-nextest", {}).get("resolved_path")
+        if example_nextest:
+            record["nextest_parent"] = parent
+            record["nextest"] = nextest_invocation(parent, tools["cargo-nextest"], context, argv, environment)
+        else:
+            record["cargo_parent"] = cargo_parent()
         before = retain_executable(original, directory / "binary", context["elf_machine"])
         record.update(executable_sha256_before=before["sha256"], executable_before=before,
                       binary=asset(directory / "binary", evidence))
-        record.update(capture_provenance(original, directory, context, environment))
+        record.update(capture_provenance(original, directory, context, environment,
+                                         example_nextest=example_nextest))
         save(directory / "before.json", record)
         print("ACCEPTANCE_CAPTURE_START " + json.dumps({"id": directory.name, "argv": argv}), file=sys.stderr, flush=True)
         record.update(execute_child(argv, environment, directory))
@@ -752,6 +820,8 @@ def run_invocation(argv, environment):
                     "Source input changed during actual test")
         for row in json.loads((directory / "artifacts.json").read_text()):
             require(digest(Path(row["original_path"])) == row["sha256"], "Cargo input changed during actual test")
+        if example_nextest:
+            require(process_snapshot(parent["pid"]) == parent, "Nextest parent changed during execution")
         record["capture_passed"] = not record["forwarded_signals"]
     except Exception as error:
         record.update(error=type(error).__name__ + ": " + str(error), finished=time.time())
@@ -785,13 +855,20 @@ def finish_capture(evidence_root, *, task_exit_status, task_log):
         if context["mode"] == "docker":
             require({row["target_name"] for row in rows} == HARNESSES, "Missing selected Docker harness")
         else:
-            require({row["leaf"] for row in rows} == {"test-workspace", "test-server-support"}, "Missing native test context")
+            require({row["leaf"] for row in rows} ==
+                    {"test-workspace", "test-server-support", "test-content-guard"}, "Missing native test context")
+            example_rows = [row for row in rows if row["leaf"] == "test-content-guard"]
+            require(any(row["nextest"]["phase"] == "run" for row in example_rows),
+                    "Nextest discovery alone does not prove a test execution")
+            require(len({row["nextest"]["run_id"] for row in example_rows}) == 1,
+                    "Standalone Nextest records belong to different runs")
         verification_environment = os.environ.copy()
         verification_environment.update(context["environment"])
         after = source_snapshot(Path(context["source_root"]), context["product_commit"], verification_environment)
         save(evidence / "source-after.json", after)
         require(after == json.loads((evidence / "source-before.json").read_text()), "Source changed during shipping task")
-        tools = tool_context(Path(context["source_root"]), verification_environment, evidence, "after")
+        tools = tool_context(Path(context["source_root"]), verification_environment, evidence, "after",
+                             include_nextest=context["mode"] == "native")
         result["tool_probe"] = asset(evidence / "tool-observations/after/receipt.json", evidence)
         save(evidence / "tools-after.json", tools)
         require(tools == json.loads((evidence / "tools.json").read_text()), "Selected tools changed during task")

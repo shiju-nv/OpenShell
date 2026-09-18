@@ -316,7 +316,9 @@ async fn replacement_connections_hold_activation_without_cancelling_pending_conf
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             if transport_recovery {
-                client.recover_after_unavailable().await
+                client
+                    .recover_after_unavailable(client.connection_generation().await)
+                    .await
             } else {
                 client.ensure_current_credential_connection().await
             }
