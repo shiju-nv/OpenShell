@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ACCEPTANCE_PRODUCT_COMMIT: bc9fbbb0bec3dc9710b3f4a115ba519115a32ce3
+  ACCEPTANCE_PRODUCT_COMMIT: da3d665b43ede9c3039a645af93d227c17ec5e13
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_BUILD_JOBS: "2"

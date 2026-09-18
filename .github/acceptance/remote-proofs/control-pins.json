@@ -1,7 +1,7 @@
 {
   "build_helper": {
     "relative_path": "linux-runner-assessment/build-scripts/build_products.py",
-    "sha256": "b4b65a0a9f8fc886b573589d6378e121675f2cf0a813c967f21f79d9b8343c92"
+    "sha256": "530b4d14ce30f8bc05dd4c2a728b15e4421cb3c0309196475b42a37240b773dc"
   },
   "expected_protocol_rows": 60,
   "fixture_image": {
@@ -20,7 +20,7 @@
     "verify-boundary.fish": "8bd501ce0ef39046984e0ec87632fbc5345da1a25646dcc300925e653bad5769",
     "verify-protocol-observations.py": "8492580a1102984cf9ae70b295fed615787f555ecdef17b6ecb97723c1a5e829",
     "verify-protocol-runtime.fish": "6f4927efd22beb8ee64e4d33c5ecce66f98f0fa1e343ff61767e2b9dece4b146",
-    "verify-runtime-observations.py": "b675c6b218861739bb51c1e7b7797c0cfdfbf882337e31bc0d50dc0a89d10689",
+    "verify-runtime-observations.py": "51ad00ce6f4e2a47765e996959ef3f31ab31477ba4ef5f33a8731e81d2efb683",
     "verify-supervisor-runtime.fish": "7b7319199c9cf1e27be1d4d99c6fb0dffd5b978894598aa6752cb25bc0da564d"
   },
   "schema_version": 1

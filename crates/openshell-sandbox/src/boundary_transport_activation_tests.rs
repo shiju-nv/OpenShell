@@ -369,10 +369,7 @@ impl ConfigurationTransportFixture {
             "credential-b".to_string(),
         )]);
         let prepared_providers =
-            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
-                7,
-                child_env.clone(),
-            );
+            ProviderCredentialState::from_child_env_snapshot(7, child_env.clone());
         let prepared = self
             .controller
             .prepare(

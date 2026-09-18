@@ -149,21 +149,24 @@ fn confirmed_configuration_requires_fresh_independent_provider_installation_evid
     let mut observation = installed(&hello, &session_id, &receipt);
     evidence.accept(observation.clone()).unwrap();
     let next_installation = Uuid::new_v4().to_string();
-    let evaluate_installation = |environment_id, evidence| {
-        evaluate_status(
-            receipt.clone(),
-            ProviderReadinessReason::Unspecified,
-            receipt.desired.as_ref().unwrap(),
-            ProviderReadinessReason::Unspecified,
-            true,
-            ActiveProviderInstallation {
-                control_instance_id: &hello.instance_id,
-                environment_id,
-            },
-            evidence,
-        )
-        .unwrap()
-    };
+    // Each evaluation borrows evidence only for that call so the next
+    // independently reported observation can update it before re-evaluation.
+    let evaluate_installation =
+        |environment_id: &str, evidence: Option<&ProviderReadinessEvidence>| {
+            evaluate_status(
+                receipt.clone(),
+                ProviderReadinessReason::Unspecified,
+                receipt.desired.as_ref().unwrap(),
+                ProviderReadinessReason::Unspecified,
+                true,
+                ActiveProviderInstallation {
+                    control_instance_id: &hello.instance_id,
+                    environment_id,
+                },
+                evidence,
+            )
+            .unwrap()
+        };
     assert_eq!(
         evaluate_installation(&hello.instance_id, Some(&evidence)).state,
         ProviderReadinessState::Ready as i32,

@@ -18,7 +18,7 @@ import time
 import uuid
 
 
-CANDIDATE_TREE = "8f52780f5fdd124fe2909b88e5951ebded6b2633"
+CANDIDATE_TREE = "43e09c50c0352bc4c43560362efff7095a49897d"
 HISTORICAL_SOURCE_SHA256 = "41ab5ee8614cee7910b58ed5c5600036f3c32bbc3ae567446d9ec6c357c54030"
 HARNESSES = {"policy_activation", "configuration_composition_acceptance"}
 EXAMPLE_MANIFEST = "examples/supervisor-middleware-content-guard/Cargo.toml"

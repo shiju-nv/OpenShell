@@ -1083,8 +1083,21 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
             let mut fixture = Box::pin(RuntimeProcessFixture::new()).await;
             let pid = fixture.pid();
             let initial = revision(&fixture.runtime.snapshot);
+            let initial_boundary = fixture.boundary.snapshot().await.expect("initial boundary");
+            let initial_credentials = fixture.runtime.credentials.snapshot();
+            let opa_generation_before = fixture.runtime.engine.current_generation();
+            let policy_guard = fixture
+                .runtime
+                .engine
+                .generation_guard(opa_generation_before)
+                .expect("initial policy guard");
+            let upstream_requests_before_rejection = [
+                fixture.endpoint_a.requests.lock().expect("requests").len(),
+                fixture.endpoint_b.requests.lock().expect("requests").len(),
+            ];
             let mut candidate = fixture.candidate.clone();
             candidate.policy_validation_failure_mode = mode;
+            let provider_mismatch = fault == "provider-revision-mismatch";
             match fault {
                 "unresolved-binding" => {
                     // The real gateway separately proves this rejection. This
@@ -1113,25 +1126,68 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
                 .reconcile_snapshot(candidate)
                 .await
                 .expect("repairable runtime rejection");
-            let retains = mode == openshell_core::PolicyValidationFailureMode::RetainLastValid;
+            let retains_policy =
+                mode == openshell_core::PolicyValidationFailureMode::RetainLastValid;
+            // Policy retention cannot authorize execution with an unverified
+            // provider environment. A mismatch holds and revokes in both modes.
+            let retains_execution = retains_policy && !provider_mismatch;
             let before = fixture.heartbeat();
-            let observed = if retains {
+            let observed = if retains_execution {
                 fixture.exec_probe(true).await;
                 fixture.wait_heartbeat(before).await
             } else {
                 fixture.assert_held().await
             };
-            assert_eq!(*fixture.runtime.readiness.borrow(), retains);
-            assert_eq!(fixture.runtime.credentials.snapshot().revision, 5);
+            assert_eq!(*fixture.runtime.readiness.borrow(), retains_execution);
+            let rejected_credentials = fixture.runtime.credentials.snapshot();
+            let provider_child_env_empty = rejected_credentials.child_env.is_empty();
+            let provider_resolver_present = fixture.runtime.credentials.resolver().is_some();
+            let provider_static_revoked = provider_child_env_empty && !provider_resolver_present;
+            assert_eq!(provider_static_revoked, provider_mismatch);
             assert_eq!(
-                fixture
-                    .boundary
-                    .snapshot()
-                    .await
-                    .expect("boundary snapshot")
-                    .installed,
-                Some(initial.clone())
+                rejected_credentials.revision,
+                if provider_mismatch { 6 } else { 5 }
             );
+            if provider_mismatch {
+                assert!(provider_child_env_empty);
+                assert!(!provider_resolver_present);
+                assert_ne!(
+                    rejected_credentials.installation_id,
+                    initial_credentials.installation_id
+                );
+            } else {
+                assert_eq!(
+                    rejected_credentials.installation_id,
+                    initial_credentials.installation_id
+                );
+            }
+            let rejected_boundary = fixture
+                .boundary
+                .snapshot()
+                .await
+                .expect("boundary snapshot");
+            assert_eq!(rejected_boundary.active, retains_execution);
+            assert_eq!(rejected_boundary.installed, Some(initial.clone()));
+            assert_eq!(rejected_boundary.identity, initial_boundary.identity);
+            assert_eq!(
+                rejected_boundary.publication_generation,
+                initial_boundary.publication_generation
+            );
+            assert_eq!(
+                rejected_boundary.provider_env_installation_id,
+                initial_boundary.provider_env_installation_id
+            );
+            let opa_generation_after_rejection = fixture.runtime.engine.current_generation();
+            if retains_policy {
+                assert_eq!(opa_generation_after_rejection, opa_generation_before);
+                policy_guard
+                    .ensure_current()
+                    .expect("retained policy guard");
+            } else {
+                assert!(opa_generation_after_rejection > opa_generation_before);
+                assert!(policy_guard.ensure_current().is_err());
+                assert!(fixture.runtime.engine.fail_closed_reason().is_some());
+            }
             assert!(
                 fixture
                     .gateway
@@ -1144,13 +1200,41 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
                             && !report.activation_confirmed
                     )
             );
-            runtime_endpoint_probe(
-                &fixture.runtime.engine,
-                &fixture.runtime.credentials,
-                &fixture.endpoint_a,
-                retains.then_some("cred-A"),
-            )
-            .await;
+            if provider_mismatch {
+                // The retained OPA policy can still allow the old endpoint,
+                // while revocation removes the material needed for an upstream
+                // write and the boundary prevents the workload from executing.
+                let decision = fixture
+                    .runtime
+                    .engine
+                    .evaluate_network(&openshell_supervisor_network::opa::NetworkInput {
+                        host: "127.0.0.1".into(),
+                        port: fixture.endpoint_a.port,
+                        binary_path: "/bin/sh".into(),
+                        binary_sha256: "fixture-binary".into(),
+                        ancestors: Vec::new(),
+                        cmdline_paths: Vec::new(),
+                    })
+                    .expect("actual OPA decision after provider mismatch");
+                assert_eq!(decision.allowed, retains_policy);
+                for endpoint in [&fixture.endpoint_a, &fixture.endpoint_b] {
+                    assert!(
+                        fixture
+                            .runtime
+                            .credentials
+                            .resolver_for_endpoint("127.0.0.1", endpoint.port, "/probe")
+                            .is_none()
+                    );
+                }
+            } else {
+                runtime_endpoint_probe(
+                    &fixture.runtime.engine,
+                    &fixture.runtime.credentials,
+                    &fixture.endpoint_a,
+                    retains_policy.then_some("cred-A"),
+                )
+                .await;
+            }
             runtime_endpoint_probe(
                 &fixture.runtime.engine,
                 &fixture.runtime.credentials,
@@ -1158,6 +1242,16 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
                 None,
             )
             .await;
+            let upstream_requests_after_rejection = [
+                fixture.endpoint_a.requests.lock().expect("requests").len(),
+                fixture.endpoint_b.requests.lock().expect("requests").len(),
+            ];
+            if provider_mismatch {
+                assert_eq!(
+                    upstream_requests_after_rejection, upstream_requests_before_rejection,
+                    "revoked provider environment must not emit an upstream request"
+                );
+            }
             *fixture.gateway.providers.lock().expect("provider lock") =
                 copy_runtime_provider(&fixture.provider_b);
             fixture
@@ -1169,6 +1263,7 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
             assert_eq!(fixture.pid(), pid);
             assert_eq!(fixture.start_count(), 1);
             assert!(*fixture.runtime.readiness.borrow());
+            assert!(policy_guard.ensure_current().is_err());
             fixture.exec_probe(true).await;
             runtime_endpoint_probe(
                 &fixture.runtime.engine,
@@ -1186,7 +1281,7 @@ async fn configuration_activation_runtime_rejection_postures_preserve_one_genera
             .await;
             println!(
                 "configuration_activation_runtime_observation {}",
-                serde_json::json!({"scenario":"rejected-live-posture", "posture":if retains {"retain_last_valid"} else {"fail_closed"},"fault":fault,"pid_before":pid,"pid_after":fixture.pid(),"start_count":fixture.start_count(),"heartbeat_before":before,"heartbeat_after_rejection":observed,"heartbeat_after_repair":repaired,"rejected_ready":retains,"rejected_exec_allowed":retains,"retained_installation":initial,"provider_after_rejection":5,"provider_after_repair":fixture.runtime.credentials.snapshot().revision,"ready_after_repair":*fixture.runtime.readiness.borrow(),"probe_origin":"actual-coordinator-opa-and-provider-state","upstream_a":*fixture.endpoint_a.requests.lock().expect("request lock"),"upstream_b":*fixture.endpoint_b.requests.lock().expect("request lock")})
+                serde_json::json!({"scenario":"rejected-live-posture", "posture":if retains_policy {"retain_last_valid"} else {"fail_closed"},"execution_posture":if retains_execution {"running"} else {"held"},"fault":fault,"pid_before":pid,"pid_after":fixture.pid(),"start_count":fixture.start_count(),"heartbeat_before":before,"heartbeat_after_rejection":observed,"heartbeat_after_repair":repaired,"rejected_ready":retains_execution,"rejected_exec_allowed":retains_execution,"retained_installation":initial,"boundary_before_rejection":initial_boundary,"boundary_after_rejection":rejected_boundary,"provider_after_rejection":rejected_credentials.revision,"provider_static_revoked":provider_static_revoked,"provider_child_env_empty_after_rejection":provider_child_env_empty,"provider_resolver_present_after_rejection":provider_resolver_present,"opa_generation_before":opa_generation_before,"opa_generation_after_rejection":opa_generation_after_rejection,"upstream_requests_before_rejection":upstream_requests_before_rejection,"upstream_requests_after_rejection":upstream_requests_after_rejection,"provider_after_repair":fixture.runtime.credentials.snapshot().revision,"ready_after_repair":*fixture.runtime.readiness.borrow(),"probe_origin":"actual-coordinator-opa-and-provider-state","upstream_a":*fixture.endpoint_a.requests.lock().expect("request lock"),"upstream_b":*fixture.endpoint_b.requests.lock().expect("request lock")})
             );
             fixture.stop().await;
         }
