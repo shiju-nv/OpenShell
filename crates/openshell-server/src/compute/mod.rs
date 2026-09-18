@@ -1138,9 +1138,11 @@ impl ComputeRuntime {
                 .map_err(Status::internal)?;
             return Ok(current);
         }
-        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) {
+        if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping)
+            && !is_runtime_error_requiring_stop(&current)
+        {
             return Err(Status::failed_precondition(format!(
-                "sandbox must be Ready to stop (current phase: {phase:?})"
+                "sandbox must be Ready or an exited control/boundary Error to stop (current phase: {phase:?})"
             )));
         }
 
@@ -1268,15 +1270,17 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<Sandbox, Status> {
-        self.start_sandbox_authenticated(workspace, name, Vec::new())
+        self.start_sandbox_authenticated(workspace, name, None)
             .await
     }
 
+    /// Select launch credentials under the lifecycle gate and commit a new
+    /// runtime identity together with Starting; retries retain that identity.
     pub(crate) async fn start_sandbox_authenticated(
         &self,
         workspace: &str,
         name: &str,
-        launch_authentication: Vec<u8>,
+        authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
     ) -> Result<Sandbox, Status> {
         let candidate = self
             .store
@@ -1339,6 +1343,11 @@ impl ComputeRuntime {
             )));
         }
 
+        // Prepare tokens before any state change, but only after selecting
+        // the authoritative lifecycle snapshot under the operation gate.
+        let (runtime_identity, launch_authentication) =
+            prepare_start_authentication(&current, authority)?;
+
         if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
             self.cleanup_stopped_sandbox_sessions(&current)
                 .await
@@ -1350,15 +1359,26 @@ impl ComputeRuntime {
             // owns this transition. Retry the idempotent driver operation.
             (current.clone(), current)
         } else {
-            let previous = current.clone();
+            let mut previous = current.clone();
             let starting = self
-                .write_lifecycle_phase(
+                .write_lifecycle_phase_with_identity(
                     &current,
                     SandboxPhase::Starting,
                     "Starting",
                     "Sandbox start requested",
+                    runtime_identity.clone(),
                 )
                 .await?;
+            // Returning to the terminal lifecycle state after a failed start
+            // must not revive credentials revoked by the committed transition.
+            if let Some(identity) = runtime_identity {
+                identity.write(
+                    &mut previous
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .annotations,
+                );
+            }
             self.sandbox_index.update_from_sandbox(&starting);
             self.sandbox_watch_bus.notify(&sandbox_id);
             (previous, starting)
@@ -1621,6 +1641,18 @@ impl ComputeRuntime {
         reason: &str,
         message: &str,
     ) -> Result<Sandbox, Status> {
+        self.write_lifecycle_phase_with_identity(sandbox, phase, reason, message, None)
+            .await
+    }
+
+    async fn write_lifecycle_phase_with_identity(
+        &self,
+        sandbox: &Sandbox,
+        phase: SandboxPhase,
+        reason: &str,
+        message: &str,
+        runtime_identity: Option<crate::auth::sandbox_session::PersistedSandboxIdentity>,
+    ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let expected_resource_version = sandbox_resource_version(sandbox);
         let reason = reason.to_string();
@@ -1630,6 +1662,16 @@ impl ComputeRuntime {
                 &sandbox_id,
                 expected_resource_version,
                 move |sandbox| {
+                    // Publish the new identity together with Starting so racing
+                    // starts cannot replace credentials before the transition.
+                    if let Some(identity) = &runtime_identity {
+                        identity.write(
+                            &mut sandbox
+                                .metadata
+                                .get_or_insert_with(Default::default)
+                                .annotations,
+                        );
+                    }
                     sandbox.set_phase(phase as i32);
                     let name = sandbox.object_name().to_string();
                     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
@@ -1641,15 +1683,16 @@ impl ComputeRuntime {
                             status.provisioning = Some(provisioning_deadline::new_record(
                                 openshell_core::time::now_ms(),
                             ));
-                            status.configuration_admission =
-                                Some(openshell_core::proto::SandboxConfigurationAdmission {
-                                    // Fence delayed registrations from the previous runtime.
-                                    instance_id: uuid::Uuid::new_v4().to_string(),
-                                    state:
-                                        openshell_core::proto::ConfigurationAdmissionState::Pending
-                                            .into(),
-                                    ..Default::default()
-                                });
+                            // Preserve the registration revision and identities
+                            // as a tombstone; the new authenticated launch must
+                            // replace them before any installed state is trusted.
+                            let admission = status
+                                .configuration_admission
+                                .get_or_insert_with(Default::default);
+                            admission.state =
+                                openshell_core::proto::ConfigurationAdmissionState::Pending.into();
+                            admission.activation_confirmed = false;
+                            status.configuration_desired = None;
                         }
                     }
                     upsert_ready_condition(
@@ -3416,6 +3459,17 @@ impl ComputeRuntime {
             if !connected && current_phase != SandboxPhase::Ready {
                 return Ok(());
             }
+            if connected
+                && current
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.configuration_admission.as_ref())
+                    .is_none_or(|admission| Some(admission.instance_id.as_str()) != instance_id)
+            {
+                return Err(
+                    "supervisor session does not match the registered control instance".to_string(),
+                );
+            }
             let expected_resource_version = sandbox_resource_version(&current);
             let result = self
                 .store
@@ -4225,6 +4279,23 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
     sandbox.set_phase(phase as i32);
 }
 
+/// An exited control or boundary requires a confirmed stop before restart.
+/// Its Error condition does not prove both runtime roles stopped; the normal
+/// stop worker must finish cleanup before the gateway can publish Stopped.
+fn is_runtime_error_requiring_stop(sandbox: &Sandbox) -> bool {
+    sandbox.phase() == SandboxPhase::Error as i32
+        && sandbox.status.as_ref().is_some_and(|status| {
+            status.conditions.iter().any(|condition| {
+                condition.r#type == "Ready"
+                    && condition.status.eq_ignore_ascii_case("false")
+                    && matches!(
+                        condition.reason.as_str(),
+                        "ControlSupervisorExited" | "ContainerExited"
+                    )
+            })
+        })
+}
+
 fn is_failed_main_process_result(sandbox: &Sandbox) -> bool {
     sandbox.phase() == SandboxPhase::Error as i32
         && sandbox.status.as_ref().is_some_and(|status| {
@@ -4665,6 +4736,55 @@ fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
         .map_or(0, |metadata| metadata.resource_version)
 }
 
+/// Prepare one launch from the authoritative lifecycle snapshot without publishing it.
+fn prepare_start_authentication(
+    sandbox: &Sandbox,
+    authority: Option<&crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+) -> Result<
+    (
+        Option<crate::auth::sandbox_session::PersistedSandboxIdentity>,
+        Vec<u8>,
+    ),
+    Status,
+> {
+    let Some(authority) = authority else {
+        return Ok((None, Vec::new()));
+    };
+    let metadata = sandbox
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("sandbox metadata is missing"))?;
+    let mut identity =
+        crate::auth::sandbox_session::PersistedSandboxIdentity::read(&metadata.annotations)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if sandbox.phase() != SandboxPhase::Starting as i32 {
+        let next_version = metadata
+            .resource_version
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("sandbox resource version overflow"))?;
+        identity.runtime_generation =
+            openshell_core::sandbox_generation::SandboxGenerationId::from_start_resource_version(
+                next_version,
+            );
+        identity.auth_epoch = identity
+            .auth_epoch
+            .get()
+            .checked_add(1)
+            .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
+            .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
+        // Refresh replay belongs to one runtime. A fresh launch must not reuse
+        // its token IDs or issue time; Starting retries retain that identity.
+        identity.gateway_token_id = uuid::Uuid::new_v4();
+        identity.refresh_replay = None;
+    }
+    // Failed minting or encoding cannot rotate persisted identity. A Starting
+    // retry mints replacement credentials for the same committed generation.
+    let authentication = authority.mint_persisted_launch(sandbox.object_id(), &identity)?;
+    let encoded = serde_json::to_vec(&authentication)
+        .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))?;
+    Ok((Some(identity), encoded))
+}
+
 fn sandbox_runtime_generation(
     sandbox: &Sandbox,
 ) -> Result<openshell_core::sandbox_generation::SandboxGenerationId, String> {
@@ -4700,6 +4820,8 @@ fn public_status_from_driver(
         endpoint_statuses: Vec::new(),
         configuration_admission: None,
         configuration_activated: None,
+        configuration_activation_authorized: None,
+        configuration_desired: None,
         provisioning: None,
     }
 }
@@ -4797,12 +4919,7 @@ fn apply_driver_snapshot(
                     .status
                     .as_ref()
                     .and_then(|status| status.configuration_admission.as_ref())
-                    .is_some_and(|admission| {
-                        admission.state
-                            != i32::from(
-                                openshell_core::proto::ConfigurationAdmissionState::Accepted,
-                            )
-                    }) =>
+                    .is_none_or(|admission| !admission.activation_confirmed) =>
         {
             SandboxPhase::Starting
         }
@@ -4831,6 +4948,11 @@ fn apply_driver_snapshot(
             .configuration_admission
             .clone_from(&current_status.configuration_admission);
         status.configuration_activated = current_status.configuration_activated;
+        status.configuration_activation_authorized =
+            current_status.configuration_activation_authorized;
+        status
+            .configuration_desired
+            .clone_from(&current_status.configuration_desired);
         status.provisioning.clone_from(&current_status.provisioning);
     }
     if old_phase != phase {
@@ -4871,31 +4993,80 @@ fn apply_driver_snapshot(
     apply_configuration_readiness(sandbox);
 }
 
+fn configuration_is_accepted(sandbox: &Sandbox) -> bool {
+    use openshell_core::proto::ConfigurationAdmissionState;
+    let runtime_generation = sandbox_runtime_generation(sandbox).ok();
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    status
+        .configuration_admission
+        .as_ref()
+        .is_some_and(|admission| {
+            admission.state == i32::from(ConfigurationAdmissionState::Accepted)
+                && admission.activation_confirmed
+                && runtime_generation
+                    .as_ref()
+                    .is_some_and(|generation| generation.as_str() == admission.runtime_generation)
+                && !admission.instance_id.is_empty()
+                && status.main_process_instance_id == admission.instance_id
+        })
+}
+
+/// Remove a configuration-created readiness block while the same runtime is live.
+/// Call under the sandbox synchronization guard, using session presence observed
+/// at the mutation; registration replacement and process exit share that guard.
+pub fn reconcile_configuration_readiness(sandbox: &mut Sandbox, session_connected: bool) {
+    let restore_runtime_ready = session_connected
+        && configuration_is_accepted(sandbox)
+        && sandbox.status.as_ref().is_some_and(|status| {
+            status.phase == i32::from(SandboxPhase::Provisioning)
+                && status.exit_code.is_none()
+                && status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready"
+                        && condition.status == "False"
+                        && matches!(
+                            condition.reason.as_str(),
+                            "ConfigurationPending" | "ConfigurationInvalid"
+                        )
+                })
+        });
+    if restore_runtime_ready {
+        // Confirmation removes only our configuration block. A live session
+        // supplies runtime readiness; terminal and unrelated backend states
+        // remain owned by the lifecycle and driver transitions.
+        let sandbox_name = sandbox.object_name().to_string();
+        ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+    }
+    apply_configuration_readiness(sandbox);
+}
+
 /// Configuration readiness is independent of compute/container readiness.
 pub fn apply_configuration_readiness(sandbox: &mut Sandbox) {
     use openshell_core::proto::ConfigurationAdmissionState;
+    let accepted = configuration_is_accepted(sandbox);
     let Some(status) = sandbox.status.as_mut() else {
         return;
     };
-    let Some(admission) = status.configuration_admission.as_ref() else {
-        provisioning_deadline::reconcile_readiness(sandbox, openshell_core::time::now_ms());
-        return;
-    };
-    let accepted = admission.state == i32::from(ConfigurationAdmissionState::Accepted);
+    let admission = status.configuration_admission.as_ref();
     let reason = if accepted {
         "ConfigurationAccepted"
-    } else if admission.state == i32::from(ConfigurationAdmissionState::Rejected) {
+    } else if admission.is_some_and(|admission| {
+        admission.state == i32::from(ConfigurationAdmissionState::Rejected)
+            || !admission.error.is_empty()
+    }) {
         "ConfigurationInvalid"
     } else {
         "ConfigurationPending"
     };
-    let desired_error = admission.error.clone();
+    let desired_error = admission.map_or_else(String::new, |admission| admission.error.clone());
     let message = if accepted {
         String::new()
-    } else if admission.error.is_empty() {
+    } else if desired_error.is_empty() {
         "Waiting for effective configuration validation before workload activation".to_string()
     } else {
-        admission.error.clone()
+        desired_error.clone()
     };
     status.conditions.retain(|condition| {
         condition.r#type != "ConfigurationReady" && condition.r#type != "DesiredConfigurationReady"
@@ -5505,15 +5676,16 @@ mod tests {
     use tokio_stream::wrappers::UnboundedReceiverStream;
 
     #[test]
-    fn configuration_admission_survives_driver_ready_observations() {
+    fn configuration_activation_requires_confirmation_after_driver_ready_observations() {
         use openshell_core::proto::{
             ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
         };
-        let mut sandbox = Sandbox::default();
-        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let mut sandbox = sandbox_record("sandbox", "sandbox", SandboxPhase::Provisioning);
+        sandbox.status.as_mut().unwrap().main_process_instance_id = "instance".to_string();
         sandbox.status.as_mut().unwrap().configuration_admission =
             Some(SandboxConfigurationAdmission {
                 instance_id: "instance".to_string(),
+                runtime_generation: "test-sandbox".to_string(),
                 state: Admission::Rejected.into(),
                 error: "Invalid credentialed endpoint in rule image".to_string(),
                 ..Default::default()
@@ -5540,6 +5712,20 @@ mod tests {
             .unwrap()
             .state = Admission::Accepted.into();
         apply_driver_snapshot(&mut sandbox, &incoming, true, true);
+        assert_eq!(
+            sandbox.phase(),
+            SandboxPhase::Provisioning as i32,
+            "installation held at the boundary is not release confirmation"
+        );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .activation_confirmed = true;
+        apply_driver_snapshot(&mut sandbox, &incoming, true, true);
         assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
         assert!(
             sandbox
@@ -5553,8 +5739,156 @@ mod tests {
         );
     }
 
+    /// Model a held update to an existing runtime whose final receipt just arrived.
+    fn configuration_readiness_blocked_runtime() -> Sandbox {
+        let mut sandbox = sandbox_record("sandbox", "sandbox", SandboxPhase::Ready);
+        accept_test_configuration(&mut sandbox, "instance");
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .activation_confirmed = false;
+        apply_configuration_readiness(&mut sandbox);
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .activation_confirmed = true;
+        sandbox
+    }
+
     #[test]
-    fn configuration_admission_preserves_starting_for_early_exit_reports() {
+    fn configuration_readiness_restoration_requires_live_current_runtime() {
+        #[derive(Debug)]
+        enum MissingAuthority {
+            Session,
+            RunningProcess,
+            MatchingInstance,
+            NonemptyInstance,
+            MatchingGeneration,
+            Confirmation,
+            Acceptance,
+        }
+        for missing in [
+            MissingAuthority::Session,
+            MissingAuthority::RunningProcess,
+            MissingAuthority::MatchingInstance,
+            MissingAuthority::NonemptyInstance,
+            MissingAuthority::MatchingGeneration,
+            MissingAuthority::Confirmation,
+            MissingAuthority::Acceptance,
+        ] {
+            let mut sandbox = configuration_readiness_blocked_runtime();
+            let status = sandbox.status.as_mut().unwrap();
+            let admission = status.configuration_admission.as_mut().unwrap();
+            match missing {
+                MissingAuthority::Session => {}
+                MissingAuthority::RunningProcess => status.exit_code = Some(0),
+                MissingAuthority::MatchingInstance => {
+                    status.main_process_instance_id = "previous-instance".to_string();
+                }
+                MissingAuthority::NonemptyInstance => {
+                    admission.instance_id.clear();
+                    status.main_process_instance_id.clear();
+                }
+                MissingAuthority::MatchingGeneration => {
+                    admission.runtime_generation = "previous-generation".to_string();
+                }
+                MissingAuthority::Confirmation => admission.activation_confirmed = false,
+                MissingAuthority::Acceptance => {
+                    admission.state =
+                        openshell_core::proto::ConfigurationAdmissionState::Rejected.into();
+                }
+            }
+            reconcile_configuration_readiness(
+                &mut sandbox,
+                !matches!(missing, MissingAuthority::Session),
+            );
+            assert_eq!(
+                sandbox.phase(),
+                SandboxPhase::Provisioning as i32,
+                "{missing:?}"
+            );
+            assert!(
+                sandbox
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .conditions
+                    .iter()
+                    .all(|condition| { condition.r#type != "Ready" || condition.status != "True" }),
+                "{missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_readiness_confirmation_respects_elapsed_provisioning_deadline() {
+        let mut sandbox = configuration_readiness_blocked_runtime();
+        sandbox.status.as_mut().unwrap().provisioning = Some(provisioning_deadline::new_record(
+            openshell_core::time::now_ms() - 300_000,
+        ));
+        reconcile_configuration_readiness(&mut sandbox, true);
+        assert_eq!(sandbox.phase(), i32::from(SandboxPhase::Provisioning));
+        let status = sandbox.status.unwrap();
+        assert!(status.provisioning.unwrap().deadline.is_some());
+        assert!(status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status == "False"
+                && condition.reason == "ProvisioningDeadlineElapsed"
+        }));
+    }
+
+    #[test]
+    fn configuration_readiness_restoration_preserves_lifecycle_and_backend_failures() {
+        for phase in [
+            SandboxPhase::Starting,
+            SandboxPhase::Stopping,
+            SandboxPhase::Stopped,
+            SandboxPhase::Deleting,
+            SandboxPhase::Error,
+            SandboxPhase::Completed,
+        ] {
+            let mut sandbox = configuration_readiness_blocked_runtime();
+            sandbox.set_phase(phase as i32);
+            reconcile_configuration_readiness(&mut sandbox, true);
+            assert_eq!(sandbox.phase(), phase as i32, "{phase:?}");
+        }
+        let mut sandbox = configuration_readiness_blocked_runtime();
+        let ready = sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .iter_mut()
+            .find(|condition| condition.r#type == "Ready")
+            .unwrap();
+        ready.reason = "SupervisorNotConnected".to_string();
+        reconcile_configuration_readiness(&mut sandbox, true);
+        assert_eq!(sandbox.phase(), SandboxPhase::Provisioning as i32);
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| {
+                    condition.r#type == "Ready"
+                        && condition.status == "False"
+                        && condition.reason == "SupervisorNotConnected"
+                })
+        );
+    }
+
+    #[test]
+    fn configuration_activation_preserves_starting_for_early_exit_reports() {
         use openshell_core::proto::{
             ConfigurationAdmissionState as Admission, SandboxConfigurationAdmission,
         };
@@ -6062,6 +6396,7 @@ mod tests {
         start_calls: AtomicUsize,
         start_requests: TestMutex<Vec<(String, String)>>,
         start_authentications: TestMutex<Vec<Vec<u8>>>,
+        start_generations: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         get_started: Notify,
         get_release: Semaphore,
@@ -6096,6 +6431,7 @@ mod tests {
                 start_calls: AtomicUsize::new(0),
                 start_requests: TestMutex::new(Vec::new()),
                 start_authentications: TestMutex::new(Vec::new()),
+                start_generations: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 get_started: Notify::new(),
                 get_release: Semaphore::new(0),
@@ -6350,6 +6686,10 @@ mod tests {
                 .lock()
                 .expect("start authentications lock poisoned")
                 .push(request.launch_authentication);
+            self.start_generations
+                .lock()
+                .expect("start generations lock poisoned")
+                .push(request.generation_id);
             self.start_calls.fetch_add(1, Ordering::SeqCst);
             self.start_started.notify_one();
             if self.start_blocked.load(Ordering::SeqCst) {
@@ -6521,6 +6861,36 @@ mod tests {
         sandbox
     }
 
+    /// Bind a pending admission to the persisted runtime without authorizing readiness.
+    fn register_test_control_instance(sandbox: &mut Sandbox, instance_id: &str) {
+        let runtime_generation = sandbox_runtime_generation(sandbox)
+            .expect("test sandbox has a persisted runtime generation")
+            .as_str()
+            .to_string();
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .configuration_admission = Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: instance_id.to_string(),
+            runtime_generation,
+            state: openshell_core::proto::ConfigurationAdmissionState::Pending.into(),
+            ..Default::default()
+        });
+    }
+
+    /// Supply matching admission evidence only for tests that require an activated runtime.
+    fn accept_test_configuration(sandbox: &mut Sandbox, instance_id: &str) {
+        register_test_control_instance(sandbox, instance_id);
+        let status = sandbox.status.as_mut().expect("test sandbox status");
+        status.main_process_instance_id = instance_id.to_string();
+        let admission = status
+            .configuration_admission
+            .as_mut()
+            .expect("test configuration admission");
+        admission.state = openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
+        admission.activation_confirmed = true;
+    }
+
     #[test]
     fn main_process_exit_zero_is_completed() {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
@@ -6598,7 +6968,8 @@ mod tests {
     #[tokio::test]
     async fn stale_main_process_exit_is_acknowledged_without_replacing_active_instance() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        register_test_control_instance(&mut sandbox, "instance-2");
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
             .supervisor_session_connected("sb-1", "instance-2")
@@ -6615,7 +6986,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
         assert_eq!(
             stored.status.unwrap().main_process_instance_id,
             "instance-2"
@@ -6635,7 +7006,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_main_process_exit_is_idempotent() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        register_test_control_instance(&mut sandbox, "instance-1");
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
             .supervisor_session_connected("sb-1", "instance-1")
@@ -6668,6 +7040,7 @@ mod tests {
             "openshell.nvidia.com/retention".to_string(),
             "ephemeral".to_string(),
         );
+        register_test_control_instance(&mut sandbox, "instance-1");
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
             .supervisor_session_connected("sb-1", "instance-1")
@@ -6711,7 +7084,8 @@ mod tests {
     #[tokio::test]
     async fn conflicting_duplicate_main_process_exit_is_acknowledged() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        register_test_control_instance(&mut sandbox, "instance-1");
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
             .supervisor_session_connected("sb-1", "instance-1")
@@ -7134,6 +7508,15 @@ mod tests {
             endpoint_statuses: vec![endpoint.clone()],
             ..Default::default()
         });
+        // Infrastructure readiness can remain Ready only while the current
+        // control instance also retains its matching accepted configuration.
+        accept_test_configuration(&mut sandbox, "control-instance");
+        let admission = sandbox
+            .status
+            .as_ref()
+            .expect("test sandbox status")
+            .configuration_admission
+            .clone();
         let incoming = ready_driver_sandbox("sandbox-id", "sandbox-name");
 
         apply_driver_snapshot(&mut sandbox, &incoming, true, true);
@@ -7141,6 +7524,8 @@ mod tests {
         assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
         let status = sandbox.status.expect("driver status applied");
         assert_eq!(status.endpoint_statuses, vec![endpoint]);
+        assert_eq!(status.configuration_admission, admission);
+        assert_eq!(status.main_process_instance_id, "control-instance");
         assert!(
             status
                 .conditions
@@ -7777,12 +8162,470 @@ mod tests {
         );
     }
 
+    async fn authenticated_lifecycle_state(
+        driver: Arc<ControlledDriver>,
+    ) -> Arc<crate::ServerState> {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        let mut runtime = test_runtime(driver).await;
+        runtime.store = state.store.clone();
+        let key = openshell_bootstrap::jwt::generate_jwt_key().unwrap();
+        let authority = crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+            key.signing_key_pem.as_bytes(),
+            key.public_key_pem.as_bytes(),
+            key.kid,
+            "generation-test-gateway",
+            Duration::from_mins(5),
+        )
+        .unwrap();
+        let unique = Arc::get_mut(&mut state).unwrap();
+        unique.compute = runtime;
+        unique.sandbox_session_jwt_authority = Some(Arc::new(authority));
+        state
+    }
+
+    async fn authorized_start(
+        state: &Arc<crate::ServerState>,
+        name: &str,
+    ) -> Result<Sandbox, Status> {
+        use openshell_core::proto::open_shell_server::OpenShell as _;
+
+        crate::grpc::OpenShellService::new(state.clone())
+            .start_sandbox(crate::grpc::test_support::authed_request(
+                openshell_core::proto::StartSandboxRequest {
+                    request_id: String::new(),
+                    name: name.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                },
+            ))
+            .await
+            .map(|response| response.into_inner().sandbox.unwrap())
+    }
+
+    /// Persist a refreshed token identity so lifecycle tests exercise replay cleanup.
+    fn refresh_test_gateway_identity(
+        sandbox: &mut Sandbox,
+    ) -> crate::auth::sandbox_session::PersistedSandboxIdentity {
+        use crate::auth::sandbox_session::{PersistedSandboxIdentity, RefreshRequestHash};
+
+        let metadata = sandbox.metadata.as_mut().unwrap();
+        let identity = PersistedSandboxIdentity::read(&metadata.annotations)
+            .unwrap()
+            .next_gateway_token(
+                RefreshRequestHash::from_extension_services(&[]),
+                chrono::Utc::now().timestamp(),
+                30,
+            );
+        identity.write(&mut metadata.annotations);
+        identity
+    }
+
+    fn assert_authenticated_driver_identity(
+        state: &crate::ServerState,
+        driver: &ControlledDriver,
+        index: usize,
+        sandbox: &Sandbox,
+    ) {
+        use openshell_core::jwt::{SessionJwtVerifier, SessionTokenProfile, SystemJwtClock};
+
+        let persisted = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&driver.start_authentications()[index]).unwrap();
+        let generation = driver.start_generations.lock().unwrap()[index].clone();
+        assert_eq!(generation, persisted.runtime_generation.as_str());
+        assert_eq!(
+            authentication.supervisor.runtime_generation,
+            persisted.runtime_generation
+        );
+        assert_eq!(authentication.supervisor.auth_epoch, persisted.auth_epoch);
+        let gateway = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .unwrap()
+            .verify_gateway_token(authentication.supervisor.gateway_token.expose_secret())
+            .unwrap();
+        let boundary = SessionJwtVerifier::new(
+            &authentication.gateway_id,
+            SessionTokenProfile::Sandbox,
+            authentication.verification_keys,
+            Arc::new(SystemJwtClock),
+        )
+        .unwrap()
+        .verify(authentication.supervisor.sandbox_token.expose_secret())
+        .unwrap();
+        assert_eq!(gateway.token_id, persisted.gateway_token_id);
+        if let Some(replay) = &persisted.refresh_replay {
+            assert_eq!(boundary.token_id, replay.sandbox_token_id());
+        }
+        for principal in [gateway, boundary] {
+            assert_eq!(principal.runtime_generation, persisted.runtime_generation);
+            assert_eq!(principal.auth_epoch, persisted.auth_epoch);
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_explicit_restart_rotates_generation_and_preserves_retries() {
+        for phase in [
+            SandboxPhase::Stopped,
+            SandboxPhase::Completed,
+            SandboxPhase::Error,
+        ] {
+            let driver = ControlledDriver::new();
+            let state = authenticated_lifecycle_state(driver.clone()).await;
+            let mut sandbox = sandbox_record("sb-auth-start", "auth-start", phase);
+            accept_test_configuration(&mut sandbox, "old-main");
+            if phase == SandboxPhase::Error {
+                // A main-process failure starts from a running workload;
+                // an existing infrastructure Error must remain protected.
+                sandbox.set_phase(SandboxPhase::Ready as i32);
+                apply_main_process_exit(&mut sandbox, "old-main", 130);
+                assert_eq!(sandbox.phase(), SandboxPhase::Error as i32);
+                assert!(is_failed_main_process_result(&sandbox));
+            }
+            let old_identity = refresh_test_gateway_identity(&mut sandbox);
+            let old_generation = sandbox_runtime_generation(&sandbox).unwrap();
+            let old_authentication =
+                crate::grpc::mint_persisted_authentication(&state, &sandbox).unwrap();
+            state.store.put_message(&sandbox).await.unwrap();
+
+            let starting = authorized_start(&state, sandbox.object_name())
+                .await
+                .unwrap();
+            assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+            assert_ne!(
+                sandbox_runtime_generation(&starting).unwrap(),
+                old_generation
+            );
+            let starting_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                &starting.metadata.as_ref().unwrap().annotations,
+            )
+            .unwrap();
+            assert_ne!(
+                starting_identity.gateway_token_id,
+                old_identity.gateway_token_id
+            );
+            assert!(starting_identity.refresh_replay.is_none());
+            assert_authenticated_driver_identity(&state, &driver, 0, &starting);
+            let admission = starting
+                .status
+                .as_ref()
+                .unwrap()
+                .configuration_admission
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                admission.state,
+                openshell_core::proto::ConfigurationAdmissionState::Pending as i32
+            );
+            assert!(!admission.activation_confirmed);
+            let old_principal = state
+                .sandbox_session_jwt_authority
+                .as_ref()
+                .unwrap()
+                .verify_gateway_token(old_authentication.supervisor.gateway_token.expose_secret())
+                .unwrap();
+            assert_eq!(
+                crate::auth::sandbox_session::authorize_persisted(&state.store, &old_principal)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::Unauthenticated
+            );
+
+            let retried = authorized_start(&state, sandbox.object_name())
+                .await
+                .unwrap();
+            assert_eq!(
+                sandbox_resource_version(&retried),
+                sandbox_resource_version(&starting)
+            );
+            assert_eq!(
+                crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                    &retried.metadata.as_ref().unwrap().annotations,
+                )
+                .unwrap(),
+                starting_identity
+            );
+            assert_authenticated_driver_identity(&state, &driver, 1, &retried);
+            let recovered = crate::grpc::mint_persisted_authentication(&state, &retried).unwrap();
+            assert_eq!(
+                recovered.supervisor.runtime_generation,
+                sandbox_runtime_generation(&starting).unwrap()
+            );
+            assert_eq!(recovered.supervisor.auth_epoch.get(), 2);
+
+            state
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox.object_id(),
+                    sandbox_resource_version(&retried),
+                    |updated| {
+                        updated.set_phase(SandboxPhase::Ready as i32);
+                    },
+                )
+                .await
+                .unwrap();
+            let ready = authorized_start(&state, sandbox.object_name())
+                .await
+                .unwrap();
+            assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
+            assert_eq!(
+                driver.start_calls(),
+                2,
+                "Ready must not issue another launch"
+            );
+            assert_eq!(
+                sandbox_runtime_generation(&ready).unwrap(),
+                sandbox_runtime_generation(&starting).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_start_retry_preserves_gateway_refresh_identity() {
+        let driver = ControlledDriver::new();
+        let state = authenticated_lifecycle_state(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-auth-retry", "auth-retry", SandboxPhase::Starting);
+        let identity = refresh_test_gateway_identity(&mut sandbox);
+        state.store.put_message(&sandbox).await.unwrap();
+        let before = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        for index in 0..2 {
+            let retried = authorized_start(&state, sandbox.object_name())
+                .await
+                .unwrap();
+            assert_eq!(retried.phase(), SandboxPhase::Starting as i32);
+            assert_eq!(
+                sandbox_resource_version(&retried),
+                sandbox_resource_version(&before)
+            );
+            assert_eq!(
+                crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                    &retried.metadata.as_ref().unwrap().annotations,
+                )
+                .unwrap(),
+                identity
+            );
+            assert_authenticated_driver_identity(&state, &driver, index, &retried);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_authorized_starts_share_one_durable_runtime_identity() {
+        let driver = ControlledDriver::new();
+        let state = authenticated_lifecycle_state(driver.clone()).await;
+        let sandbox = sandbox_record("sb-auth-race", "auth-race", SandboxPhase::Stopped);
+        state.store.put_message(&sandbox).await.unwrap();
+        let before = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let guard = state
+            .compute
+            .lifecycle_gates
+            .lock_for(sandbox.object_id())
+            .await;
+        let first_state = state.clone();
+        let mut first =
+            tokio::spawn(async move { authorized_start(&first_state, "auth-race").await });
+        let second_state = state.clone();
+        let mut second =
+            tokio::spawn(async move { authorized_start(&second_state, "auth-race").await });
+        for pending in [&mut first, &mut second] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), pending)
+                    .await
+                    .is_err()
+            );
+        }
+        // Both authorized RPCs have an opportunity to run while the lifecycle
+        // gate is held; neither may publish credentials ahead of Starting.
+        let blocked = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked, before);
+        assert_eq!(driver.start_calls(), 0);
+        drop(guard);
+        let first = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sandbox_resource_version(&first),
+            sandbox_resource_version(&second)
+        );
+        assert_ne!(
+            sandbox_runtime_generation(&first).unwrap(),
+            sandbox_runtime_generation(&before).unwrap()
+        );
+        assert_eq!(
+            driver.start_calls(),
+            2,
+            "the second call retries the same Starting operation"
+        );
+        for index in 0..2 {
+            assert_authenticated_driver_identity(&state, &driver, index, &second);
+        }
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &second.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(
+            identity.auth_epoch.get(),
+            2,
+            "one transition advances the epoch once"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_restart_epoch_overflow_leaves_terminal_identity_unchanged() {
+        let driver = ControlledDriver::new();
+        let state = authenticated_lifecycle_state(driver.clone()).await;
+        let mut sandbox =
+            sandbox_record("sb-auth-overflow", "auth-overflow", SandboxPhase::Stopped);
+        let mut identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &sandbox.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        identity.auth_epoch = openshell_core::jwt::CredentialEpoch::new(u64::MAX).unwrap();
+        identity.write(&mut sandbox.metadata.as_mut().unwrap().annotations);
+        state.store.put_message(&sandbox).await.unwrap();
+        let before = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            authorized_start(&state, sandbox.object_name())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Internal
+        );
+        let after = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(driver.start_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_failed_start_rollback_preserves_committed_identity() {
+        let driver = ControlledDriver::new();
+        let state = authenticated_lifecycle_state(driver.clone()).await;
+        let mut sandbox =
+            sandbox_record("sb-auth-rollback", "auth-rollback", SandboxPhase::Stopped);
+        let old_identity = refresh_test_gateway_identity(&mut sandbox);
+        let old_authentication =
+            crate::grpc::mint_persisted_authentication(&state, &sandbox).unwrap();
+        let old_principal = state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .unwrap()
+            .verify_gateway_token(old_authentication.supervisor.gateway_token.expose_secret())
+            .unwrap();
+        state.store.put_message(&sandbox).await.unwrap();
+        driver.set_start_outcome(ControlledLifecycleOutcome::Error("start rejected"));
+        let mut stopped = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
+        stopped.status = Some(DriverSandboxStatus {
+            conditions: vec![DriverCondition {
+                r#type: "Suspended".to_string(),
+                status: "True".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(stopped)));
+
+        assert!(
+            authorized_start(&state, sandbox.object_name())
+                .await
+                .is_err()
+        );
+        let rolled_back = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back.phase(), SandboxPhase::Stopped as i32);
+        assert_ne!(
+            sandbox_runtime_generation(&rolled_back).unwrap(),
+            sandbox_runtime_generation(&sandbox).unwrap()
+        );
+        assert_authenticated_driver_identity(&state, &driver, 0, &rolled_back);
+        let committed = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &rolled_back.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(committed.auth_epoch.get(), 2);
+        assert_ne!(committed.gateway_token_id, old_identity.gateway_token_id);
+        assert!(committed.refresh_replay.is_none());
+        assert!(
+            crate::auth::sandbox_session::authorize_persisted(&state.store, &old_principal)
+                .await
+                .is_err()
+        );
+
+        driver.set_start_outcome(ControlledLifecycleOutcome::Ok);
+        let next = authorized_start(&state, sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(next.phase(), SandboxPhase::Starting as i32);
+        assert_ne!(
+            sandbox_runtime_generation(&next).unwrap(),
+            committed.runtime_generation
+        );
+        assert_authenticated_driver_identity(&state, &driver, 1, &next);
+        let next_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &next.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_eq!(next_identity.auth_epoch.get(), 3);
+        assert_ne!(next_identity.gateway_token_id, committed.gateway_token_id);
+        assert!(next_identity.refresh_replay.is_none());
+        assert_eq!(
+            crate::auth::sandbox_session::authorize_persisted(&state.store, &old_principal)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+    }
+
     #[tokio::test]
     async fn stop_and_start_follow_durable_state_machine() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
         let mut sandbox = sandbox_record("sb-lifecycle", "sandbox-lifecycle", SandboxPhase::Ready);
-        sandbox.status.as_mut().unwrap().configuration_activated = Some(true);
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_activation_authorized = Some(true);
+        accept_test_configuration(&mut sandbox, "instance-before-stop");
         runtime.store.put_message(&sandbox).await.unwrap();
         let session = ssh_session_record("lifecycle-session", sandbox.object_id());
         runtime.store.put_message(&session).await.unwrap();
@@ -7830,6 +8673,23 @@ mod tests {
             "explicit retry reissues the idempotent start"
         );
 
+        // Restart rotates the runtime identity and requires fresh activation evidence.
+        let restarted = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                sandbox_resource_version(&restarted),
+                |sandbox| accept_test_configuration(sandbox, "instance-after-start"),
+            )
+            .await
+            .unwrap();
+
         register_test_supervisor_session(&runtime, sandbox.object_id());
         driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
             ready_driver_sandbox(sandbox.object_id(), sandbox.object_name()),
@@ -7853,24 +8713,27 @@ mod tests {
             "driver/session readiness cannot bypass restart configuration admission"
         );
         assert_eq!(
-            blocked.status.as_ref().unwrap().configuration_activated,
+            blocked
+                .status
+                .as_ref()
+                .unwrap()
+                .configuration_activation_authorized,
             Some(true)
         );
         assert!(!crate::policy_store::permits_initial_static_policy_repair(
             &blocked
         ));
-        // Simulate the supervisor's successful exact-generation admission report.
+        // Simulate the supervisor's exact-generation release confirmation.
         runtime
             .store
             .update_message_cas::<Sandbox, _>(sandbox.object_id(), 0, |sandbox| {
-                sandbox
+                let instance_id = sandbox
                     .status
-                    .as_mut()
+                    .as_ref()
                     .unwrap()
-                    .configuration_admission
-                    .as_mut()
-                    .unwrap()
-                    .state = openshell_core::proto::ConfigurationAdmissionState::Accepted.into();
+                    .main_process_instance_id
+                    .clone();
+                accept_test_configuration(sandbox, &instance_id);
             })
             .await
             .unwrap();
@@ -7975,6 +8838,267 @@ mod tests {
 
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert_eq!(driver.start_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn control_supervisor_error_stop_confirms_driver_and_revokes_sessions() {
+        Box::pin(
+            assert_runtime_error_stop_confirms_driver_and_revokes_sessions(
+                "ControlSupervisorExited",
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn container_exited_error_stop_confirms_driver_and_revokes_sessions() {
+        Box::pin(assert_runtime_error_stop_confirms_driver_and_revokes_sessions("ContainerExited"))
+            .await;
+    }
+
+    async fn assert_runtime_error_stop_confirms_driver_and_revokes_sessions(reason: &str) {
+        let driver = ControlledDriver::new();
+        driver.block_stop();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = error_sandbox_record("sb-control", "control-failed", reason);
+        accept_test_configuration(&mut sandbox, "instance-old");
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_activation_authorized = Some(true);
+        let generation = sandbox_runtime_generation(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("control-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let error = runtime
+            .start_sandbox("default", "control-failed")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(
+            driver.start_calls(),
+            0,
+            "an Error is not a completed command"
+        );
+
+        let stop_runtime = runtime.clone();
+        let stop =
+            tokio::spawn(
+                async move { stop_runtime.stop_sandbox("default", "control-failed").await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), driver.stop_started.notified())
+            .await
+            .expect("control failure stop did not reach the driver");
+
+        // A retained accepted receipt and a stale connected control cannot
+        // reopen readiness while the driver still owns the stop operation.
+        assert!(
+            runtime
+                .supervisor_session_connected(sandbox.object_id(), "instance-old")
+                .await
+                .is_err()
+        );
+        runtime
+            .apply_sandbox_update(ready_driver_sandbox(
+                sandbox.object_id(),
+                sandbox.object_name(),
+            ))
+            .await
+            .unwrap();
+        let stopping = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopping.phase(), SandboxPhase::Stopping as i32);
+        assert_eq!(sandbox_runtime_generation(&stopping).unwrap(), generation);
+        assert!(runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_some(),
+            "session cleanup waits for confirmed stop"
+        );
+        assert_eq!(driver.stop_calls(), 1);
+
+        driver.release_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("confirmed control failure stop did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(sandbox_runtime_generation(&stopped).unwrap(), generation);
+        let status = stopped.status.unwrap();
+        assert_eq!(status.main_process_instance_id, "instance-old");
+        assert_eq!(status.configuration_activation_authorized, Some(true));
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(driver.start_calls(), 0, "stopping never relaunches work");
+    }
+
+    #[tokio::test]
+    async fn control_supervisor_error_stop_failure_does_not_claim_stopped() {
+        assert_runtime_error_stop_failure_does_not_claim_stopped("ControlSupervisorExited").await;
+    }
+
+    #[tokio::test]
+    async fn container_exited_error_stop_failure_does_not_claim_stopped() {
+        assert_runtime_error_stop_failure_does_not_claim_stopped("ContainerExited").await;
+    }
+
+    async fn assert_runtime_error_stop_failure_does_not_claim_stopped(reason: &str) {
+        let driver = ControlledDriver::new();
+        driver.set_stop_outcome(ControlledLifecycleOutcome::Error("stop unavailable"));
+        driver.set_get_outcome(ControlledGetOutcome::Error("driver unavailable"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = error_sandbox_record("sb-control", "control-failed", reason);
+        let generation = sandbox_runtime_generation(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let session = ssh_session_record("control-session", sandbox.object_id());
+        runtime.store.put_message(&session).await.unwrap();
+        register_test_supervisor_session(&runtime, sandbox.object_id());
+
+        let error = runtime
+            .stop_sandbox("default", "control-failed")
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("stop unavailable"));
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Stopping as i32);
+        assert_eq!(sandbox_runtime_generation(&stored).unwrap(), generation);
+        assert!(runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert!(
+            runtime
+                .store
+                .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(driver.stop_calls(), 1);
+        assert_eq!(
+            runtime
+                .start_sandbox("default", "control-failed")
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(driver.start_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn control_supervisor_error_stop_rejects_unrelated_or_malformed_failures() {
+        for (index, (phase, reason, kind, state)) in [
+            (SandboxPhase::Error, "OuterFenceViolation", "Ready", "False"),
+            (
+                SandboxPhase::Error,
+                "ContainerRuntimeRestart",
+                "Ready",
+                "False",
+            ),
+            (SandboxPhase::Error, "ContainerExited", "Ready", "True"),
+            (
+                SandboxPhase::Error,
+                "ContainerExited",
+                "ConfigurationReady",
+                "False",
+            ),
+            (
+                SandboxPhase::Provisioning,
+                "ContainerExited",
+                "Ready",
+                "False",
+            ),
+            (
+                SandboxPhase::Error,
+                "AuthenticationFailed",
+                "Ready",
+                "False",
+            ),
+            (
+                SandboxPhase::Error,
+                "ComputeResourceMissing",
+                "Ready",
+                "False",
+            ),
+            (
+                SandboxPhase::Error,
+                "ControlSupervisorExited",
+                "Ready",
+                "True",
+            ),
+            (
+                SandboxPhase::Error,
+                "ControlSupervisorExited",
+                "ConfigurationReady",
+                "False",
+            ),
+            (
+                SandboxPhase::Provisioning,
+                "ControlSupervisorExited",
+                "Ready",
+                "False",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime(driver.clone()).await;
+            let id = format!("sb-invalid-{index}");
+            let mut sandbox = sandbox_record(&id, &id, phase);
+            sandbox
+                .status
+                .as_mut()
+                .unwrap()
+                .conditions
+                .push(SandboxCondition {
+                    r#type: kind.to_string(),
+                    status: state.to_string(),
+                    reason: reason.to_string(),
+                    ..Default::default()
+                });
+            runtime.store.put_message(&sandbox).await.unwrap();
+
+            let stop = runtime.stop_sandbox("default", &id).await.unwrap_err();
+            assert_eq!(
+                stop.code(),
+                Code::FailedPrecondition,
+                "{reason}/{kind}/{state}"
+            );
+            let start = runtime.start_sandbox("default", &id).await.unwrap_err();
+            assert_eq!(start.code(), Code::FailedPrecondition);
+            assert_eq!(driver.stop_calls(), 0);
+            assert_eq!(driver.start_calls(), 0);
+            let retained = runtime
+                .store
+                .get_message::<Sandbox>(&id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.status, sandbox.status);
+        }
     }
 
     #[tokio::test]
@@ -8682,7 +9806,8 @@ mod tests {
         // Starting by the stale Suspended condition.
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
-        let sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
+        let mut sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
         register_test_supervisor_session(&runtime, sandbox.object_id());
 
@@ -9036,7 +10161,7 @@ mod tests {
             .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
             .unwrap();
         assert_eq!(ready_condition.status, "False");
-        assert_eq!(ready_condition.reason, "SupervisorNotConnected");
+        assert_eq!(ready_condition.reason, "ConfigurationPending");
     }
 
     #[tokio::test]
@@ -10347,6 +11472,7 @@ mod tests {
             ..Default::default()
         });
         sandbox.set_phase(SandboxPhase::Ready as i32);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
@@ -10390,7 +11516,8 @@ mod tests {
     #[tokio::test]
     async fn apply_sandbox_update_promotes_connected_supervisor_session_to_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         register_test_supervisor_session(&runtime, "sb-1");
@@ -10438,7 +11565,8 @@ mod tests {
     #[tokio::test]
     async fn supervisor_session_connected_promotes_store_state_without_driver_refresh() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-generation");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
@@ -10482,7 +11610,8 @@ mod tests {
     #[tokio::test]
     async fn supervisor_session_connected_retries_a_stale_store_snapshot() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        register_test_control_instance(&mut sandbox, "test-generation");
         runtime.store.put_message(&sandbox).await.unwrap();
         let stale = runtime.store.get_message::<Sandbox>("sb-1").await.unwrap();
 
@@ -10513,9 +11642,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
+            SandboxPhase::Provisioning
         );
         assert_eq!(stored.current_policy_version(), 7);
+        assert_eq!(
+            stored.status.unwrap().main_process_instance_id,
+            "test-generation"
+        );
     }
 
     #[tokio::test]
@@ -10534,6 +11667,7 @@ mod tests {
             ..Default::default()
         });
         sandbox.set_phase(SandboxPhase::Ready as i32);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
@@ -10614,7 +11748,8 @@ mod tests {
     #[tokio::test]
     async fn backend_ready_without_supervisor_stays_provisioning() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
@@ -10651,7 +11786,8 @@ mod tests {
     #[tokio::test]
     async fn backend_ready_with_supervisor_becomes_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
         register_test_supervisor_session(&runtime, "sb-1");
 
@@ -10686,7 +11822,8 @@ mod tests {
     async fn backend_not_ready_with_supervisor_becomes_ready() {
         // The supervisor may connect before the backend reports Ready.
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
         register_test_supervisor_session(&runtime, "sb-1");
 
@@ -10760,7 +11897,8 @@ mod tests {
         // Re-promotion bug fix: backend-ready snapshot after session disconnect must not
         // re-promote the sandbox to Ready.
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-generation");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         // Promote to Ready via supervisor session connect.
@@ -10907,7 +12045,7 @@ mod tests {
         }))
         .await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
                     gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
@@ -10916,6 +12054,7 @@ mod tests {
             }),
             ..sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning)
         };
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
@@ -11122,7 +12261,8 @@ mod tests {
         }))
         .await;
 
-        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        accept_test_configuration(&mut sandbox, "test-instance");
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         register_test_supervisor_session(&runtime, "sb-1");
@@ -12431,6 +13571,7 @@ mod tests {
         let status = sandbox.status.as_mut().unwrap();
         status.provisioning = Some(provisioning_deadline::new_record(0));
         status.configuration_activated = Some(false);
+        status.configuration_activation_authorized = Some(false);
         status.configuration_admission =
             Some(openshell_core::proto::SandboxConfigurationAdmission {
                 instance_id: uuid::Uuid::new_v4().to_string(),

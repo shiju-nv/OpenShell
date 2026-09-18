@@ -125,6 +125,7 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
+	result.ConfigurationActivationAuthorized = CopyBoolPtr(status.ConfigurationActivationAuthorized)
 	if admission := status.GetConfigurationAdmission(); admission != nil {
 		state := types.ConfigurationAdmissionUnknown
 		switch admission.GetState() {
@@ -136,12 +137,45 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			state = types.ConfigurationAdmissionRejected
 		}
 		result.ConfigurationAdmission = &types.SandboxConfigurationAdmission{
-			State:               state,
-			PolicyVersion:       admission.GetPolicyVersion(),
-			PolicyHash:          admission.GetPolicyHash(),
-			ConfigRevision:      admission.GetConfigRevision(),
-			ProviderEnvRevision: admission.GetProviderEnvRevision(),
-			Error:               admission.GetError(),
+			State:                     state,
+			InstanceID:                admission.GetInstanceId(),
+			RuntimeGeneration:         admission.GetRuntimeGeneration(),
+			BoundaryInstanceID:        admission.GetBoundaryInstanceId(),
+			BoundarySessionID:         admission.GetBoundarySessionId(),
+			PolicyVersion:             admission.GetPolicyVersion(),
+			PolicyHash:                admission.GetPolicyHash(),
+			ConfigRevision:            admission.GetConfigRevision(),
+			ProviderEnvRevision:       admission.GetProviderEnvRevision(),
+			ProviderAttachmentEpoch:   admission.GetProviderAttachmentEpoch(),
+			PublicationGeneration:     admission.GetPublicationGeneration(),
+			ProviderEnvInstallationID: admission.GetProviderEnvInstallationId(),
+			PolicySource:              PolicySourceFromProto(admission.GetPolicySource()),
+			ConfigurationSnapshot:     admission.GetConfigurationSnapshot(),
+			RegistrationRevision:      admission.GetRegistrationRevision(),
+			DeliveryRevision:          admission.GetDeliveryRevision(),
+			ActivationConfirmed:       admission.GetActivationConfirmed(),
+			Error:                     admission.GetError(),
+		}
+	}
+	if desired := status.GetConfigurationDesired(); desired != nil {
+		result.ConfigurationDesired = &types.SandboxConfigurationSnapshot{
+			SnapshotID:                      desired.GetSnapshotId(),
+			InstanceID:                      desired.GetInstanceId(),
+			RuntimeGeneration:               desired.GetRuntimeGeneration(),
+			BoundaryInstanceID:              desired.GetBoundaryInstanceId(),
+			BoundarySessionID:               desired.GetBoundarySessionId(),
+			PolicyVersion:                   desired.GetPolicyVersion(),
+			PolicyHash:                      desired.GetPolicyHash(),
+			ConfigRevision:                  desired.GetConfigRevision(),
+			ProviderEnvRevision:             desired.GetProviderEnvRevision(),
+			ProviderAttachmentEpoch:         desired.GetProviderAttachmentEpoch(),
+			PolicySource:                    PolicySourceFromProto(desired.GetPolicySource()),
+			RegistrationRevision:            desired.GetRegistrationRevision(),
+			DeliveryRevision:                desired.GetDeliveryRevision(),
+			Admitted:                        desired.GetAdmitted(),
+			Error:                           desired.GetError(),
+			PolicyValidationFailureMode:     desired.GetPolicyValidationFailureMode(),
+			GatewayConfigurationFingerprint: desired.GetGatewayConfigurationFingerprint(),
 		}
 	}
 

@@ -90,6 +90,40 @@ func TestSandbox_Create_NoAnnotations(t *testing.T) {
 	assert.Nil(t, sb.Annotations)
 }
 
+func TestSandboxConfigurationStatusIsCopiedAtStoreBoundaries(t *testing.T) {
+	client := NewClient()
+	authorized := true
+	input := &types.Sandbox{
+		Name: "configured", Workspace: "default",
+		Status: types.SandboxStatus{
+			ConfigurationAdmission: &types.SandboxConfigurationAdmission{
+				State: types.ConfigurationAdmissionAccepted, ActivationConfirmed: true,
+			},
+			ConfigurationDesired:              &types.SandboxConfigurationSnapshot{SnapshotID: "snapshot-1"},
+			ConfigurationActivationAuthorized: &authorized,
+		},
+	}
+	client.AddSandbox("default", input)
+	input.Status.ConfigurationAdmission.ActivationConfirmed = false
+	input.Status.ConfigurationDesired.SnapshotID = "input-mutation"
+	authorized = false
+
+	first, err := client.Sandboxes().Get(context.Background(), "default", "configured")
+	require.NoError(t, err)
+	assert.True(t, first.Status.ConfigurationAdmission.ActivationConfirmed)
+	assert.Equal(t, "snapshot-1", first.Status.ConfigurationDesired.SnapshotID)
+	assert.True(t, *first.Status.ConfigurationActivationAuthorized)
+	first.Status.ConfigurationAdmission.ActivationConfirmed = false
+	first.Status.ConfigurationDesired.SnapshotID = "returned-mutation"
+	*first.Status.ConfigurationActivationAuthorized = false
+
+	second, err := client.Sandboxes().Get(context.Background(), "default", "configured")
+	require.NoError(t, err)
+	assert.True(t, second.Status.ConfigurationAdmission.ActivationConfirmed)
+	assert.Equal(t, "snapshot-1", second.Status.ConfigurationDesired.SnapshotID)
+	assert.True(t, *second.Status.ConfigurationActivationAuthorized)
+}
+
 func TestCopyAnyMap(t *testing.T) {
 	t.Run("nil", func(t *testing.T) {
 		assert.Nil(t, copyAnyMap(nil))

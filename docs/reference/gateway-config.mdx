@@ -136,8 +136,8 @@ credential_drivers        = ["kubernetes-secrets"]
 
 ssh_session_ttl_secs  = 3600
 
-# Reject invalid policy generations securely by default. Set
-# "retain_last_valid" only when availability takes priority.
+# Hold workload execution when a runtime configuration is rejected.
+# "retain_last_valid" requires a known accepted installation.
 policy_validation_failure_mode = "fail_closed"
 
 # Subject Alternative Names baked into the gateway server certificate.
@@ -266,7 +266,9 @@ The client-certificate handshake policy is derived and has no `require_client_au
 
 `[openshell.gateway.tls]` supports optional SNI-based dual-certificate mode for deployments that need separate internal and external server certificates. Set `external_cert_path` and `external_key_path` to point at the external (e.g. ACME/publicly-trusted) certificate and key. List the hostnames that should be served with the external certificate in `external_server_names`. Connections whose TLS SNI hostname matches one of those names receive the external certificate; all other connections (including those with no SNI) receive the primary internal certificate from `cert_path`/`key_path`. Both fields must be set together — providing only one is a configuration error. On Kubernetes with the Helm chart, the external certificate is managed automatically when `certManager.serverIssuerRef.name` is set; the chart populates these fields from the cert-manager-issued external server certificate.
 
-`[openshell.gateway] policy_validation_failure_mode` controls what sandbox supervisors do when a complete candidate policy fails runtime validation. The default, `fail_closed`, deactivates the previous network policy, closes relays pinned to it, and denies new egress until a valid generation loads. `retain_last_valid` leaves the previous valid generation active. Both modes reject the candidate atomically; startup keeps the workload unstarted until the effective policy and matching provider configuration pass admission. A rejected startup exposes `ConfigurationInvalid` and remains available for policy/provider repair in either mode. Gateway mutation paths that can preflight a known effective scope reject invalid candidates before persistence and leave the active policy unchanged regardless of this setting. Changing the value requires restarting the gateway so it can reload `gateway.toml` and distribute the new posture to sandbox supervisors.
+`[openshell.gateway] policy_validation_failure_mode` controls rejected effective configurations, including matching policy and provider state. The default, `fail_closed`, holds the workload, blocks new exec, keeps readiness false, closes old relays, and denies new egress until a valid configuration is accepted and released. `retain_last_valid` can keep or restore only a known accepted installation for the same boundary; it cannot resume an uncertain or mixed generation. Initial startup remains blocked when no accepted configuration exists. Provider-only updates follow the same atomic activation path.
+
+Gateway preflight rejection leaves the active configuration unchanged because the candidate is not persisted. A runtime rejection remains visible in sandbox configuration status and can be repaired through policy or provider updates. Acceptance alone does not restore readiness: the current boundary must confirm release and the supervisor must report `activation_confirmed`. See [Repair a Rejected Configuration](/sandboxes/policies#repair-a-rejected-configuration). Restart the gateway after changing this setting so it can reload `gateway.toml` and distribute the new posture.
 
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. Omit it for a non-expiring token: the token has no `exp` claim and the response omits `expiration_time`. Use this only for local single-player Docker, Podman, or VM gateways. Explicit `0` is invalid. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway omits the field.
 
@@ -712,6 +714,10 @@ grpc_endpoint      = "https://host.openshell.internal:17670"
 # Supervisor runtime. Defaults to the gateway version.
 # supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 network_name       = "openshell-docker"
+# Optional explicit container-visible host IP for aliases and trusted DNS.
+# On Linux, this also selects an exact native gateway callback bind address.
+# On macOS, use the host address reachable from Docker containers; it need not
+# be assigned to macOS, and native callback listeners remain on loopback.
 host_gateway_ip    = "172.17.0.1"
 # Unsafe operator override. Host bind mounts, including Docker local-driver
 # bind-backed volumes, expose gateway-host paths inside sandboxes and can
@@ -736,6 +742,8 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 
 Use `sandbox_label` for Docker configurations. The legacy
 `sandbox_namespace` key is rejected.
+
+`host_gateway_ip` accepts an IP literal reachable from the supervisor container. On macOS, an explicit address pins both supervisor host aliases and the workload's trusted reserved-alias DNS answers; it does not request a native listener on that address. On other hosts, the same setting also selects the exact gateway callback bind address, so it must be locally bindable. When a desktop host route has no explicit address, Docker's `host-gateway` mapping remains available to the supervisor, but workload DNS for reserved host aliases stays denied because no trusted destination IP was supplied.
 
 ### Podman
 
@@ -1000,7 +1008,7 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
 
-## Preflight package configuration {#gateway-config-preflight}
+## Gateway config preflight
 
 Before starting a package-managed gateway, validate the selected file without
 changing it:

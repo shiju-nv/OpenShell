@@ -106,3 +106,26 @@ fn external_callers_read_reason_evidence_and_authorize_only_within() {
     }
     assert_eq!(evidence.scope().policy_version, 1);
 }
+
+#[test]
+fn containment_rejects_annotations_that_its_model_cannot_represent() {
+    let cases = [
+        "version: 1\nfuture_authority: true\n",
+        "version: 1\nmetadata: { policy_id: managed/default, version: 7 }\n",
+        "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        review: { required: true, reason: approval }\n",
+        "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        protocol: rest\n        rules:\n          - allow:\n              method: GET\n              path: /public\n              review: { required: true, reason: approval }\n",
+    ];
+    for source in cases {
+        // These are valid annotated documents. The solver must reject them
+        // because projecting only its runtime fields would erase the annotation.
+        openshell_policy_schema::parse_document(
+            source,
+            openshell_policy_schema::ParseProfile::ContainmentInput,
+        )
+        .expect("shared schema should retain the annotated input");
+        assert!(
+            parse_policy_str(source).is_err(),
+            "unsupported annotations must not disappear during solver projection: {source}"
+        );
+    }
+}

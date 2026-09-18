@@ -264,6 +264,9 @@ impl Tracker {
                 |failure| failure.config_revision,
             ),
             policy_hash: identity.policy_hash.clone(),
+            // The gateway joins this local publication to confirmed activation.
+            // A cached observation cannot acknowledge a later same-revision repair.
+            provider_env_installation_id: state.installation_id.clone(),
             credentials_installed,
             policy_active,
             launch_environment_installed,
@@ -775,17 +778,48 @@ mod tests {
         let tracker = Tracker::new();
         let credentials = ProviderCredentialState::from_child_env_snapshot(6, HashMap::new());
         tracker.credentials_installed(identity(), &credentials, None);
+        let policy = openshell_policy::restrictive_default_policy();
+        let engine = openshell_supervisor_network::opa::OpaEngine::from_proto(&policy).unwrap();
+        tracker.policy_activated(&identity(), 12, engine.generation_guard(0).unwrap());
         let old = installation(&credentials);
+        tracker.process_installed(old.clone(), &credentials);
+        let cached = tracker.observation(&credentials);
+        assert!(
+            cached.policy_active
+                && cached.credentials_installed
+                && cached.launch_environment_installed
+        );
+        assert_eq!(cached.provider_env_installation_id, old.installation_id);
         credentials
             .install_child_env_snapshot(6, HashMap::from([("TOKEN".into(), "restored".into())]));
         tracker.credentials_installed(identity(), &credentials, None);
         tracker.process_installed(old, &credentials);
+        let pending = tracker.observation(&credentials);
+        assert_eq!(
+            pending.provider_env_installation_id,
+            credentials.snapshot().installation_id
+        );
+        assert_ne!(
+            pending.provider_env_installation_id,
+            cached.provider_env_installation_id
+        );
         assert!(
             !tracker
                 .observation(&credentials)
                 .launch_environment_installed
         );
         tracker.process_installed(installation(&credentials), &credentials);
+        let repaired = tracker.observation(&credentials);
+        assert_eq!(repaired.provider_env_revision, cached.provider_env_revision);
+        assert_eq!(repaired.policy_hash, cached.policy_hash);
+        assert_eq!(
+            repaired.provider_env_installation_id,
+            credentials.snapshot().installation_id
+        );
+        assert_ne!(
+            repaired.provider_env_installation_id,
+            cached.provider_env_installation_id
+        );
         assert!(
             tracker
                 .observation(&credentials)

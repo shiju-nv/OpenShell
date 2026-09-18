@@ -160,7 +160,7 @@ external = os.environ.get("OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER") == "1"
 zero = "0" * 64
 image_digest = f"sha256:{zero}"
 sandbox_runtime = f"ghcr.io/nvidia/openshell-community/sandboxes/base@{image_digest}"
-sandbox_boundary = "localhost/openshell/sandbox:dev"
+sandbox_boundary = f"localhost/openshell/sandbox-boundary@{image_digest}"
 supervisor_runtime = f"localhost/openshell/supervisor@{image_digest}"
 base_runtime = f"docker.io/library/debian@{image_digest}"
 pull_policy = "missing" if schema == 1 else "if_not_present"
@@ -255,12 +255,12 @@ if external:
                 "OPENSHELL_PODMAN_SOCKET": podman_socket,
                 "OPENSHELL_SANDBOX_IMAGE": sandbox_runtime,
                 "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY": pull_policy,
-                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": sandbox_boundary,
                 "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS": 10,
                 "OPENSHELL_GRPC_ENDPOINT": callback,
                 "OPENSHELL_GATEWAY_PORT": gateway_port,
                 "OPENSHELL_NETWORK_NAME": network,
                 "OPENSHELL_STOP_TIMEOUT": 15,
+                "OPENSHELL_SANDBOX_RUNTIME_IMAGE": sandbox_boundary,
                 "OPENSHELL_SUPERVISOR_IMAGE": supervisor_runtime,
                 "OPENSHELL_PODMAN_TLS_CA": {
                     "path": f"/tmp/{variant}-pki/ca.crt",

@@ -115,6 +115,7 @@ fn installed(
         policy_active: true,
         launch_environment_installed: true,
         process_instance_id: hello.instance_id.clone(),
+        provider_env_installation_id: hello.instance_id.clone(),
         reason: ProviderReadinessReason::Unspecified.into(),
     }
 }
@@ -129,10 +130,64 @@ fn evaluate(
         receipt.desired.as_ref().unwrap(),
         ProviderReadinessReason::Unspecified,
         true,
-        session.map_or("", |evidence| evidence.network_instance_id.as_str()),
+        ActiveProviderInstallation {
+            control_instance_id: session
+                .map_or("", |evidence| evidence.network_instance_id.as_str()),
+            environment_id: session.map_or("", |evidence| evidence.network_instance_id.as_str()),
+        },
         session,
     )
     .unwrap()
+}
+
+#[test]
+fn confirmed_configuration_requires_fresh_independent_provider_installation_evidence() {
+    let hello = hello();
+    let receipt = receipt(&hello);
+    let session_id = Uuid::new_v4().to_string();
+    let mut evidence = ProviderReadinessEvidence::from_hello(&hello).unwrap();
+    let mut observation = installed(&hello, &session_id, &receipt);
+    evidence.accept(observation.clone()).unwrap();
+    let next_installation = Uuid::new_v4().to_string();
+    let evaluate_installation = |environment_id, evidence| {
+        evaluate_status(
+            receipt.clone(),
+            ProviderReadinessReason::Unspecified,
+            receipt.desired.as_ref().unwrap(),
+            ProviderReadinessReason::Unspecified,
+            true,
+            ActiveProviderInstallation {
+                control_instance_id: &hello.instance_id,
+                environment_id,
+            },
+            evidence,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        evaluate_installation(&hello.instance_id, Some(&evidence)).state,
+        ProviderReadinessState::Ready as i32,
+    );
+    for installation in ["", next_installation.as_str()] {
+        let status = evaluate_installation(installation, Some(&evidence));
+        assert_eq!(status.state, ProviderReadinessState::Pending as i32);
+        assert_eq!(
+            status.reason,
+            ProviderReadinessReason::WaitingForProcess as i32
+        );
+    }
+    assert_ne!(
+        evaluate_installation(&next_installation, None).state,
+        ProviderReadinessState::Ready as i32,
+        "configuration confirmation cannot replace the independent reporter",
+    );
+    observation.sequence += 1;
+    observation.provider_env_installation_id = next_installation.clone();
+    evidence.accept(observation).unwrap();
+    assert_eq!(
+        evaluate_installation(&next_installation, Some(&evidence)).state,
+        ProviderReadinessState::Ready as i32,
+    );
 }
 
 #[test]
@@ -417,7 +472,7 @@ fn malformed_reports_do_not_replace_accepted_evidence() {
     registry
         .accept(&hello.sandbox_id, &session, initial.clone())
         .unwrap();
-    for case in 0..6 {
+    for case in 0..7 {
         let mut invalid = initial.clone();
         invalid.sequence = 2;
         match case {
@@ -426,7 +481,8 @@ fn malformed_reports_do_not_replace_accepted_evidence() {
             2 => invalid.attachment_epoch = "untrusted-identity".to_string(),
             3 => invalid.policy_hash = "a".repeat(129),
             4 => invalid.policy_hash = "not-a-fingerprint".to_string(),
-            _ => invalid.process_instance_id.clear(),
+            5 => invalid.process_instance_id.clear(),
+            _ => invalid.provider_env_installation_id = "invalid-installation".to_string(),
         }
         assert!(
             registry
@@ -593,7 +649,10 @@ fn partial_failed_incompatible_stopped_and_expired_installations_are_not_ready()
         receipt.desired.as_ref().unwrap(),
         ProviderReadinessReason::Unspecified,
         false,
-        &hello.instance_id,
+        ActiveProviderInstallation {
+            control_instance_id: &hello.instance_id,
+            environment_id: &hello.instance_id,
+        },
         Some(&complete),
     )
     .unwrap();
@@ -691,7 +750,10 @@ fn superseded_authority_cannot_complete_an_older_receipt() {
             &current,
             ProviderReadinessReason::Unspecified,
             true,
-            &hello.instance_id,
+            ActiveProviderInstallation {
+                control_instance_id: &hello.instance_id,
+                environment_id: &hello.instance_id,
+            },
             session.as_ref(),
         )
         .unwrap();
@@ -703,7 +765,10 @@ fn superseded_authority_cannot_complete_an_older_receipt() {
         receipt.desired.as_ref().unwrap(),
         ProviderReadinessReason::Unspecified,
         true,
-        &hello.instance_id,
+        ActiveProviderInstallation {
+            control_instance_id: &hello.instance_id,
+            environment_id: &hello.instance_id,
+        },
         session.as_ref(),
     )
     .unwrap();
@@ -796,6 +861,15 @@ async fn attach_waiting_for_update_captures_published_revision_and_becomes_ready
         .unwrap()
         .main_process_instance_id
         .clone_from(&hello.instance_id);
+    sandbox.status.as_mut().unwrap().configuration_admission =
+        Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: hello.instance_id.clone(),
+            activation_confirmed: true,
+            state: openshell_core::proto::ConfigurationAdmissionState::Accepted.into(),
+            publication_generation: 1,
+            provider_env_installation_id: hello.instance_id.clone(),
+            ..Default::default()
+        });
     state.store.put_message(&sandbox).await.unwrap();
     let provider = |value: &str| Provider {
         metadata: Some(ObjectMeta {
@@ -1068,6 +1142,78 @@ async fn observation_fixture() -> (
 }
 
 #[tokio::test]
+async fn provider_status_same_logical_repair_waits_for_current_installation_report() {
+    let (state, mut sandbox, _, mut query) = observation_fixture().await;
+    let hello = SupervisorHello {
+        sandbox_id: sandbox.object_id().to_string(),
+        ..hello()
+    };
+    let installation_id = Uuid::new_v4().to_string();
+    sandbox.set_phase(SandboxPhase::Ready.into());
+    let status = sandbox.status.as_mut().unwrap();
+    status
+        .main_process_instance_id
+        .clone_from(&hello.instance_id);
+    status.configuration_admission = Some(openshell_core::proto::SandboxConfigurationAdmission {
+        instance_id: hello.instance_id.clone(),
+        activation_confirmed: true,
+        state: openshell_core::proto::ConfigurationAdmissionState::Accepted.into(),
+        publication_generation: 2,
+        provider_env_installation_id: installation_id.clone(),
+        ..Default::default()
+    });
+    state.store.put_message(&sandbox).await.unwrap();
+    let initial = handle_get_sandbox_provider_status(&state, authed_request(query.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+    let receipt = initial.receipt.unwrap();
+    query.receipt_id = receipt.receipt_id.clone();
+    let session_id = register_session(&state.supervisor_sessions, &hello).unwrap();
+    let mut observed = installed(&hello, &session_id, &receipt);
+    assert_ne!(observed.provider_env_installation_id, installation_id);
+    state
+        .supervisor_sessions
+        .accept_provider_readiness(&hello.sandbox_id, &hello.instance_id, observed.clone())
+        .unwrap();
+    let stale = handle_get_sandbox_provider_status(&state, authed_request(query.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+    assert_eq!(stale.state, ProviderReadinessState::Pending as i32);
+    assert_eq!(
+        stale.reason,
+        ProviderReadinessReason::WaitingForProcess as i32
+    );
+    assert_ne!(
+        stale.operation.unwrap().state,
+        openshell_core::proto::ConfigUpdateOperationState::Applied as i32,
+        "accepted configuration must not complete an operation from stale installation evidence",
+    );
+    observed.sequence += 1;
+    observed.provider_env_installation_id = installation_id;
+    state
+        .supervisor_sessions
+        .accept_provider_readiness(&hello.sandbox_id, &hello.instance_id, observed)
+        .unwrap();
+    let ready = handle_get_sandbox_provider_status(&state, authed_request(query))
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+    assert_eq!(ready.state, ProviderReadinessState::Revoked as i32);
+    assert_eq!(
+        ready.operation.unwrap().state,
+        openshell_core::proto::ConfigUpdateOperationState::Applied as i32,
+    );
+}
+
+#[tokio::test]
 async fn repeated_and_concurrent_receiptless_status_reuses_one_operation() {
     let (state, _, _, query) = observation_fixture().await;
     let results = futures::future::join_all(
@@ -1237,6 +1383,15 @@ async fn detach_receipt_persists_but_gateway_restart_requires_fresh_installation
         .unwrap()
         .main_process_instance_id
         .clone_from(&hello.instance_id);
+    sandbox.status.as_mut().unwrap().configuration_admission =
+        Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: hello.instance_id.clone(),
+            activation_confirmed: true,
+            state: openshell_core::proto::ConfigurationAdmissionState::Accepted.into(),
+            publication_generation: 1,
+            provider_env_installation_id: hello.instance_id.clone(),
+            ..Default::default()
+        });
     state.store.put_message(&sandbox).await.unwrap();
     let receipt = record_provider_mutation(
         &state,
@@ -1325,6 +1480,15 @@ async fn detach_receipt_persists_but_gateway_restart_requires_fresh_installation
         .unwrap()
         .main_process_instance_id
         .clone_from(&hello.instance_id);
+    sandbox.status.as_mut().unwrap().configuration_admission =
+        Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: hello.instance_id.clone(),
+            activation_confirmed: true,
+            state: openshell_core::proto::ConfigurationAdmissionState::Accepted.into(),
+            publication_generation: 1,
+            provider_env_installation_id: hello.instance_id.clone(),
+            ..Default::default()
+        });
     state.store.put_message(&sandbox).await.unwrap();
 
     let mut restarted = test_server_state().await;

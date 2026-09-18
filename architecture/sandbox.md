@@ -27,19 +27,9 @@ TCP Service, or VM vsock channel. Independent bidirectional `Exchange` RPCs
 carry lifecycle, exec, TCP, and forwarding traffic, while one persistent
 bidirectional `Mediate` RPC carries multiplexed DNS traffic. General application
 UDP is unsupported; UDP DNS remains mediated by the supervisor.
-The sandbox probes HTTP/2 connection liveness every five seconds and closes
-connections that miss a ten-second acknowledgement deadline. Closing a
-connection freezes the owned workload process tree and cancels its stream
-bridges before releasing the exclusive DNS mediation lease. The supervisor has
-30 seconds to reconnect, replay attach, and reconfirm the boundary. Every
-supervisor process generates an ephemeral instance ID, and the sandbox pins the
-first ID it accepts for its process lifetime. The same process can therefore
-recover a dropped transport, but a replacement supervisor cannot reuse launch
-credentials to claim the existing runtime generation. Confirmation resumes the
-workload; expiration terminates it. A credential replacement does not displace
-the active connection until the new connection is confirmed. Idle healthy
-connections remain usable.
-TCP mediation accepts use the same authenticated transport recovery as process waits. A healthy idle accept has no timeout. An interrupted pending open fails closed, while a replacement accept waits for new workload traffic; decisions and established byte streams are not replayed. Boundary rejections and failed recovery remain terminal to the proxy.
+The sandbox probes HTTP/2 connection liveness every five seconds and closes connections that miss a ten-second acknowledgement deadline. Closing a connection freezes the owned workload process tree and cancels its stream bridges before releasing the exclusive DNS mediation lease. The supervisor has 30 seconds to recover. A replacement supervisor uses a new process instance ID and a gateway-signed registration grant bound to the current sandbox, driver generation, authentication epoch, boundary session and incarnation, and registration revision. The boundary rejects stale grants and acknowledges the registered identity. Confirmation proves isolation but leaves the workload frozen. Recovery requires complete configuration installation, gateway acceptance, and an exact release acknowledgement; expiry terminates the workload. Idle healthy connections remain usable.
+
+TCP mediation accepts use the same authenticated transport recovery as process waits. A healthy idle accept has no timeout. An interrupted pending open fails closed, while a replacement accept waits for new workload traffic and confirmed configuration release; decisions and established byte streams are not replayed. Boundary rejections and failed recovery remain terminal to the proxy.
 
 A renewed Sandbox Protocol bearer is authenticated even when its credential epoch is unchanged. The supervisor confirms that bearer on the active physical connection and records its fingerprint only after confirmation succeeds, preserving pending streams and the mediation session. Changing the credential epoch still requires an authenticated replacement connection.
 
@@ -55,10 +45,7 @@ both endpoints bind the same workload identity and immutable driver resource
 claims. Driver crates do not appear in generic process, network, SSH, or
 session code.
 
-The supervisor exposes readiness only after the sandbox is confirmed and the
-gateway access plane is registered. Driver-owned channel directories limit
-reachability, while mutual authentication and channel epochs prevent endpoint
-replacement from granting authority.
+The supervisor exposes readiness only after the gateway accepts the complete configuration, the boundary releases that exact installation, the gateway records `activation_confirmed`, and the current access session is connected. Driver-owned channel directories limit reachability, while mutual authentication, registration revisions, and process incarnation checks prevent endpoint replacement from granting authority.
 
 ## Startup Flow
 
@@ -67,18 +54,16 @@ replacement from granting authority.
 2. The sandbox consumes and unlinks bootstrap material, proves the admitted
    runtime posture, and listens on the protected driver channel. It does not
    run untrusted code yet.
-3. `openshell-supervisor` loads policy and runtime settings from the gateway,
-   attaches to the sandbox, and verifies the driver's generation and evidence.
-4. The sandbox installs its seccomp notification broker and Landlock baseline,
-   then reports measured confirmation. The supervisor must accept that evidence
-before it sends the launch permit.
-5. The sandbox starts the canonical process through its single workload
-   launcher. The supervisor starts SSH and registers its gateway session.
+3. `openshell-supervisor` discovers image policy and filesystem facts through the authenticated boundary, registers one control-process identity with the gateway, and validates the selected policy with matching provider credentials and bindings.
+4. The supervisor attaches with a signed registration grant and verifies the driver's generation and measured isolation evidence. Confirmation alone leaves execution blocked.
+5. The supervisor stages the complete configuration, publishes matching OPA and credentials, and commits the boundary environment while execution remains blocked. The gateway accepts that exact delivered generation before the supervisor releases the boundary and starts the canonical process. A matching activation acknowledgement and connected access session are required for readiness.
 6. Exec, signaling, PTY, DNS, TCP, and loopback-forwarding operations cross the
    authenticated channel for the lifetime of the sandbox generation.
 
+Initial boundary discovery uses the same bounded bootstrap grace as attachment. Startup gateway calls have response deadlines and a finite operational retry budget. An acknowledged configuration rejection keeps the workload blocked for operator repair; unavailable infrastructure, unanswered calls, and permanent authentication failures cannot turn into an indefinite repair wait.
+
 When the admitted main process exits, its status and retained terminal output
-remain available. The confirmed sandbox and supervisor-owned access plane continue
+remain available. The activated sandbox and supervisor-owned access plane continue
 to serve policy-authorized exec and loopback forwarding until explicit stop or
 delete tears down the boundary and terminates any remaining workload processes.
 
@@ -232,19 +217,9 @@ for each HTTP request, after destination and L7 policy admission. A static
 credential resolves only when the request host, port, and path match an endpoint
 in that provider's effective profile. CONNECT, absolute-form forward HTTP,
 request targets, headers, supported request bodies, SigV4 signing, and opted-in
-WebSocket text rewriting use the same scoped resolver. Provider refresh swaps
-credential values and endpoint bindings atomically. An invalid or unavailable
-refresh revokes the previous static credential state instead of leaving a
-partially active or last-known-good static set. Invalid metadata preserves the
-supplied dynamic snapshot, while a fetch failure preserves the currently active
-dynamic snapshot.
+WebSocket text rewriting use the same scoped resolver. Provider updates prepare credential values, endpoint bindings, and environment together with the effective policy. Invalid metadata or a mismatching fetched revision cannot publish candidate credentials. The configured validation failure posture determines whether the previous accepted configuration remains usable.
 
-Across the protected sandbox/supervisor channel, the provider environment revision remains
-an opaque content fingerprint and has no numeric ordering semantics. The
-network supervisor assigns a separate, connection-local monotonic generation
-to each distinct environment it publishes. The process supervisor applies only
-newer generations, which accepts descending fingerprint values while rejecting
-duplicate or delayed supervisor messages.
+Across the protected channel, provider and configuration revisions remain opaque content fingerprints with no numeric ordering semantics. Gateway delivery and registration revisions supply ordering. Boundary transitions compare the entire expected installed configuration and return an exact receipt; new exec uses only the released environment rather than independently installing provider updates.
 
 Gateway-managed refresh credentials use an opaque workload handle derived from
 the sandbox, provider identity, credential key, refresh authorization epoch,
@@ -655,24 +630,12 @@ does not terminate a live provisioning supervisor; the gateway deadline owns
 that decision. Cleanup cancels pending driver startup before stopping compute
 so a late startup failure cannot remove retained workload storage.
 
-Static policy fields can be replaced before the first accepted activation.
-A durable first-activation marker closes this repair window permanently, including
-across stop/start and later rejected configurations. Legacy records without the
-marker retain static-field immutability.
+Static policy fields can be replaced only while admission is pending or rejected and durable state explicitly records that release has never been authorized. The first authorization closes this repair window before any workload may run, including across stop/start and later rejected configurations. Records without the marker retain static-field immutability.
 Admission validates policy composition; image and host setup failures, such as
 an unresolved OCI user or unavailable isolation facilities, retain their existing
 startup error behavior.
 
-Acceptance identifies the effective policy hash/version, configuration revision,
-provider-environment revision, and reporting supervisor instance. Startup captures
-the matching provider environment and constructs the runtime before reporting
-acceptance. Live reconciliation begins only after the main process has spawned,
-so it cannot replace the configuration captured for that launch. Restart resets
-admission and requires a fresh accepted configuration. Permanent gateway errors
-and exhausted transient retries terminate startup; each RPC attempt has a
-10-second deadline, including acceptance reports; only acknowledged configuration
-rejections wait for repair within the gateway's provisioning deadline. Image discovery uses the authenticated
-sandbox boundary control request deadline.
+Startup captures the matching effective policy and provider environment before constructing the runtime. Restart requires fresh configuration activation for the new runtime generation. Permanent gateway errors and exhausted transient retries terminate startup; each RPC attempt has a 10-second deadline, including acceptance reports. Only acknowledged configuration rejections wait for repair within the gateway's provisioning deadline. Image discovery uses the authenticated sandbox boundary control request deadline.
 
 Policy and provider refreshes are prepared before publication. Publication
 invalidates prior policy guards before exposing new provider material and swaps
@@ -680,73 +643,35 @@ the policy under the same publication locks. Rejected candidates cannot install
 their credentials alongside the previous policy. Existing runtime fail-closed
 checks remain necessary for in-flight traffic and invalid live updates.
 
-The supervisor reads the workload image policy through an authenticated,
-read-only `DiscoverPolicy` boundary request before attaching or launching the
-workload. The boundary reads only the well-known policy paths, bounds the response,
-and distinguishes missing policy from unreadable or invalid content. The supervisor
-validates this candidate with gateway provider composition and obtains admission
-before `Attach`, `Confirm`, networking startup, and `StartAgent`. Workload image
-environment variables cannot configure the isolated supervisor.
+The supervisor reads the workload image policy through an authenticated, read-only `DiscoverPolicy` boundary request before attaching or launching the workload. The boundary reads only the well-known policy paths, bounds the response, and distinguishes missing policy from unreadable or invalid content. Discovery also returns the boundary identity and immutable workload filesystem baseline. The supervisor obtains a gateway-signed registration grant before attaching, then validates the composed configuration before any workload release. Workload image environment variables cannot configure the isolated supervisor.
 
-## Policy Revision Acknowledgement
+## Configuration Activation and Policy Acknowledgement
 
-When the supervisor loads a sandbox-scoped policy from the gateway, it retains
-the version, hash, source, and configuration revision returned with that exact
-policy snapshot. After the OPA engine is built successfully, the supervisor
-reports that revision as `LOADED`, which advances
-`SandboxStatus.current_policy_version` and moves the revision out of `Pending`.
-If policy construction fails, it reports the captured revision as `FAILED` with
-the original construction error. It never infers revision identity by comparing
-policy structure.
+Gateway-managed activation compares the complete delivered identity: configuration revision, policy version/hash/source, provider attachment epoch and environment revision, snapshot token, and delivery revision. It also binds that identity to the driver runtime generation, boundary session/incarnation, supervisor instance, and signed registration revision. A matching policy hash alone cannot acknowledge a provider or settings change.
 
-This holds even when the initial policy is enriched with baseline paths during
-startup: the enriched revision the supervisor synced back to the gateway is the
-revision it acknowledges, so a successfully constructed initial policy never
-remains `Pending`. If the first poll returns a different revision, the supervisor
-processes it through the normal reload path instead of treating it as already
-loaded.
+The gateway keeps desired configuration separate from accepted installation state. The supervisor prepares the exact candidate, freezes execution, and stages its boundary environment. It publishes OPA and matching credentials together, then commits the boundary installation while the workload stays frozen. The gateway accepts that held installation before authorizing release. The boundary releases only the matching committed transition, and the supervisor sends a final `activation_confirmed` report. Only that matching final report advances `current_policy_version` and marks policy history `loaded`.
 
-A newer sandbox-scoped revision can carry the same non-empty effective policy
-hash as the currently loaded revision, for example when provenance changes
-without changing enforcement content. The supervisor acknowledges that newer
-revision without reloading identical policy. If the revision also requires
-middleware or policy-runtime reconciliation, acknowledgement waits until that
-reconciliation succeeds. Global policies, local overrides, equal or older
-versions, and different hashes do not use this shortcut. Success telemetry is
-emitted only after the gateway accepts the resulting loaded-status report.
+Provider readiness remains a separate observation. The supervisor records the actual installed credential snapshot and policy generation, then obtains an authenticated acknowledgement for the exact child-environment publication. A repaired environment may have the same opaque provider revision but a new installation identity; old acknowledgement evidence cannot satisfy that publication. Withheld or expired matching snapshots clear static credentials, and a configuration acceptance does not substitute for this process installation evidence.
 
-Policy status delivery uses a FIFO background worker. Retryable delivery
-failures retain the ordered update and retry with capped exponential backoff;
-terminal errors are logged and discarded. The outbox is nonblocking and does
-not discard updates because of a fixed queue capacity, so status endpoint
-outages cannot block policy polling, enforcement, settings, or provider
-refreshes and cannot permanently lose the initial acknowledgement.
+Acceptance before release is deliberate. The gateway persists `configuration_activation_authorized = true` before it permits the first release, closing the static-policy repair window before any workload may run. Before that point, an explicit never-authorized marker and pending/rejected admission permit repair of an invalid initial policy. Missing state does not grant repair authority. Rejected initial configuration remains inspectable and authenticatable while execution stays blocked.
 
-Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
-zero) use the policy revision acknowledgement API. Global policies use the
-configuration admission contract without a sandbox policy revision acknowledgement.
-Local Rego/data overrides remain available for standalone development; combining
-them with a gateway-managed sandbox is rejected because the gateway cannot admit
-the runtime policy it would enforce.
+A lost or mismatched commit/release response keeps control readiness false. Retries use the same immutable transition; a successful release with a lost response may already have resumed the workload. Replaying the initial start returns the existing process for matching immutable launch inputs and cannot start a second process. Mutable provider state is installed through activation rather than changing that replay identity.
+
+Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than zero) use the policy revision acknowledgement API. Global policies use the configuration admission contract without a sandbox policy revision acknowledgement. `PolicySource` names the selected gateway scope, `sandbox` or `global`; it does not identify whether sandbox policy originated in an image or from a restrictive default.
+
+Local Rego/data overrides remain available for standalone development; combining them with a gateway-managed sandbox is rejected because the gateway cannot admit the runtime policy it would enforce. A local-file standalone network proxy keeps its file-driven reload path and does not report sandbox configuration activation. Workload image files and environment variables do not configure the separately isolated supervisor.
 
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
-- If a live policy or middleware-registry update is invalid, the supervisor
-  rejects the update and keeps the current runtime pair.
+- If a live configuration is invalid, the supervisor rejects it before publishing candidate credentials. `fail_closed` quiesces the workload and denies egress until repair; `retain_last_valid` keeps the previous accepted configuration usable only when its installation is still known.
 - If an operator-run middleware call fails, the selected config's `on_error`
   behavior decides whether to deny the request or continue without that stage.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
   to new connections or the next parsed HTTP request where the proxy can safely
   re-evaluate.
-- If the supervisor relay drops, the sandbox stops the canonical agent and exec
-  process groups, rejects new runtime operations, and closes mediated streams.
-  A replacement supervisor has 30 seconds to authenticate, replay the identical
-  attach, and reconfirm the boundary. Successful confirmation resumes the
-  process tree; otherwise the sandbox sends `SIGTERM`, waits the normal stop
-  grace period, sends `SIGKILL` to survivors, and makes the session terminal.
-  Explicit supervisor shutdown uses the same terminal transition and requires
-  an acknowledgement before treating the boundary as stopped.
+- If the supervisor relay drops, the sandbox freezes the canonical agent and exec process groups, rejects new execution, and closes mediated streams. A replacement supervisor must authenticate and revalidate the complete configuration within the recovery window. Confirmation alone cannot resume it. If recovery expires, the sandbox terminates the workload and makes the session terminal. Explicit supervisor shutdown uses the same terminal transition and requires an acknowledgement before treating the boundary as stopped.
+- If the boundary process is destroyed, its incarnation and owned processes cannot be recovered by replaying activation. The old runtime generation remains terminal; a new driver runtime generation is required to launch again.
 - If the canonical main process exits, the supervisor durably reports the
   normalized result immediately. A foreground create declares a one-shot main
   attachment, so the supervisor accepts it even after a fast process exits,

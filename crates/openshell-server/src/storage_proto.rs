@@ -118,11 +118,11 @@ mod tests {
     const STORAGE_V1_SCHEMA_SHA256: &str =
         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "87be23fc0ac4eaf8ce5890a1c87e6a48279f65fc8fbcc0cea7d7cbe426f2cc46";
+        "2d434e1a316a970f3c65432f3da8020649b5982ee13bc8200bea4e1cb3388905";
     const DURABLE_SCHEMA_SHA256: &str =
-        "654649c8f65f44ac2ba04290f49c56de2f488271f99bc0fd4c6d025039c05128";
+        "b2f74cf3d1fb6fbdd7f2f0ab7659bf9404f08f58d6b2a9494c100a527381c16d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "376cc8ecbc8b9b995e2170ccb5c2f18ef82adf9b5f55f1683571410722dfd4cf";
+        "756445736fc2606f3bea74188c5175421d1c15a501c1d8aea27df9b8094432e7";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -570,9 +570,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (299, 21),
-                (92, 16),
-                (80, 16),
+                (300, 21),
+                (93, 16),
+                (81, 16),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -610,6 +610,109 @@ mod tests {
             &sandbox
         ));
         assert_eq!(sandbox.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn configuration_activation_prior_status_bytes_do_not_authorize_readiness_or_static_repair() {
+        // Pre-admission status encoded Ready, policy version 1, and process
+        // instance "old". Missing release evidence must remain absent on decode.
+        let prior = legacy_bytes("3002380142036f6c64");
+        let status = openshell_core::proto::SandboxStatus::decode(prior.as_slice())
+            .expect("prior status bytes decode");
+        assert_eq!(
+            status.phase,
+            i32::from(openshell_core::proto::SandboxPhase::Ready)
+        );
+        assert_eq!(status.current_policy_version, 1);
+        assert_eq!(status.main_process_instance_id, "old");
+        assert_eq!(status.configuration_activation_authorized, None);
+        assert!(status.configuration_admission.is_none());
+        let mut sandbox = openshell_core::proto::Sandbox {
+            status: Some(status),
+            ..Default::default()
+        };
+        assert!(!crate::policy_store::permits_initial_static_policy_repair(
+            &sandbox
+        ));
+        crate::compute::apply_configuration_readiness(&mut sandbox);
+        let status = sandbox.status.expect("status is retained");
+        assert_eq!(
+            status.phase,
+            i32::from(openshell_core::proto::SandboxPhase::Provisioning)
+        );
+        assert_eq!(status.configuration_activation_authorized, None);
+        assert!(status.conditions.iter().any(
+            |condition| condition.r#type == "ConfigurationReady" && condition.status == "False"
+        ));
+    }
+
+    #[test]
+    fn published_config_response_fields_do_not_become_activation_evidence() {
+        // Published attachment, control, and diagnostic tags must retain their
+        // meaning when the response gains a fenced configuration snapshot.
+        let bytes = legacy_bytes(
+            "6801720f7075626c69736865642d65706f63687a10636f6e74726f6c2d696e7374616e636582011473796e74686574696320646961676e6f73746963",
+        );
+        let response = openshell_core::proto::GetSandboxConfigResponse::decode(bytes.as_slice())
+            .expect("published configuration response must decode");
+        assert!(response.configuration_admitted);
+        assert_eq!(response.provider_attachment_epoch, "published-epoch");
+        assert_eq!(response.configuration_instance_id, "control-instance");
+        assert_eq!(response.configuration_error, "synthetic diagnostic");
+        assert!(response.runtime_generation.is_empty());
+        assert!(response.configuration_boundary_instance_id.is_empty());
+        assert!(response.configuration_snapshot.is_empty());
+        assert_eq!(response.configuration_registration_revision, 0);
+        assert_eq!(response.configuration_delivery_revision, 0);
+        assert_eq!(response.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn published_activation_and_provisioning_fields_remain_separate_from_release_authority() {
+        let bytes = legacy_bytes(
+            "30023807420c6d61696e2d70726f6365737360016a1f0a07617474656d707412066368616e6765520c65706f63682d6368616e6765",
+        );
+        let status = openshell_core::proto::SandboxStatus::decode(bytes.as_slice())
+            .expect("published sandbox status must decode");
+        assert_eq!(
+            status.phase,
+            openshell_core::proto::SandboxPhase::Ready as i32
+        );
+        assert_eq!(status.current_policy_version, 7);
+        assert_eq!(status.main_process_instance_id, "main-process");
+        assert_eq!(status.configuration_activated, Some(true));
+        let provisioning = status
+            .provisioning
+            .as_ref()
+            .expect("provisioning is retained");
+        assert_eq!(provisioning.attempt_id, "attempt");
+        assert_eq!(provisioning.configuration_change_id, "change");
+        assert_eq!(provisioning.attachment_change_id, "epoch-change");
+        assert_eq!(status.configuration_activation_authorized, None);
+        assert!(status.configuration_desired.is_none());
+        assert_eq!(status.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn published_provider_observation_does_not_invent_an_installation_identity() {
+        let bytes = legacy_bytes(
+            "0a0773657373696f6e10091a0f7075626c69736865642d65706f63682017280b320b706f6c6963792d68617368380140014801520c6d61696e2d70726f63657373",
+        );
+        let observed =
+            openshell_core::proto::ProviderReadinessObservation::decode(bytes.as_slice())
+                .expect("published provider observation must decode");
+        assert_eq!(observed.session_id, "session");
+        assert_eq!(observed.sequence, 9);
+        assert_eq!(observed.attachment_epoch, "published-epoch");
+        assert_eq!(observed.provider_env_revision, 23);
+        assert_eq!(observed.config_revision, 11);
+        assert_eq!(observed.policy_hash, "policy-hash");
+        assert!(observed.credentials_installed);
+        assert!(observed.policy_active);
+        assert!(observed.launch_environment_installed);
+        assert_eq!(observed.process_instance_id, "main-process");
+        assert!(observed.provider_env_installation_id.is_empty());
+        assert_eq!(observed.encode_to_vec(), bytes);
     }
 
     fn legacy_bytes(encoded: &str) -> Vec<u8> {

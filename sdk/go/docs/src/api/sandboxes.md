@@ -158,6 +158,10 @@ Blocks until the sandbox reaches the `Ready` phase, returning the final sandbox 
 
 If the sandbox enters the `Error` phase, WaitReady returns immediately with a `StatusError`.
 
+A rejected configuration does not by itself put the sandbox in the terminal `Error` phase. During provisioning, repair remains possible until the gateway provisioning deadline. Once that deadline expires, the gateway reports the provisioning failure through the sandbox phase and conditions; detailed attempt and cleanup state remains available in the raw protobuf status.
+
+Inspect `Status.ConfigurationDesired` and `Status.ConfigurationAdmission` for the desired and reported revisions, validation errors, and runtime activation confirmation. `ConfigurationAdmission.State == v1.ConfigurationAdmissionAccepted` means validation succeeded; `ActivationConfirmed` records the runtime acknowledgment for the exact provider attachment epoch, environment publication generation, and credential installation identified in the admission. The desired snapshot names the gateway delivery before any local credential installation. `WaitReady` continues waiting while the gateway reports the sandbox as unready, so use a context deadline while another operation repairs the configuration.
+
 ```go
 // Wait with a 30-second timeout
 ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

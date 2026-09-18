@@ -77,6 +77,7 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
+            ..Default::default()
         })
         .await;
     match resp {

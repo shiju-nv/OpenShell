@@ -34,6 +34,7 @@ struct NetworkPeer {
     state: Arc<PeerState>,
     connection: usize,
     attached: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
     disconnect: Arc<tokio::sync::Notify>,
 }
 
@@ -85,6 +86,8 @@ impl NetworkPeer {
         }
         let envelope: RequestEnvelope = decode_frame(&frame).unwrap();
         let kind = match envelope.request {
+            Request::DescribeWorkload { .. } => "describe",
+            Request::ReleaseConfiguration { .. } => "release",
             Request::Attach { .. } => "attach",
             Request::Confirm => "confirm",
             Request::AcceptNetwork => "accept",
@@ -96,6 +99,24 @@ impl NetworkPeer {
             .unwrap()
             .push((self.connection, kind));
         let response = match envelope.request {
+            Request::DescribeWorkload { .. } => {
+                let mut identity = test_activation().identity;
+                identity.registration_revision = 0;
+                Response::WorkloadDescribed { bootstrap: Box::new(BoundaryBootstrap {
+                    identity,
+                    workload_identity: sandbox().identity,
+                    image_policy: openshell_isolation_interface::contract::ImagePolicyDiscovery::Missing,
+                    filesystem_baseline: openshell_isolation_interface::contract::BoundaryFilesystemBaseline::default(),
+                }) }
+            }
+            Request::ReleaseConfiguration { installed } => {
+                assert_eq!(*installed, test_installed());
+                assert_eq!(*self.state.active.lock().unwrap(), Some(self.connection));
+                self.released.store(true, Ordering::Release);
+                Response::ConfigurationReleased {
+                    activated: Box::new(test_activation()),
+                }
+            }
             Request::Attach { .. } => {
                 // An equal-epoch connection cannot displace an active peer.
                 // This rejects reconnect storms that a stateless mock permits.
@@ -110,6 +131,15 @@ impl NetworkPeer {
                     Response::Attached {
                         snapshot: SessionSnapshotWire {
                             generation: "test-generation".into(),
+                            configuration: BoundaryConfigurationSnapshot {
+                                identity: test_activation().identity,
+                                installed: Some(test_activation().configuration),
+                                active: false,
+                                publication_generation: 1,
+                                provider_env_installation_id: Some(
+                                    "55555555-5555-4555-8555-555555555555".to_string(),
+                                ),
+                            },
                             processes: Vec::new(),
                         },
                     }
@@ -123,6 +153,10 @@ impl NetworkPeer {
                 }
             }
             Request::AcceptNetwork => {
+                assert!(
+                    self.released.load(Ordering::Acquire),
+                    "TCP accept requires fresh release after reconnect"
+                );
                 assert_eq!(
                     *self.state.active.lock().unwrap(),
                     Some(self.connection),
@@ -256,6 +290,7 @@ impl Fixture {
                         state: state.clone(),
                         connection,
                         attached: Arc::new(AtomicBool::new(false)),
+                        released: Arc::new(AtomicBool::new(false)),
                         disconnect: disconnect.clone(),
                     };
                     // Keep the incoming stream open: the server can finish
@@ -284,17 +319,22 @@ impl Fixture {
         let client = Arc::new(BoundaryClient::new(
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
+            test_supervisor_instance_id(),
         ));
         tokio::time::timeout(Duration::from_secs(3), async {
             client
                 .call_idempotent(Request::Attach {
                     supervisor_instance_id: client.supervisor_instance_id,
+                    registration_grant: "test-grant".into(),
+                    registration_revision: 1,
                     policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
                     resource_claims: std::collections::BTreeMap::new(),
                 })
                 .await
                 .unwrap();
             client.call_idempotent(Request::Confirm).await.unwrap();
+            client.activation.lock().unwrap().identity = Some(test_activation().identity);
+            client.release(&test_installed()).await.unwrap();
         })
         .await
         .expect("fixture must attach and confirm");
@@ -303,6 +343,32 @@ impl Fixture {
             state,
             server,
         }
+    }
+
+    async fn release_recovered(&self) {
+        while self.source.client.connection_generation().await == Some(1) {
+            tokio::task::yield_now().await;
+        }
+        // Wait until replay has installed the replacement channel, not merely
+        // until the old channel has been removed from the cache.
+        while self.source.client.connection_generation().await.is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!*self.source.client.readiness().borrow());
+        assert_eq!(self.state.decisions.load(Ordering::Acquire), 0);
+        self.source.client.release(&test_installed()).await.unwrap();
+        let recovered = self.source.client.connection_generation().await;
+        self.source
+            .client
+            .recover_after_unavailable(Some(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            self.source.client.connection_generation().await,
+            recovered,
+            "late failure from the retired transport must not replace recovery"
+        );
+        assert!(*self.source.client.readiness().borrow());
     }
 }
 
@@ -343,7 +409,12 @@ async fn verify_connection(mut pending: PendingTcpOpen) {
 async fn tcp_accept_recovers_a_lost_tls_connection() {
     let fixture = Fixture::new(Reply::Disconnect { pending_accepts: 1 }).await;
     tokio::time::timeout(Duration::from_secs(3), async {
-        verify_connection(fixture.source.accept_tcp().await.unwrap()).await;
+        tokio::join!(
+            async {
+                verify_connection(fixture.source.accept_tcp().await.unwrap()).await;
+            },
+            fixture.release_recovered()
+        );
     })
     .await
     .unwrap_or_else(|error| {
@@ -359,9 +430,12 @@ async fn tcp_accept_recovers_a_lost_tls_connection() {
         vec![
             (1, "attach"),
             (1, "confirm"),
+            (1, "release"),
             (1, "accept"),
+            (2, "describe"),
             (2, "attach"),
             (2, "confirm"),
+            (2, "release"),
             (2, "accept")
         ]
     );
@@ -382,9 +456,14 @@ async fn concurrent_tcp_accepts_recover_a_lost_tls_connection() {
         accepts.spawn(async move { verify_connection(source.accept_tcp().await.unwrap()).await });
     }
     tokio::time::timeout(Duration::from_secs(3), async {
-        while let Some(result) = accepts.join_next().await {
-            result.unwrap();
-        }
+        tokio::join!(
+            async {
+                while let Some(result) = accepts.join_next().await {
+                    result.unwrap();
+                }
+            },
+            fixture.release_recovered()
+        );
     })
     .await
     .expect("all concurrent TCP accepts must recover");
@@ -418,7 +497,7 @@ async fn tcp_accept_preserves_boundary_leaf_errors() {
         assert_eq!(fixture.state.connections.load(Ordering::Acquire), 1);
         assert_eq!(
             *fixture.state.events.lock().unwrap(),
-            vec![(1, "attach"), (1, "confirm"), (1, "accept")]
+            vec![(1, "attach"), (1, "confirm"), (1, "release"), (1, "accept")]
         );
     }
 }

@@ -61,7 +61,7 @@ pub fn policy_record_for_atomic_write(
 /// static restrictions. Legacy records are conservative: absence is not false.
 pub fn permits_initial_static_policy_repair(sandbox: &Sandbox) -> bool {
     sandbox.status.as_ref().is_some_and(|status| {
-        status.configuration_activated == Some(false)
+        status.configuration_activation_authorized == Some(false)
             && status
                 .configuration_admission
                 .as_ref()
@@ -110,6 +110,11 @@ pub fn project_policy_revision_onto_sandbox(
             Some(current) if current == backfill_policy => {}
             Some(_) if startup_blocked => {
                 spec.policy = Some(backfill_policy.clone());
+                // A repaired static baseline cannot authorize release using
+                // the previous baseline's already delivered activation ticket.
+                if let Some(status) = sandbox.status.as_mut() {
+                    status.configuration_desired = None;
+                }
                 changed = true;
             }
             Some(_) => {
@@ -634,7 +639,7 @@ mod tests {
     };
 
     #[test]
-    fn static_projection_requires_durable_evidence_of_no_previous_activation() {
+    fn configuration_activation_static_projection_requires_durable_no_release_evidence() {
         let baseline = openshell_policy::restrictive_default_policy();
         let mut replacement = baseline.clone();
         replacement
@@ -663,7 +668,13 @@ mod tests {
                         ..Default::default()
                     }),
                     status: Some(SandboxStatus {
-                        configuration_activated: activated,
+                        configuration_activation_authorized: activated,
+                        configuration_desired: Some(
+                            openshell_core::proto::SandboxConfigurationSnapshot {
+                                snapshot_id: "previous-baseline-ticket".to_string(),
+                                ..Default::default()
+                            },
+                        ),
                         configuration_admission: Some(SandboxConfigurationAdmission {
                             state: state.into(),
                             ..Default::default()
@@ -678,6 +689,10 @@ mod tests {
                     let (projected, changed) = result.unwrap();
                     assert!(changed);
                     assert_eq!(projected.spec.unwrap().policy, Some(replacement.clone()));
+                    assert!(
+                        projected.status.unwrap().configuration_desired.is_none(),
+                        "repair invalidates the previous static baseline ticket"
+                    );
                 } else {
                     assert!(
                         matches!(result, Err(PersistenceError::Conflict { .. })),
