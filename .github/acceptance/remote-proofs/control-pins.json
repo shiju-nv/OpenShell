@@ -1,7 +1,7 @@
 {
   "build_helper": {
     "relative_path": "linux-runner-assessment/build-scripts/build_products.py",
-    "sha256": "7866757bca53360f087a83817290dde80ab1d327e8f0aecbe3415f7fc9a7ba76"
+    "sha256": "b4b65a0a9f8fc886b573589d6378e121675f2cf0a813c967f21f79d9b8343c92"
   },
   "expected_protocol_rows": 60,
   "fixture_image": {
@@ -11,7 +11,7 @@
   },
   "fixtures": {
     "cases.json": "64a5cd77bbe12c97d97922d928b7642622051a0d3106a205501f4bd1461caee9",
-    "expected-protocol-observations.template.json": "ce105c15babaf348c73767129055ba1441b5b4491ed8e0a28a60528717da8249",
+    "expected-protocol-observations.template.json": "5f23fdce875509c6b30a48a8014d62efcaae50b27d0ae99cdf17f2c55895d210",
     "policy-a.yaml": "0bca074866f2e47d3f9c6991eab7dc96f7e7f14bf46eb38bbd7d50162a7a0bc7",
     "policy-b.yaml": "068fa9baebcc37b4d09245c379caffdefb780dc06aad18efa91829ba65927314",
     "policy-invalid-binding.yaml": "068fa9baebcc37b4d09245c379caffdefb780dc06aad18efa91829ba65927314",

@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 
-TREE = 'fcdcfe206a67939ecf30903b6b46bc6953402ce4'
+TREE = '8f52780f5fdd124fe2909b88e5951ebded6b2633'
 RUST_SKIPS = 'rust:check,rust:lint,rust:format:check,rust:deny:policy,rust:lockfiles:check,test:rust'
 COMMANDS = {
     'rust-checks': ['mise', 'run', '--jobs', '1', 'rust:check', ':::', 'rust:lint', ':::', 'rust:format:check', ':::', 'rust:deny:policy'],

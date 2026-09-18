@@ -18,7 +18,7 @@ import time
 import uuid
 
 
-CANDIDATE_TREE = "fcdcfe206a67939ecf30903b6b46bc6953402ce4"
+CANDIDATE_TREE = "8f52780f5fdd124fe2909b88e5951ebded6b2633"
 HISTORICAL_SOURCE_SHA256 = "41ab5ee8614cee7910b58ed5c5600036f3c32bbc3ae567446d9ec6c357c54030"
 HARNESSES = {"policy_activation", "configuration_composition_acceptance"}
 EXAMPLE_MANIFEST = "examples/supervisor-middleware-content-guard/Cargo.toml"
@@ -276,10 +276,20 @@ def tool_context(root, environment, evidence, phase, *, include_nextest=False):
     result["cargo"]["execution"] = observe_cargo_execution(evidence, phase, environment, result)
     if not include_nextest:
         return result
-    selected = shutil.which("cargo-nextest", path=environment.get("PATH"))
-    require(selected, "Missing selected cargo-nextest")
-    path = Path(selected).absolute()
-    # The locked Nix package installs an ELF directly. A wrapper requires an
+    # The task activates repository-pinned mise tools after this outer capture
+    # starts. Resolve that selection instead of observing the enclosing Nix PATH.
+    mise = shutil.which("mise", path=environment.get("PATH"))
+    require(mise, "Missing task tool resolver: mise")
+    selection_argv = [mise, "which", "cargo-nextest"]
+    selection = subprocess.run(selection_argv, cwd=root, env=environment,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               check=False, timeout=30)
+    require(selection.returncode == 0, "Repository Nextest selection failed")
+    lines = selection.stdout.decode().splitlines()
+    require(len(lines) == 1 and lines[0] and Path(lines[0]).is_absolute(),
+            "Repository Nextest selection must be one absolute executable path")
+    path = Path(lines[0])
+    # The locked release installs an ELF directly. A wrapper requires an
     # explicit launcher-to-process observation, never a basename exception.
     elf_identity(path, 62 if result["host"].startswith("x86_64-") else 183)
     completed = subprocess.run([str(path), "--version"], cwd=root, env=environment,
@@ -288,7 +298,11 @@ def tool_context(root, environment, evidence, phase, *, include_nextest=False):
     result["cargo-nextest"] = {"path": str(path), "resolved_path": str(path.resolve()),
                               "sha256": digest(path), "argv": [str(path), "--version"],
                               "exit_status": completed.returncode,
-                              "output": completed.stdout.decode(errors="replace")}
+                              "output": completed.stdout.decode(errors="replace"),
+                              "selection": {"argv": selection_argv, "cwd": str(root),
+                                            "resolver_sha256": digest(Path(mise)),
+                                            "exit_status": selection.returncode,
+                                            "stdout": selection.stdout.decode()}}
     return result
 
 

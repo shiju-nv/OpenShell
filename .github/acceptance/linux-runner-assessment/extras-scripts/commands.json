@@ -1,5 +1,5 @@
 {
-  "candidate_tree": "fcdcfe206a67939ecf30903b6b46bc6953402ce4",
+  "candidate_tree": "8f52780f5fdd124fe2909b88e5951ebded6b2633",
   "execution_run": false,
   "schema_version": 1,
   "scopes": {
@@ -26,7 +26,7 @@
     "pipefail"
   ],
   "source_inputs": {
-    ".config/nextest.toml": "47b1bb8d620fafcc3bc0ee0a4704cbcc8763e7b7b1680c0e3a683148e52e06c5",
+    ".config/nextest.toml": "9be78c43dc0caba6c747fc0eb01a0eb335028c9a772212123640c6d54c2fc7fb",
     ".github/workflows/branch-checks.yml": "b0d79f5ad8e0e7fc1d31496e38393bba85da0c3ba1cb0fe8572a6181aa3dad80",
     "tasks/scripts/verify-defaults-without-telemetry.sh": "4301e793e780c0e4f2636d38d829cd129da27ddd16820fe0b3ed0c3d5af4049b",
     "tasks/scripts/verify-telemetry-compiled-out.sh": "fa640a70b2617531259fd7a036b9e94370204e8f066d043a9d4ac06bb1e9e097"

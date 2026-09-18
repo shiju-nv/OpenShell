@@ -53,13 +53,16 @@ fn protocol_runtime_policy(
     base: &openshell_core::proto::SandboxPolicy,
     case: ProtocolRuntimeCase,
 ) -> openshell_core::proto::SandboxPolicy {
-    use openshell_core::proto::{GraphqlOperation, L7Allow, L7QueryMatcher, L7Rule, McpOptions};
+    use openshell_core::proto::{
+        GraphqlOperation, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkAccessPreset,
+        NetworkEnforcementMode,
+    };
 
     let mut policy = base.clone();
     let endpoint = protocol_runtime_endpoint_mut(&mut policy);
     endpoint.protocol = case.protocol().to_ascii_uppercase();
-    endpoint.enforcement = "enforce".into();
-    endpoint.access.clear();
+    endpoint.enforcement = NetworkEnforcementMode::Enforce as i32;
+    endpoint.access = NetworkAccessPreset::Unspecified as i32;
     endpoint.path = "/probe".into();
     let mut allow = L7Allow::default();
     match case {
