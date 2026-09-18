@@ -3512,6 +3512,17 @@ async fn handle_update_config_inner(
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
+    // Authentication state belongs to gateway lifecycle and token rotation.
+    // Reject its annotation keys before either policy or settings can be written.
+    if req
+        .annotations
+        .keys()
+        .any(|key| crate::auth::sandbox_session::is_runtime_identity_annotation(key))
+    {
+        return Err(Status::invalid_argument(
+            "runtime authentication annotations are gateway-owned metadata",
+        ));
+    }
     let workspace = if req.global {
         if req.workspace_scope.is_some() {
             return Err(Status::invalid_argument(
@@ -7605,6 +7616,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
+
+    include!("policy/auth_metadata_tests.rs");
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

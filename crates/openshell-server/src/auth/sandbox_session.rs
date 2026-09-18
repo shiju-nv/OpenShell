@@ -24,6 +24,22 @@ const REFRESH_REQUEST_HASH_ANNOTATION: &str = "internal.openshell.ai/refresh-req
 const REFRESH_ISSUED_AT_ANNOTATION: &str = "internal.openshell.ai/refresh-issued-at";
 const REFRESH_ROTATION_ID_ANNOTATION: &str = "internal.openshell.ai/refresh-rotation-id";
 
+/// Identify runtime authentication metadata writable only by trusted gateway paths.
+/// Policy and settings annotations cannot replace bearer or refresh authority.
+pub fn is_runtime_identity_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        RUNTIME_GENERATION_ANNOTATION
+            | AUTH_EPOCH_ANNOTATION
+            | GATEWAY_TOKEN_ID_ANNOTATION
+            | PREVIOUS_GATEWAY_TOKEN_ID_ANNOTATION
+            | REFRESH_REPLAY_UNTIL_ANNOTATION
+            | REFRESH_REQUEST_HASH_ANNOTATION
+            | REFRESH_ISSUED_AT_ANNOTATION
+            | REFRESH_ROTATION_ID_ANNOTATION
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshRequestHash(String);
 

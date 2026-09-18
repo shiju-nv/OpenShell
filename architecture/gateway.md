@@ -528,6 +528,8 @@ revisions commit in one database transaction. SQLite serializes this operation
 with an immediate transaction, while Postgres locks the sandbox row. A failed
 resource-version check or revision insert rolls back the entire operation.
 
+`UpdateConfig` rejects annotation keys that store sandbox runtime identity or gateway-token refresh state before changing policy or settings. Those keys are written only by gateway-managed sandbox lifecycle and token-rotation paths; ordinary provenance annotations remain supported.
+
 SQLite is the default local store; Postgres is supported for deployments that
 need an external database or multi-replica coordination. Both backends expose
 the same `Store` API and the same logical schema. Backend differences stay
