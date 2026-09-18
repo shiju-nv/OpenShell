@@ -461,9 +461,13 @@ class Runner:
             "candidate-cli-rpc",
             cli["sandbox_name_fallback_integration"],
             "policy_",
-            7,
+            8,
             False,
         )
+        self.proofs()
+
+    def proofs(self):
+        """Complete negative and overlap evidence after candidate gates passed."""
         candidate_tree = self.manifest["candidate_tree"]
         for name, (package, path, test, marker) in VARIANTS.items():
             variant = self.manifest["variants"][name]
@@ -505,7 +509,7 @@ class Runner:
                         name + "-rpc",
                         binaries["sandbox_name_fallback_integration"],
                         "policy_",
-                        7,
+                        8,
                         False,
                     )
                     self.test(
@@ -704,7 +708,9 @@ class Runner:
 def main():
     """Keep failed and interrupted attempts distinct from completed qualification."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=["focused", "broad", "lint"], required=True)
+    parser.add_argument(
+        "--phase", choices=["focused", "broad", "lint", "proofs"], required=True
+    )
     for option in ("worktree", "bundle", "output"):
         parser.add_argument("--" + option, type=Path, required=True)
     args = parser.parse_args()
