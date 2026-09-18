@@ -3794,6 +3794,102 @@ async fn provider_create_allows_credentialless_policy_profile() {
 }
 
 #[tokio::test]
+async fn sandbox_provider_list_json_distinguishes_recreated_provider_identity() {
+    let server = run_server().await;
+    server
+        .state
+        .sandbox_providers
+        .lock()
+        .await
+        .insert("dev-sandbox".to_string(), vec!["work-github".to_string()]);
+
+    // Equal names, types, and versions must not hide replacement of the
+    // provider returned by the gateway for this attachment.
+    for provider_id in [
+        "4a6a20db-f91e-4c61-b0ad-aaf253895ece",
+        "46e5420a-1f0f-4f27-8f3d-af9b10d89467",
+    ] {
+        server.state.providers.lock().await.insert(
+            "work-github".to_string(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: provider_id.to_string(),
+                    name: "work-github".to_string(),
+                    workspace: "default".to_string(),
+                    resource_version: 7,
+                    ..Default::default()
+                }),
+                r#type: "github".to_string(),
+                profile_workspace: "profiles".to_string(),
+                credentials: HashMap::from([(
+                    "GITHUB_TOKEN".to_string(),
+                    "fixture-attachment-secret".to_string(),
+                )]),
+                config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://fixture-sensitive-endpoint.example".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
+        let output = run_readiness_cli(
+            &server,
+            &[
+                "sandbox",
+                "provider",
+                "list",
+                "dev-sandbox",
+                "--output",
+                "json",
+            ],
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "attachment list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("attachment list JSON");
+        assert_eq!(
+            value,
+            serde_json::json!([{
+                "id": provider_id,
+                "name": "work-github",
+                "workspace": "default",
+                "resource_version": 7,
+                "type": "github",
+                "profile_workspace": "profiles",
+                "credential_keys": ["GITHUB_TOKEN"],
+                "config_keys": ["endpoint"],
+            }])
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains("fixture-attachment-secret"));
+            assert!(!text.contains("https://fixture-sensitive-endpoint.example"));
+        }
+    }
+
+    assert_eq!(
+        server
+            .state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .as_slice(),
+        [
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+            },
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results() {
     let ts = run_server().await;
 

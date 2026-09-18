@@ -549,6 +549,16 @@ Print only the policy YAML for scripting (same effective policy, no metadata):
 openshell sandbox get my-sandbox --policy-only
 ```
 
+### Inspect Attached Providers
+
+Inspect the provider records attached to a sandbox:
+
+```shell
+openshell sandbox provider list my-sandbox --output json
+```
+
+JSON and YAML output contain an array of providers. Each entry includes the immutable provider `id`, `name`, `workspace`, `resource_version`, `type`, and `profile_workspace`, plus sorted `credential_keys` and `config_keys`. An empty `profile_workspace` selects the platform profile. Credential values, storage handles, and configuration values are omitted. Compare provider IDs when checking for replacement under the same name; `resource_version` describes the provider record and does not establish that a supervisor applied it.
+
 ### Diagnose Failed Calls to Tool Servers
 
 A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.

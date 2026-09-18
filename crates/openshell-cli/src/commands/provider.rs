@@ -257,9 +257,15 @@ fn attached_provider_to_json(provider: &Provider) -> serde_json::Value {
     let mut config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
     config_keys.sort();
 
+    // Project identity and key names explicitly: the raw record can contain
+    // credential values, storage handles, and sensitive configuration values.
     serde_json::json!({
+        "id": provider.object_id(),
         "name": provider.object_name(),
+        "workspace": provider.object_workspace(),
+        "resource_version": provider.metadata.as_ref().map_or(0, |meta| meta.resource_version),
         "type": provider.r#type,
+        "profile_workspace": provider.profile_workspace,
         "credential_keys": provider_credential_keys(provider),
         "config_keys": config_keys,
     })
@@ -2510,7 +2516,10 @@ mod tests {
     fn attached_provider_json_is_sorted_and_secret_safe() {
         let provider = Provider {
             metadata: Some(ObjectMeta {
+                id: "4a6a20db-f91e-4c61-b0ad-aaf253895ece".to_string(),
                 name: "github".to_string(),
+                workspace: "engineering".to_string(),
+                resource_version: 7,
                 ..Default::default()
             }),
             r#type: "github".to_string(),
@@ -2547,8 +2556,12 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
+                "id": "4a6a20db-f91e-4c61-b0ad-aaf253895ece",
                 "name": "github",
+                "workspace": "engineering",
+                "resource_version": 7,
                 "type": "github",
+                "profile_workspace": "internal",
                 "credential_keys": ["A_HANDLE", "SHARED", "Z_TOKEN"],
                 "config_keys": ["A_MODE", "Z_URL"],
             })
@@ -2561,7 +2574,6 @@ mod tests {
             "sensitive-config",
             "opaque-secret-handle",
             "metadata-value",
-            "internal",
             "123",
         ] {
             assert!(!serialized.contains(secret), "leaked {secret}");
