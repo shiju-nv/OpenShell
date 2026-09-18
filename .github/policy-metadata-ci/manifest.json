@@ -1,13 +1,14 @@
 {
   "schema_version": 1,
   "base_commit": "473d1e997439c3577fabd9014ba8e8959e3c2444",
-  "candidate_tree": "e5e26d5624a2120da5b4777388681b58d751cd10",
-  "candidate_patch_sha256": "5b299b42a8247282031ef69be8484c1240918d7823149e7cfb49211cc1ea7640",
+  "candidate_tree": "b73c4722f1e39eb67d3ecb7d354748d4f7f7a63a",
+  "candidate_patch_sha256": "59ea4ac5911f4c1375ea5bdad3ad98bb4a13ce3c0633ad7b232f12bad8e8d9ef",
   "source_blobs": {
     "architecture/security-policy.md": "5814c98b37b96cba751348352a1b001bcaeaeafd",
     "crates/openshell-cli/src/run.rs": "0ba6cbab76502b6ff677039aa286592b3654c20b",
     "crates/openshell-cli/tests/sandbox_name_fallback_integration.rs": "397342800b0e9ed7538efccd55e598fdd51df966",
-    "crates/openshell-server/src/grpc/policy.rs": "a679fd28c395ef35161d0058b03528c64c75e6f5",
+    "crates/openshell-server/src/grpc/policy.rs": "f93d36710d191d5b02fefa60e0b60b0c25fda366",
+    "crates/openshell-server/src/storage_proto.rs": "9de2d2eac4ff3a06ac3628aeee0162042999f67b",
     "docs/sandboxes/policies.mdx": "aefa8e8a70c3bf13d88e5a0d2a08b4f3254e47c3",
     "proto/openshell.proto": "72c553d41676ad8c7336caa5255350c625630255",
     "sdk/go/proto/openshellv1/openshell.pb.go": "fec1e2dfb6e033bbe0119df6acc703149ef0dab3",
@@ -18,17 +19,17 @@
     "server_old_boundary": {
       "patch": "variants/strict-server-negative.patch",
       "sha256": "53cc5c1b282565af8d4dae405b2ea72582fc36803ac4b3bddd18d3f5d19dc212",
-      "expected_tree": "34828ed281ea6864f93c08b08872b6205583dc2e"
+      "expected_tree": "d4ec1aa9cb1df66b36c9a14d5dea7f3cd9b87c5a"
     },
     "cli_old_boundary": {
       "patch": "variants/strict-cli-negative.patch",
       "sha256": "6602a97acf3462988a3cc19bffc08ea56b9777e3258d24660e55b31b549f7398",
-      "expected_tree": "0c6ef546588f5dde64fd1a40c81767023ec681f2"
+      "expected_tree": "c18f115a8a670bcc330512154c4d4a8a255dc211"
     },
     "combined_3444": {
       "patch": "variants/pr-3444-cli-overlap.patch",
       "sha256": "7703f765bb402e41690cf277eb6af71a7b1acc6677e64b08e550843395b2c390",
-      "expected_tree": "fbdf7e4e21923c077ca098a49a78af551a4ee3ce"
+      "expected_tree": "4a285850b74238781bd61afa0dad1caa4834e7cb"
     }
   }
 }

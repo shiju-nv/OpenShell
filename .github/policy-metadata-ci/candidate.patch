@@ -546,7 +546,7 @@ index 27cf9d63ea827c351dfaa878ab8cb7a40a493b37..397342800b0e9ed7538efccd55e598fd
  #[tokio::test]
  async fn explicit_name_takes_precedence_over_persisted() {
 diff --git a/crates/openshell-server/src/grpc/policy.rs b/crates/openshell-server/src/grpc/policy.rs
-index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c64c75e6f5 100644
+index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..f93d36710d191d5b02fefa60e0b60b0c25fda366 100644
 --- a/crates/openshell-server/src/grpc/policy.rs
 +++ b/crates/openshell-server/src/grpc/policy.rs
 @@ -4271,7 +4271,9 @@ pub(super) async fn handle_get_sandbox_policy_status(
@@ -576,7 +576,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
              let identity_error = format!(
                  "policy revision is invalid under the current schema: {}",
                  error.message()
-@@ -8680,6 +8681,310 @@ mod tests {
+@@ -8680,6 +8681,308 @@ mod tests {
          assert!(listed.revisions[1].policy.is_none());
      }
  
@@ -777,7 +777,6 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
 +                        workspace_scope: (!global)
 +                            .then(|| openshell_core::proto::workspace_selector("default")),
 +                        metadata_only,
-+                        ..Default::default()
 +                    };
 +                    let request = if global {
 +                        authed_request(request)
@@ -792,7 +791,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
 +                    );
 +                }
 +                let mut full = responses.remove(0);
-+                assert_eq!(full.active_version, if global { 0 } else { 1 });
++                assert_eq!(full.active_version, u32::from(!global));
 +                let revision = full.revision.as_mut().unwrap();
 +                assert_eq!(revision.version, expected_version);
 +                assert_eq!(revision.policy_hash, hash);
@@ -844,7 +843,6 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
 +                            workspace_scope: (!global)
 +                                .then(|| openshell_core::proto::workspace_selector("default")),
 +                            metadata_only,
-+                            ..Default::default()
 +                        }),
 +                    )
 +                    .await
@@ -887,7 +885,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
      #[tokio::test]
      async fn valid_global_policy_overrides_invalid_legacy_history() {
          let state = test_server_state().await;
-@@ -9901,17 +10206,20 @@ mod tests {
+@@ -9901,17 +10204,20 @@ mod tests {
          let mut state = test_server_state().await;
          Arc::get_mut(&mut state).unwrap().admin_role = "openshell-admin".to_string();
  
@@ -919,7 +917,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
  
          let list_error = handle_list_sandbox_policies(
              &state,
-@@ -9946,17 +10254,20 @@ mod tests {
+@@ -9946,17 +10252,20 @@ mod tests {
          .unwrap_err();
          assert_eq!(update_error.code(), Code::InvalidArgument);
  
@@ -951,7 +949,7 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
  
          let list_error = handle_list_sandbox_policies(
              &state,
-@@ -22282,21 +22593,26 @@ mod tests {
+@@ -22282,21 +22591,26 @@ mod tests {
              req
          }
  
@@ -993,6 +991,19 @@ index a3a9b5cc3b828fe98faf2d382f6d559aba15b8db..a679fd28c395ef35161d0058b03528c6
  
          let err = handle_list_sandbox_policies(
              &state,
+diff --git a/crates/openshell-server/src/storage_proto.rs b/crates/openshell-server/src/storage_proto.rs
+index 209d600a82a72f6f44ae6f969cd137c52f921ce8..9de2d2eac4ff3a06ac3628aeee0162042999f67b 100644
+--- a/crates/openshell-server/src/storage_proto.rs
++++ b/crates/openshell-server/src/storage_proto.rs
+@@ -118,7 +118,7 @@ mod tests {
+     const STORAGE_V1_SCHEMA_SHA256: &str =
+         "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+     const PUBLIC_RPC_SCHEMA_SHA256: &str =
+-        "87be23fc0ac4eaf8ce5890a1c87e6a48279f65fc8fbcc0cea7d7cbe426f2cc46";
++        "75d49772faffd084d7e5726dbed46d55836f860b3d1e71571588fe1473f1a123";
+     const DURABLE_SCHEMA_SHA256: &str =
+         "654649c8f65f44ac2ba04290f49c56de2f488271f99bc0fd4c6d025039c05128";
+     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
 diff --git a/docs/sandboxes/policies.mdx b/docs/sandboxes/policies.mdx
 index a8b743b5cd6c23bfff1828df78976e4fc4c3db59..aefa8e8a70c3bf13d88e5a0d2a08b4f3254e47c3 100644
 --- a/docs/sandboxes/policies.mdx
