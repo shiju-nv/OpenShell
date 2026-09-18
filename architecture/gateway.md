@@ -20,22 +20,11 @@ attachments; and asks compute runtimes to create or delete sandbox workloads.
   failures also use `Error`, with a distinct reason and no fabricated command
   result.
 
-The gateway does not enforce agent network policy at request time. That happens
-inside each sandbox, where the supervisor and proxy can observe local process
-identity.
+The isolated supervisor enforces agent network policy at request time using process identity from the workload boundary. The gateway stores and delivers the effective configuration.
 
-The live supervisor session is the readiness authority for its main-process
-instance. The supervisor reports its normalized result through the
-sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects
-results from stale instance IDs. Foreground creation carries a one-shot
-attachment intent to the process supervisor. The supervisor durably reports the
-result immediately, accepts that declared SSH attachment even when the process
-has already exited, sends the retained output and exit status, and waits for the
-peer's channel close before finalizing the result for ephemeral cleanup.
-Detached commands carry no attachment intent, so they finalize and exit
-immediately without a grace period. Finalization is persisted separately from
-the exit result; the gateway deletes an ephemeral sandbox only after the
-finalized supervisor session disconnects.
+The live supervisor session identifies the current main-process instance. Readiness also requires matching accepted configuration and confirmed activation for that control and boundary incarnation; a session or driver-ready observation alone is insufficient.
+
+The supervisor reports its normalized result through the sandbox-authenticated `ReportMainProcessExit` RPC, and the gateway rejects results from stale instance IDs. Foreground creation carries a one-shot attachment intent to the process supervisor. The supervisor durably reports the result immediately, accepts that declared SSH attachment even when the process has already exited, sends the retained output and exit status, and waits for the peer's channel close before finalizing the result for ephemeral cleanup. Detached commands carry no attachment intent, so they finalize and exit immediately without a grace period. Finalization is persisted separately from the exit result; the gateway deletes an ephemeral sandbox only after the finalized supervisor session disconnects.
 
 Local Docker development builds the supervisor image separately from the
 `openshell-sandbox` workload runtime. Cross-platform runtime extraction uses
@@ -54,6 +43,16 @@ local Docker, Podman, or VM driver requires a complete guest bundle whenever
 the gateway listener uses TLS; package-managed local TLS can supply that bundle.
 Kubernetes instead projects guest credentials through its configured Secret.
 The gateway validates this requirement before constructing the selected driver.
+
+### Effective configuration admission
+
+The gateway stores the desired delivered snapshot separately from the accepted installation in sandbox status. A registered control poll issues an immutable snapshot/token covering the selected policy, runtime settings, provider attachment epoch, and provider environment revision. Provider fetches must match the attachment epoch, provider revision, and effective policy hash. New provider/global changes become desired at the next authoritative poll; ordinary CLI reads do not issue generations or establish runtime acceptance.
+
+Pending registration uses compare-and-swap against the current control/boundary pair. The gateway signs a registration grant bound to the sandbox, driver runtime generation, authentication epoch, control instance, boundary session/incarnation and monotonic registration revision. This permits a replacement control to take over a surviving boundary while fencing old grants and reports. A destroyed boundary requires a new driver runtime generation.
+
+The supervisor reports a committed but still frozen installation first. Acceptance compares the full delivered snapshot and registered runtime identity, then durably authorizes release. The first authorization consumes the never-activated repair marker before the workload may run. A subsequent matching `activation_confirmed` report proves release and updates loaded policy history; accepted state without that confirmation cannot establish readiness.
+
+Rejected initial configurations use a repairable configuration condition while runtime authentication remains available. Static policy repair requires a positive never-authorized marker and pending/rejected admission. Stale rejection, legacy loaded reports, and driver-ready observations cannot replace accepted activation. See [sandbox activation](sandbox.md#configuration-activation-and-policy-acknowledgement) for the control/boundary sequence.
 
 ## Protocol and Auth
 
@@ -416,7 +415,7 @@ than extending the frozen message.
 | Configuration operation storage root | `StoredConfigUpdateOperation` | One common operation resource stores the exact provider target, receipt projection, snapshot failure reason, and historical outcome. |
 | Public dependencies of an operation | `ConfigUpdateOperation`, `ProviderMutationReceipt`, `ProviderReadinessReason` | Their complete message and enum closures are durable contracts. |
 
-The descriptor-derived test owns the complete public, durable, and intersecting inventories and their reviewed fingerprints. The tables here record their roots and classifications. A synthetic sandbox-spec byte fixture verifies that an absent server-owned attachment epoch decodes to the valid empty initial identity; direct and template creation tests separately require the gateway to replace any caller-supplied epoch.
+The descriptor-derived tests own the complete public, durable, and intersecting inventories and their reviewed fingerprints. The tables here record their roots and classifications. Configuration admission and desired-configuration status are governed by the durable `Sandbox` dependency closure. A synthetic sandbox-spec byte fixture verifies that an absent server-owned attachment epoch decodes to the valid empty initial identity; direct and template creation tests separately require the gateway to replace any caller-supplied epoch. Optional mutation request IDs extend public request fields without adding messages to these closures or changing the durable protobuf schema.
 
 Public delete, membership-removal, and SSH-revocation responses use
 `DeletionOutcome`, not a transport-success boolean. `COMPLETED` establishes
@@ -796,11 +795,9 @@ Ordinary static credentials retain revision-scoped references. After update read
 
 ## Provider Environment Resolution
 
-The gateway resolves only the providers attached to a sandbox. It combines each
-provider instance with its profile, returns non-secret configuration, and marks
-credentials with the profile's host, port, and path boundaries. The supervisor
-uses those bindings when it replaces credential placeholders in policy-allowed
-requests.
+The gateway resolves only the providers attached to a sandbox. It combines each provider instance with its profile, returns non-secret configuration, and marks credentials with the profile's host, port, and path boundaries. The supervisor uses those bindings when it replaces credential placeholders in policy-allowed requests.
+
+A gateway-managed supervisor fetches the provider environment named by its delivered configuration and checks the attachment epoch, provider revision, and effective policy hash before preparation. Provider-only updates follow the same staged activation path; a mismatching or invalid fetch cannot publish credentials independently. A matching snapshot with withheld or expired credentials can install an empty credential set so stale credentials remain unavailable. Configuration activation alone does not complete a provider operation: the independent provider readiness report also requires current credential, policy-generation, and authenticated process-environment installation evidence.
 
 Model selection, API protocol, request and response shapes, streaming behavior,
 and endpoint URL construction remain responsibilities of the workload's native

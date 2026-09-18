@@ -946,7 +946,7 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
     let config = runtime_config();
     let expected_address = match config.gateway_route {
         DockerGatewayRoute::Bridge { bind_address, .. } => bind_address,
-        DockerGatewayRoute::HostGateway => panic!("test config must use a managed bridge"),
+        DockerGatewayRoute::HostGateway { .. } => panic!("test config must use a managed bridge"),
     };
     let driver = test_driver_with_config(config);
 
@@ -966,7 +966,9 @@ async fn gateway_listener_requirements_report_managed_bridge_address() {
 #[tokio::test]
 async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
     let mut config = runtime_config();
-    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_route = DockerGatewayRoute::HostGateway {
+        host_alias_ip: None,
+    };
     config.gateway_callback_bind_address = None;
     let driver = test_driver_with_config(config);
 
@@ -982,7 +984,9 @@ async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
 #[tokio::test]
 async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
     let mut config = runtime_config();
-    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_route = DockerGatewayRoute::HostGateway {
+        host_alias_ip: None,
+    };
     config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
     let driver = test_driver_with_config(config);
 
@@ -1061,7 +1065,9 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             DEFAULT_SERVER_PORT,
             None,
         ),
-        DockerGatewayRoute::HostGateway
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }
     );
 }
 
@@ -1084,7 +1090,9 @@ fn vm_backed_docker_daemon_uses_daemon_local_companion_transport() {
 fn host_gateway_route_requests_ipv4_loopback_for_ipv6_primary() {
     assert_eq!(
         docker_gateway_callback_bind_address(
-            &DockerGatewayRoute::HostGateway,
+            &DockerGatewayRoute::HostGateway {
+                host_alias_ip: None
+            },
             "[::1]:17670".parse().unwrap(),
         ),
         Some("127.0.0.1:17670".parse().unwrap())
@@ -1096,7 +1104,9 @@ fn host_gateway_route_reuses_ipv4_primary_when_it_covers_loopback() {
     for primary in ["127.0.0.1:17670", "0.0.0.0:17670"] {
         assert_eq!(
             docker_gateway_callback_bind_address(
-                &DockerGatewayRoute::HostGateway,
+                &DockerGatewayRoute::HostGateway {
+                    host_alias_ip: None
+                },
                 primary.parse().unwrap(),
             ),
             None,
@@ -1120,7 +1130,9 @@ fn docker_gateway_route_uses_host_gateway_for_colima() {
             DEFAULT_SERVER_PORT,
             None,
         ),
-        DockerGatewayRoute::HostGateway
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }
     );
 }
 
@@ -1141,7 +1153,9 @@ fn docker_gateway_route_uses_host_gateway_for_colima_named_profile() {
             DEFAULT_SERVER_PORT,
             None,
         ),
-        DockerGatewayRoute::HostGateway
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }
     );
 }
 
@@ -1163,7 +1177,9 @@ fn docker_gateway_route_uses_host_gateway_for_rancher_desktop() {
             DEFAULT_SERVER_PORT,
             None,
         ),
-        DockerGatewayRoute::HostGateway
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }
     );
 }
 
@@ -1183,7 +1199,9 @@ fn docker_gateway_route_uses_host_gateway_for_orbstack() {
             DEFAULT_SERVER_PORT,
             None,
         ),
-        DockerGatewayRoute::HostGateway
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }
     );
 }
 
@@ -1225,24 +1243,158 @@ fn docker_gateway_route_uses_host_gateway_when_host_runtime_requires_it() {
             None,
             true,
         ),
-        DockerGatewayRoute::HostGateway
+        DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }
     );
 }
 
 #[test]
-fn docker_gateway_route_prefers_configured_host_gateway_ip() {
+fn docker_host_alias_linux_explicit_ip_preserves_bridge_listener() {
     let info = SystemInfo {
         operating_system: Some("Ubuntu 24.04 LTS".to_string()),
         ..Default::default()
     };
 
-    let route = docker_gateway_route(
+    let route = docker_gateway_route_for_host(
         &info,
         IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         DEFAULT_SERVER_PORT,
         Some(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4))),
+        false,
     );
 
+    assert_eq!(
+        route,
+        DockerGatewayRoute::Bridge {
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
+        }
+    );
+    assert_eq!(docker_supervisor_host_alias(&route), "172.20.0.4");
+    assert_eq!(
+        docker_boundary_host_gateway_ip(&route),
+        Some("172.20.0.4".parse().unwrap()),
+    );
+    assert_eq!(
+        docker_gateway_callback_bind_address(&route, "127.0.0.1:17670".parse().unwrap()),
+        Some("172.20.0.4:17670".parse().unwrap()),
+    );
+    assert_eq!(
+        docker_host_openshell_endpoint("https://host.openshell.internal:17670", &route).unwrap(),
+        "https://172.20.0.4:17670/",
+    );
+}
+
+#[test]
+fn docker_host_alias_macos_explicit_ip_matches_descriptor_without_native_bind() {
+    for address in ["192.168.65.254", "fd00::254"] {
+        let ip = address.parse::<IpAddr>().unwrap();
+        let route = docker_gateway_route_for_host(
+            &SystemInfo::default(),
+            "172.18.0.1".parse().unwrap(),
+            DEFAULT_SERVER_PORT,
+            Some(ip),
+            true,
+        );
+        assert_eq!(
+            route,
+            DockerGatewayRoute::HostGateway {
+                host_alias_ip: Some(ip)
+            }
+        );
+        assert_eq!(docker_supervisor_host_alias(&route), address);
+        assert_eq!(docker_boundary_host_gateway_ip(&route), Some(ip));
+        assert_eq!(
+            docker_gateway_callback_bind_address(&route, "127.0.0.1:17670".parse().unwrap()),
+            None,
+        );
+        for alias in [HOST_OPENSHELL_INTERNAL, HOST_DOCKER_INTERNAL] {
+            assert_eq!(
+                docker_host_openshell_endpoint(&format!("https://{alias}:17670"), &route).unwrap(),
+                "https://127.0.0.1:17670/",
+            );
+        }
+        assert_eq!(
+            docker_host_openshell_endpoint("https://gateway.example.com:17670", &route).unwrap(),
+            "https://gateway.example.com:17670/",
+        );
+    }
+}
+
+#[tokio::test]
+async fn docker_host_alias_macos_explicit_ip_preserves_callback_listener_rules() {
+    for (primary, expected) in [
+        ("127.0.0.1:17670", None),
+        ("0.0.0.0:17670", None),
+        ("[::1]:17670", Some("127.0.0.1:17670")),
+        ("10.0.0.4:17670", Some("127.0.0.1:17670")),
+    ] {
+        let mut config = runtime_config();
+        config.gateway_route = docker_gateway_route_for_host(
+            &SystemInfo::default(),
+            "172.18.0.1".parse().unwrap(),
+            DEFAULT_SERVER_PORT,
+            Some("192.168.65.254".parse().unwrap()),
+            true,
+        );
+        config.gateway_callback_bind_address =
+            docker_gateway_callback_bind_address(&config.gateway_route, primary.parse().unwrap());
+        let driver = test_driver_with_config(config);
+        let response = driver
+            .get_gateway_listener_requirements(Request::new(
+                GetGatewayListenerRequirementsRequest {},
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let addresses = response
+            .requirements
+            .into_iter()
+            .map(|requirement| requirement.selector)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addresses,
+            expected
+                .into_iter()
+                .map(|address| Some(Selector::ExactBindAddress(address.to_string())))
+                .collect::<Vec<_>>(),
+            "{primary}",
+        );
+    }
+}
+
+#[test]
+fn docker_host_alias_without_explicit_ip_keeps_trusted_descriptor_absent() {
+    let info = SystemInfo {
+        operating_system: Some("Docker Desktop".to_string()),
+        ..Default::default()
+    };
+    for host_requires_alias in [false, true] {
+        let route = docker_gateway_route_for_host(
+            &info,
+            "172.18.0.1".parse().unwrap(),
+            DEFAULT_SERVER_PORT,
+            None,
+            host_requires_alias,
+        );
+        assert_eq!(
+            route,
+            DockerGatewayRoute::HostGateway {
+                host_alias_ip: None
+            }
+        );
+        assert_eq!(docker_supervisor_host_alias(&route), "host-gateway");
+        assert_eq!(docker_boundary_host_gateway_ip(&route), None);
+    }
+    // A Linux gateway running inside Docker still needs its explicit native
+    // bind address even when the daemon identifies itself as Docker Desktop.
+    let route = docker_gateway_route_for_host(
+        &info,
+        "172.18.0.1".parse().unwrap(),
+        DEFAULT_SERVER_PORT,
+        Some("172.20.0.4".parse().unwrap()),
+        false,
+    );
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
@@ -1260,7 +1412,9 @@ fn docker_supervisor_alias_matches_the_trusted_gateway_route() {
         "172.20.0.4"
     );
     assert_eq!(
-        docker_supervisor_host_alias(&DockerGatewayRoute::HostGateway),
+        docker_supervisor_host_alias(&DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }),
         "host-gateway"
     );
 }
@@ -1274,7 +1428,9 @@ fn docker_boundary_pins_only_concrete_host_gateway_addresses() {
         Some(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)))
     );
     assert_eq!(
-        docker_boundary_host_gateway_ip(&DockerGatewayRoute::HostGateway),
+        docker_boundary_host_gateway_ip(&DockerGatewayRoute::HostGateway {
+            host_alias_ip: None
+        }),
         None
     );
 }
@@ -3568,6 +3724,156 @@ fn concurrent_container_removal_is_idempotent() {
 
     assert!(is_removal_in_progress_error(&removing));
     assert!(!is_removal_in_progress_error(&other_conflict));
+}
+
+/// Seed both persisted sides from the same Docker coordinates and launch identity.
+fn persisted_boundary_authentication_fixture(
+    directory: &Path,
+    authentication: &SandboxLaunchAuthentication,
+) -> isolation::DockerBoundaryProvisioning {
+    let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
+    let provisioned = isolation::DockerBoundarySpec {
+        gpu_requested: false,
+        boundary_id: "sandbox-refresh".to_string(),
+        generation: authentication.supervisor.runtime_generation.to_string(),
+        session_id: authentication.supervisor.session_id,
+        session_rotation: authentication.supervisor.session_rotation,
+        auth_epoch: authentication.supervisor.auth_epoch,
+        gateway_id: authentication.gateway_id.clone(),
+        verification_keys: gateway_verification_keys(&authentication.verification_keys).unwrap(),
+        container_id: "container-kept".to_string(),
+        image_identity: "sha256:image-kept".to_string(),
+        listener_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
+        control_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
+        sandbox_tls: SandboxTlsServerConfig {
+            certificate_chain_path: PathBuf::from(BOUNDARY_CERTIFICATE_MOUNT_PATH),
+            private_key_path: PathBuf::from(BOUNDARY_PRIVATE_KEY_MOUNT_PATH),
+        },
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1))),
+        workload_identity: test_workload_identity(),
+        child_env: HashMap::from([("FIXTURE_ENV".to_string(), "retained".to_string())]),
+    }
+    .provision();
+    for (name, bytes) in [
+        (
+            BOUNDARY_CONFIG_FILE,
+            provisioned.boundary_config.encode().unwrap(),
+        ),
+        (
+            RUNTIME_DESCRIPTOR_FILE,
+            provisioned
+                .runtime_descriptor
+                .backend_descriptor()
+                .unwrap()
+                .payload,
+        ),
+        (
+            SUPERVISOR_AUTH_BUNDLE_FILE,
+            serde_json::to_vec(&authentication.supervisor).unwrap(),
+        ),
+        (
+            BOUNDARY_CERTIFICATE_FILE,
+            tls.certificate_chain_pem.into_bytes(),
+        ),
+        (BOUNDARY_PRIVATE_KEY_FILE, tls.private_key_pem.into_bytes()),
+    ] {
+        fs::write(directory.join(name), bytes).unwrap();
+    }
+    provisioned
+}
+
+#[tokio::test]
+async fn stopped_start_authentication_refresh_persists_matching_generations() {
+    let directory = TempDir::new().unwrap();
+    let old = decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
+    let previous = persisted_boundary_authentication_fixture(directory.path(), &old);
+    let old_certificate = fs::read(directory.path().join(BOUNDARY_CERTIFICATE_FILE)).unwrap();
+    let old_key = fs::read(directory.path().join(BOUNDARY_PRIVATE_KEY_FILE)).unwrap();
+    let mut fresh = old.clone();
+    fresh.supervisor.runtime_generation =
+        openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-2").unwrap();
+    fresh.supervisor.session_id = openshell_core::SandboxSessionId::new();
+    fresh.supervisor.session_rotation = openshell_core::jwt::SessionRotation::new(2).unwrap();
+    fresh.supervisor.auth_epoch = CredentialEpoch::new(2).unwrap();
+    fresh.supervisor.gateway_token = SecretJwt::parse("fresh.gateway.token").unwrap();
+    fresh.supervisor.sandbox_token = SecretJwt::parse("fresh.sandbox.token").unwrap();
+    fresh.gateway_id = "gateway-rotated".to_string();
+    fresh.verification_keys[0].key_id = "rotated-key".to_string();
+    fresh.verification_keys[0].public_key_pem = b"rotated-public-key".to_vec();
+    fresh.validate().unwrap();
+
+    refresh_docker_boundary_authentication(directory.path(), &serde_json::to_vec(&fresh).unwrap())
+        .await
+        .unwrap();
+
+    let descriptor =
+        read_docker_runtime_descriptor_file(&directory.path().join(RUNTIME_DESCRIPTOR_FILE))
+            .await
+            .unwrap()
+            .unwrap();
+    let boundary: BoundaryConfig =
+        serde_json::from_slice(&fs::read(directory.path().join(BOUNDARY_CONFIG_FILE)).unwrap())
+            .unwrap();
+    let encoded_auth = fs::read(directory.path().join(SUPERVISOR_AUTH_BUNDLE_FILE)).unwrap();
+    let persisted_auth: SupervisorAuthBundle = serde_json::from_slice(&encoded_auth).unwrap();
+    persisted_auth.validate().unwrap();
+    assert_eq!(encoded_auth, serde_json::to_vec(&fresh.supervisor).unwrap());
+    // These are the cross-file identities checked at supervisor startup and
+    // boundary attachment; a valid fresh bundle must match both persisted peers.
+    assert_ne!(
+        old.supervisor.runtime_generation,
+        fresh.supervisor.runtime_generation
+    );
+    assert_eq!(
+        descriptor.generation,
+        fresh.supervisor.runtime_generation.as_str()
+    );
+    assert_eq!(
+        descriptor.generation,
+        persisted_auth.runtime_generation.as_str()
+    );
+    assert_eq!(boundary.generation, descriptor.generation);
+    assert_eq!(boundary.session_id, persisted_auth.session_id);
+    assert_eq!(descriptor.session_id, persisted_auth.session_id);
+    assert_eq!(boundary.session_rotation, persisted_auth.session_rotation);
+    assert_eq!(boundary.auth_epoch, persisted_auth.auth_epoch);
+    assert_ne!(descriptor.tls, previous.runtime_descriptor.tls);
+    assert_eq!(
+        descriptor.tls.server_name,
+        format!("sandbox.{}.openshell.internal", persisted_auth.session_id)
+    );
+    assert_ne!(
+        fs::read(directory.path().join(BOUNDARY_CERTIFICATE_FILE)).unwrap(),
+        old_certificate
+    );
+    assert_ne!(
+        fs::read(directory.path().join(BOUNDARY_PRIVATE_KEY_FILE)).unwrap(),
+        old_key
+    );
+
+    // Every resource, workload, socket and host-route coordinate survives the
+    // authorized generation rotation; only launch authentication and TLS change.
+    let mut expected_descriptor = previous.runtime_descriptor;
+    expected_descriptor.generation = fresh.supervisor.runtime_generation.to_string();
+    expected_descriptor.session_id = fresh.supervisor.session_id;
+    expected_descriptor.tls = descriptor.tls.clone();
+    assert_eq!(descriptor, expected_descriptor);
+    let mut expected_boundary = previous.boundary_config;
+    expected_boundary.generation = fresh.supervisor.runtime_generation.to_string();
+    expected_boundary.session_id = fresh.supervisor.session_id;
+    expected_boundary.session_rotation = fresh.supervisor.session_rotation;
+    expected_boundary.auth_epoch = fresh.supervisor.auth_epoch;
+    expected_boundary.gateway_id = fresh.gateway_id;
+    expected_boundary.verification_keys =
+        gateway_verification_keys(&fresh.verification_keys).unwrap();
+    assert_eq!(
+        serde_json::to_value(&boundary).unwrap(),
+        serde_json::to_value(&expected_boundary).unwrap()
+    );
 }
 
 #[tokio::test]

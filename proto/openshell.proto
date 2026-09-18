@@ -1122,6 +1122,11 @@ message SandboxStatus {
   optional bool configuration_activated = 12;
   // Gateway-owned repair window. Retained after timeout for inspection and retry.
   SandboxProvisioning provisioning = 13;
+  // Durable release-authorization marker. Once true, static restrictions cannot
+  // be repaired in place because a workload may have consumed them.
+  optional bool configuration_activation_authorized = 14;
+  // Last complete configuration delivered to the registered control instance.
+  SandboxConfigurationSnapshot configuration_desired = 15;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1606,6 +1611,9 @@ message ProviderReadinessObservation {
   bool launch_environment_installed = 9;
   string process_instance_id = 10;
   ProviderReadinessReason reason = 11;
+  // Exact local credential snapshot shared with the confirmed activation receipt.
+  // Repaired snapshots can retain the same logical revision and policy hash.
+  string provider_env_installation_id = 12;
 }
 
 // Operator view of desired and observed state; contains no credential material.
@@ -2799,6 +2807,48 @@ message SandboxConfigurationAdmission {
   uint64 config_revision = 5;
   uint64 provider_env_revision = 6;
   string error = 7;
+  // Existing authenticated launch generation, independent of configuration revisions.
+  string runtime_generation = 8;
+  string boundary_instance_id = 9;
+  string boundary_session_id = 10;
+  openshell.sandbox.v1.PolicySource policy_source = 11;
+  string configuration_snapshot = 12;
+  // True only after the boundary acknowledged release and initial process launch.
+  bool activation_confirmed = 13;
+  uint64 registration_revision = 14;
+  uint64 delivery_revision = 15;
+  // Attachment identity captured with the installed provider environment.
+  string provider_attachment_epoch = 16;
+  // Boundary-allocated monotonic installation fence within this registration.
+  // A later installation must first be reported held, before release confirmation.
+  uint64 publication_generation = 17;
+  // Exact locally prepared credential snapshot, preserved through installation.
+  string provider_env_installation_id = 18;
+}
+
+// Immutable gateway-issued configuration identity. Independent provider and global
+// writes become desired when the next authoritative control poll delivers them.
+message SandboxConfigurationSnapshot {
+  string snapshot_id = 1;
+  string instance_id = 2;
+  string runtime_generation = 3;
+  string boundary_instance_id = 4;
+  string boundary_session_id = 5;
+  uint32 policy_version = 6;
+  string policy_hash = 7;
+  uint64 config_revision = 8;
+  uint64 provider_env_revision = 9;
+  openshell.sandbox.v1.PolicySource policy_source = 10;
+  bool admitted = 11;
+  string error = 12;
+  uint64 registration_revision = 13;
+  uint64 delivery_revision = 14;
+  // Failure posture used when this exact configuration was delivered.
+  string policy_validation_failure_mode = 15;
+  // Hash of immutable gateway policy services; changes require a fresh delivery.
+  string gateway_configuration_fingerprint = 16;
+  // Reattachment invalidates installation evidence even at the same revision.
+  string provider_attachment_epoch = 17;
 }
 
 message ReportSandboxConfigurationRequest {
@@ -2806,9 +2856,15 @@ message ReportSandboxConfigurationRequest {
   SandboxConfigurationAdmission admission = 2;
   // Pending registration replaces only this previously observed instance.
   string expected_instance_id = 3;
+  // The boundary half of the same registration fence.
+  string expected_boundary_instance_id = 4;
 }
 
-message ReportSandboxConfigurationResponse {}
+message ReportSandboxConfigurationResponse {
+  // Gateway-signed authority for this exact control and boundary registration.
+  string control_registration_grant = 1 [(openshell.options.v1.secret) = true];
+  uint64 registration_revision = 2;
+}
 
 // A versioned policy revision with metadata.
 message SandboxPolicyRevision {

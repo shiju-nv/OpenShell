@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use openshell_policy_schema::{
     AccessPreset, FilesystemPolicy, L7Allow as Allow, L7DenyRule as DenyRule, LandlockPolicy,
     NetworkBinary as Binary, NetworkEndpoint as Endpoint, NetworkMiddleware,
-    NetworkPolicyRule as NetworkRule, PolicyDocument, ProcessPolicy,
+    NetworkPolicyRule as NetworkRule, ParseProfile, PolicyDocument, ProcessPolicy,
 };
 use z3::ast::{Ast, Bool, Int, Regexp, String as Z3String};
 use z3::{Context, Params, SatResult, Solver};
@@ -77,7 +77,10 @@ impl ContainmentEndpoint for Endpoint {
 
 /// Parse one captured YAML or JSON input using the canonical authored schema.
 pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyError> {
-    let document = openshell_policy_schema::parse_policy(source)
+    // This solver models runtime policy only. Extensions and managed-policy
+    // annotations must fail before projection because the model cannot retain
+    // their authority or account for it when deciding containment.
+    let document = openshell_policy_schema::parse_policy(source, ParseProfile::RuntimeStrict)
         .map_err(|error| ParsePolicyError(format!("invalid policy: {error:#}")))?;
     let mut filesystem_policy = document.effective_filesystem_policy();
     normalize_filesystem_paths(&mut filesystem_policy)?;
@@ -88,6 +91,7 @@ pub fn parse_policy_str(source: &str) -> Result<ContainmentPolicy, ParsePolicyEr
         landlock,
         process,
         network_middlewares,
+        metadata: _,
     } = document;
     Ok(ContainmentPolicy {
         filesystem_policy,

@@ -9,7 +9,7 @@
 
 use openshell_policy_schema::{
     AccessPreset, L7Allow as AuthoredAllow, NetworkEndpoint as AuthoredEndpoint, ParseLimits,
-    PolicyDocument,
+    ParseProfile, PolicyDocument,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -257,13 +257,17 @@ impl PolicyModel {
 
 /// Parse an `OpenShell` policy YAML file into a `PolicyModel`.
 pub fn parse_policy(path: &Path) -> miette::Result<PolicyModel> {
-    let document = openshell_policy_schema::parse_policy_file(path, ParseLimits::default())?;
+    let document = openshell_policy_schema::parse_policy_file(
+        path,
+        ParseProfile::RuntimeStrict,
+        ParseLimits::default(),
+    )?;
     Ok(project_policy(document))
 }
 
 /// Parse a policy YAML string into a `PolicyModel`.
 pub fn parse_policy_str(yaml: &str) -> miette::Result<PolicyModel> {
-    let document = openshell_policy_schema::parse_policy(yaml)?;
+    let document = openshell_policy_schema::parse_policy(yaml, ParseProfile::RuntimeStrict)?;
     Ok(project_policy(document))
 }
 

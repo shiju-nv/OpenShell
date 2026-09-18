@@ -170,13 +170,26 @@ Runtime rejection behavior is configured only in `gateway.toml`:
 policy_validation_failure_mode = "fail_closed"
 ```
 
-The default `fail_closed` mode deactivates the previous generation, closes
-pinned relays, and quarantines new egress until a valid generation loads.
-`retain_last_valid` explicitly keeps the previous valid policy active; without
-one it still fails closed. Restart the gateway after changing this field.
-Inspect sandbox OCSF configuration and finding events for the validation
-rationale, configured and effective modes, active generation, and the explicit
-`previous_policy_active` state.
+The default `fail_closed` mode deactivates the previous generation, closes pinned relays, and quarantines new egress until a valid generation loads. In a gateway-managed control/boundary sandbox, workload execution and readiness are also held until the matching policy and provider configuration is activated. `retain_last_valid` permits a verified previous accepted configuration to remain active; without one it still fails closed. It cannot release an uncertain policy/provider combination. Restart the gateway after changing this field. Inspect sandbox OCSF configuration and finding events for the validation rationale, configured and effective modes, active generation, and the explicit `previous_policy_active` state.
+
+For a sandbox that remains `Provisioning` or `Starting`, or loses readiness, inspect configuration status alongside driver and Pod status:
+
+```fish
+openshell sandbox get my-sandbox
+openshell sandbox get my-sandbox --output json
+openshell policy list my-sandbox
+openshell sandbox provider list my-sandbox
+```
+
+`configuration_desired` records the latest delivered candidate; `configuration_admission` records runtime installation status. Gateway validation (`admitted: true`) and an accepted installation are intermediate states. Readiness also requires `activation_confirmed: true` for the current runtime. A rejected desired candidate can coexist with a previous accepted configuration under `retain_last_valid`. Follow the desired error to repair policy with `openshell policy set`, or correct provider credentials, profile coverage, and attachments. A policy revision becomes `loaded` only after the matching final activation report. Its history alone cannot prove that a replacement runtime is ready.
+
+A rejected initial configuration remains repairable without launching a workload. Static fields can be replaced only while the durable `configuration_activation_authorized` value is explicitly `false` and admission is pending or rejected. The first authorization to release the workload consumes this permission before the workload may run. Missing evidence, a lost response, or a restart does not restore it. After authorization, changing filesystem, Landlock, or process policy requires a new sandbox. A successful initial repair within the provisioning repair window launches the waiting workload once. If the condition is `ProvisioningTimedOut`, inspect cleanup status and follow the published [restart guidance](https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes.md) after repair.
+
+Inspect `openshell sandbox provider status <sandbox> <provider> --output json` for a provider mutation that remains pending. Configuration acceptance does not replace independent provider installation evidence. A current report must cover matching credentials, policy generation, and the authenticated environment installation for future processes; reconnecting invalidates stale observations.
+
+During recovery, an authenticated control/boundary connection and isolation `Confirm` leave the workload held. A replacement supervisor must obtain a fresh gateway-signed registration grant, reinstall the selected configuration, and complete matching activation before readiness returns. Do not try to repair a stale grant by replaying an old runtime identity. A surviving main process resumes without another initial launch. Destruction of its boundary makes the old runtime generation terminal; another launch requires a new driver-authorized generation.
+
+These admission and workload-release checks apply to gateway-managed control/boundary sandboxes. A standalone network proxy continues to load its local policy file and has no sandbox admission or workload-release record to inspect.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
 Use container logs, engine inspection and the configured exec health probe for
@@ -654,16 +667,7 @@ kubectl -n <sandbox-namespace> get pod -l openshell.ai/sandbox-id=<sandbox-id>,o
 kubectl -n <sandbox-namespace> get networkpolicy -l openshell.ai/sandbox-id=<sandbox-id> -o yaml
 ```
 
-Creation and recovery fail closed. A missing Secret leaves both pods inert; a
-missing or unobserved workload fence must prevent the driver from releasing the
-Sandbox; and readiness requires both Agent Sandbox readiness and an Available
-supervisor Pod. Its exec readiness check succeeds only after the
-supervisor has attached, confirmed enforcement, started or resumed the
-workload, and registered the gateway access plane. Use both Pod logs for
-bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked
-a required unprivileged seccomp, task-memory, or Landlock operation. Do not add
-capabilities, gateway egress, or credentials to the workload Pod as a
-workaround.
+Creation and recovery fail closed. A missing Secret leaves both pods inert; a missing or unobserved workload fence must prevent the driver from releasing the Sandbox. Readiness requires Agent Sandbox readiness, an Available supervisor Pod, and confirmed activation of the matching effective configuration. Isolation confirmation alone leaves the workload held. The exec readiness check succeeds after the supervisor installs the matching policy and providers, receives release authorization, starts or resumes the workload, and registers the gateway access plane. Use both Pod logs for bootstrap errors. An `EPERM` during enforcement setup means the runtime blocked a required unprivileged seccomp, task-memory, or Landlock operation. Do not add capabilities, gateway egress, or credentials to the workload Pod as a workaround.
 
 If a Sandbox remains in the `releasing` bootstrap phase, inspect the supervisor
 Pod first. The gateway keeps the workload running during this phase so the

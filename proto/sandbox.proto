@@ -354,6 +354,9 @@ message NetworkBinary {
 message GetSandboxConfigRequest {
   // The sandbox ID.
   string sandbox_id = 1;
+  // Nonempty only for an authoritative poll by the registered control process.
+  // Empty observer requests never replace the delivered activation snapshot.
+  string configuration_instance_id = 2;
 }
 
 // Request to get gateway-global settings.
@@ -443,6 +446,11 @@ message GetSandboxConfigResponse {
   string configuration_error = 16;
   // Registration fence for a new supervisor; capture once and retain on retry.
   string configuration_instance_id = 15;
+  string runtime_generation = 17;
+  string configuration_boundary_instance_id = 18;
+  string configuration_snapshot = 19;
+  uint64 configuration_registration_revision = 20;
+  uint64 configuration_delivery_revision = 21;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

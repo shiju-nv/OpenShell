@@ -267,6 +267,20 @@ impl SandboxSessionJwtAuthority {
             .verify(token)
             .map_err(|error| Status::unauthenticated(format!("invalid gateway session: {error}")))
     }
+
+    /// Mint attachment authority only for an already persisted control registration.
+    pub fn mint_control_registration(
+        &self,
+        registration: &openshell_core::jwt::ControlRegistrationGrant,
+    ) -> Result<String, Status> {
+        self.issuer
+            .mint_control_registration(registration)
+            .map(|token| token.token.expose_secret().to_string())
+            .map_err(|error| {
+                warn!(%error, "failed to mint control registration grant");
+                Status::internal("failed to mint control registration grant")
+            })
+    }
 }
 
 /// Authenticates launch-scoped supervisor tokens and checks their identity
@@ -322,8 +336,9 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         }
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id: authenticated.sandbox_id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "launch-session".to_string(),
+            source: SandboxIdentitySource::LaunchSession {
+                runtime_generation: authenticated.runtime_generation,
+                auth_epoch: authenticated.auth_epoch,
             },
             trust_domain: Some("openshell".to_string()),
         })))

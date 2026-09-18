@@ -683,6 +683,7 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
     });
 }
 
+#[cfg(test)]
 async fn require_persisted_sandbox(
     store: &Arc<crate::persistence::Store>,
     sandbox_id: &str,
@@ -920,6 +921,43 @@ fn expected_transport_close_during_session_state(
 // ConnectSupervisor gRPC handler
 // ---------------------------------------------------------------------------
 
+async fn register_configuration_transport(
+    state: &Arc<ServerState>,
+    principal: &Principal,
+    hello: &openshell_core::proto::SupervisorHello,
+    session_id: String,
+    tx: mpsc::Sender<GatewayMessage>,
+    shutdown_tx: oneshot::Sender<()>,
+) -> Result<bool, Status> {
+    // Control registration and transport replacement share this guard. A stale
+    // hello must be rejected before it can evict the current transport, even
+    // when the later readiness transition would also reject that hello.
+    let _guard = state.compute.sandbox_sync_guard().await;
+    crate::auth::guard::ensure_sandbox_principal_scope(principal, &hello.sandbox_id)?;
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&hello.sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("load control registration failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::grpc::policy::authorize_configuration_identity(principal, &sandbox)?;
+    if sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .is_none_or(|admission| {
+            admission.instance_id != hello.instance_id || admission.instance_id.is_empty()
+        })
+    {
+        return Err(Status::failed_precondition(
+            "supervisor hello does not match the registered control instance",
+        ));
+    }
+    Ok(state
+        .supervisor_sessions
+        .register(hello.sandbox_id.clone(), session_id, tx, shutdown_tx))
+}
+
 pub async fn handle_connect_supervisor(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<SupervisorMessage>>,
@@ -945,12 +983,10 @@ pub async fn handle_connect_supervisor(
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
-    if let Some(principal) = principal.as_ref() {
-        crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
-    }
-    require_persisted_sandbox(&state.store, &sandbox_id).await?;
-    // Validate readiness identities before replacing a healthy session. Older
-    // supervisors remain usable but cannot assert provider installation.
+    let principal = principal
+        .ok_or_else(|| Status::unauthenticated("supervisor session requires a launch identity"))?;
+    crate::auth::guard::ensure_sandbox_principal_scope(&principal, &sandbox_id)?;
+    // Validate provider installation identities before replacing a healthy stream.
     let provider_readiness = ProviderReadinessEvidence::from_hello(&hello)?;
 
     let session_id = Uuid::new_v4().to_string();
@@ -964,12 +1000,15 @@ pub async fn handle_connect_supervisor(
     // Step 2: Create and register the outbound channel.
     let (tx, rx) = mpsc::channel::<GatewayMessage>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let superseded = state.supervisor_sessions.register(
-        sandbox_id.clone(),
+    let superseded = register_configuration_transport(
+        state,
+        &principal,
+        &hello,
         session_id.clone(),
         tx.clone(),
         shutdown_tx,
-    );
+    )
+    .await?;
     if superseded {
         info!(
             sandbox_id = %sandbox_id,
@@ -1517,6 +1556,86 @@ mod tests {
             "new session must still be registered"
         );
         assert_eq!(sessions.get("sbx").unwrap().session_id, "s-new");
+    }
+
+    #[tokio::test]
+    async fn configuration_activation_stale_hello_cannot_evict_current_transport() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity {
+            runtime_generation: openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                "current-generation",
+            )
+            .unwrap(),
+            auth_epoch: openshell_core::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_token_id: Uuid::new_v4(),
+            refresh_replay: None,
+        };
+        let mut metadata = openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "registered-sandbox".to_string(),
+            name: "registered".to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        };
+        identity.write(&mut metadata.annotations);
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(metadata),
+                status: Some(openshell_core::proto::SandboxStatus {
+                    phase: SandboxPhase::Provisioning.into(),
+                    configuration_admission: Some(
+                        openshell_core::proto::SandboxConfigurationAdmission {
+                            instance_id: "current-control".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "registered-sandbox".to_string(),
+            source: SandboxIdentitySource::LaunchSession {
+                runtime_generation: identity.runtime_generation,
+                auth_epoch: identity.auth_epoch,
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let (current_tx, _current_rx) = mpsc::channel(1);
+        let (current_shutdown, mut current_shutdown_rx) = oneshot::channel();
+        state.supervisor_sessions.register(
+            "registered-sandbox".to_string(),
+            "current-transport".to_string(),
+            current_tx,
+            current_shutdown,
+        );
+        let (stale_tx, _stale_rx) = mpsc::channel(1);
+        let error = register_configuration_transport(
+            &state,
+            &principal,
+            &openshell_core::proto::SupervisorHello {
+                sandbox_id: "registered-sandbox".to_string(),
+                instance_id: "stale-control".to_string(),
+                ..Default::default()
+            },
+            "stale-transport".to_string(),
+            stale_tx,
+            make_shutdown(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("registered-sandbox", "current-transport")
+        );
+        assert!(matches!(
+            current_shutdown_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

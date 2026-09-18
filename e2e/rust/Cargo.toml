@@ -38,6 +38,11 @@ e2e-oidc-pkce = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
+name = "configuration_composition_acceptance"
+path = "tests/configuration_composition_acceptance.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "policy_activation"
 path = "tests/policy_activation.rs"
 required-features = ["e2e-docker"]

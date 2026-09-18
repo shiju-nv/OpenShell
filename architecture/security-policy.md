@@ -1,9 +1,6 @@
 # Security Policy
 
-OpenShell policy defines what a sandboxed agent can access. The policy is
-enforced inside each sandbox by kernel controls, process setup, and the local
-policy proxy. The gateway stores and delivers policy, but it does not make
-per-request egress decisions.
+OpenShell policy defines what a sandboxed agent can access. The workload boundary enforces kernel and process controls; the isolated supervisor enforces network policy and credential bindings. The gateway stores and delivers configuration, but it does not make per-request egress decisions.
 
 For the field-by-field YAML reference, use
 [Policy Schema Reference](../docs/reference/policy-schema.mdx).
@@ -13,33 +10,26 @@ For the field-by-field YAML reference, use
 | Area | Enforcement |
 |---|---|
 | Filesystem | Landlock restricts read-only and read-write paths. |
-| Process | The supervisor launches the agent as an unprivileged user with reduced capabilities. |
+| Process | The boundary launches the agent with the admitted non-root identity and zero capabilities. |
 | Network | The proxy evaluates destination, port, calling binary, and optional L7 rules. |
 | Provider access | Attached provider profiles contribute endpoint and binary rules; credentials remain bound to profile-authorized endpoints. |
 | Runtime settings | Typed settings are delivered with policy and can be global or sandbox scoped. |
 
-Filesystem and process policy are startup-time controls. Network policy is
-dynamic and can be hot-reloaded when the new policy validates successfully.
+Filesystem and process policy are startup controls. A rejected initial configuration may be repaired only while durable state proves that no workload release has been authorized. The first release authorization locks static policy before the workload may run. Network policy remains dynamic and is installed with the matching provider state.
 
 ### Authored policy boundary
 
-`openshell-policy-schema` is the sole owner of the authored YAML and JSON
-representation. It preserves authored distinctions such as an absent
-`filesystem_policy` versus an explicitly empty object, rejects duplicate keys,
-and applies parser budgets while noyalib constructs the document. It also owns
-pure language semantics such as access presets, MCP revision vocabulary,
-effective ports and rule names, protocol classification, and lexical policy
-path normalization.
+`openshell-policy-schema` owns the authored YAML and JSON representation, bounded decoding, and pure language semantics such as access presets, MCP revision vocabulary, effective ports and rule names, protocol classification, and lexical path normalization. It preserves field presence, including the difference between an omitted filesystem section and a present empty object. `openshell-policy` owns protobuf conversion, composition, merge behavior, and validation that depends on runtime components.
 
-Consumers project that syntax into purpose-specific models. `openshell-policy`
-owns protobuf conversion, composition, merge behavior, raw-protobuf checks, and
-validation that depends on runtime components. Both the proposal-risk prover and
-standalone containment checker project the shared schema into their own models
-using the same fail-closed parser as the runtime. The parser
-requires `version: 1` and rejects managed annotations and every unknown field
-before any consumer-specific projection runs. There is no permissive parsing
-profile: unsupported policy fields always invalidate the document. Middleware `config`, query and persisted-query names, and recursive MCP
-parameter names are open user-data maps rather than schema extensions.
+Both the proposal-risk prover and standalone containment checker use the schema's `RuntimeStrict` profile, which requires `version: 1` and rejects managed annotations and unknown fields in closed schema objects. The schema also exposes `ContainmentInput`, which retains managed metadata, review annotations, and unknown closed-object fields for a consumer support audit; it does not make those fields supported by either prover entrypoint. Both profiles require the known field types. Middleware configuration, query names, persisted-query names, and recursive MCP parameter names are open user-data namespaces. Recognizing a parameter shape in the schema does not imply that every protocol supports that matcher at runtime.
+
+### OPA runtime data
+
+The same schema crate supplies the bounded raw decoder used by OPA string, byte-reader, and file loading. Input budgets apply while the parser constructs the document; reader allocation is bounded before decoding, and regular-file loading also checks metadata. Duplicate and merge keys are rejected. The policy reference documents the byte, nesting, collection, scalar, and alias limits.
+
+Raw OPA data has a separate runtime contract. It can omit `version`, retain unrelated application data at the root, and carry lowered protocol fields, explicit matcher objects, binary-resolution entries, and endpoint provenance. The loader validates governed policy sections through a separate canonical-schema projection while retaining the original runtime data. Closed governed objects reject unknown keys, malformed scalars, positional arrays, and explicit nulls. A missing filesystem section enables `include_workdir`; a present empty section disables it. Validation does not derive credential provenance or let input override the trusted runtime binary-identity setting. Custom Rego output has its own evaluation contract; these checks validate the supplied data document.
+
+After L7 validation, the loader converts nonempty string query and MCP parameter matchers to explicit `glob` objects, including tool aliases and deny rules. Matchers supported by YAML and protobuf expose the same runtime representation. Existing `glob` and `any` matchers retain their values, and normalization preserves endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
 
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
@@ -191,43 +181,23 @@ Denials emit both the relevant network activity and a detection finding. Events
 identify only the destination, policy, traffic surface, and controlled denial reason; they never include
 credential names, placeholders, body content, or secret values.
 
-Credential provenance is gateway-derived and deliberately absent from the policy
-YAML schema, so it does not survive a policy that never transits the gateway.
-Gateway-delivered policy is the authoritative source for this control, and a
-policy without provenance applies neither the raw-tunnel refusal nor the
-WebSocket binary-frame refusal. The request-body backstop still applies, because
-it keys off the presence of a secret resolver rather than endpoint provenance.
+Credential provenance is gateway-derived and deliberately absent from the authored policy schema. The raw OPA loader preserves supplied runtime provenance but does not derive it for an unstamped policy. Gateway-delivered policy supplies the authoritative provenance for managed sandboxes. A policy without provenance applies neither the raw-tunnel refusal nor the WebSocket binary-frame refusal. The request-body backstop still applies because it keys off the presence of a secret resolver rather than endpoint provenance.
 
-Two supervisor-local paths load a policy without provenance. A supervisor
-booting from an explicitly provisioned policy file has a bounded window before
-that policy is resynchronized to the gateway, which then serves a stamped
-effective policy. An explicit supervisor Rego and data override is permanent,
-because gateway revisions are observed for settings and providers but never
-replace the local policy. Workload-image files and environment variables cannot
-configure the separately isolated supervisor. When a supervisor override is
-combined with injected provider credentials, the supervisor emits a
-high-severity detection finding at startup naming the inactive controls.
+Gateway-managed startup composes and validates image policy through the gateway before workload release, so the installed effective policy includes gateway provenance. Combining a local Rego/data override with a gateway-managed sandbox is rejected. Standalone local-file use can load unstamped data and therefore lacks controls that require gateway-derived provenance. Workload-image files and environment variables cannot configure the separately isolated supervisor.
 
 ## Policy Load Diagnostics
 
-`OpaEngine` bounds the error messages returned when loading or reloading policy from files, strings, or protobuf. Each message contains at most eight error items and 512 UTF-8 bytes, including its heading, separators, and any `additional violations omitted` marker. The loader reports complete, fixed categories and discards authored names, values, paths, source snippets, and nested error chains.
+`OpaEngine` bounds returned load and reload errors from files, readers, strings, and protobuf. Each message contains at most eight error items and 512 UTF-8 bytes, including the heading, separators, and any `additional violations omitted` marker. The loader uses fixed categories and schema locations, omitting policy names, values, paths, source snippets, and nested error chains.
 
-Typed validation categories distinguish process identity, filesystem paths and limits, Landlock compatibility, endpoint hosts and ports, credential signing and rewriting, MCP configuration, and middleware configuration. Opaque L7 errors identify the protocol-configuration or policy-validation stage; endpoint conflicts report ambiguous selectors. YAML errors retain a fixed parser category and numeric line and column when available. File I/O, Rego loading, and internal policy-data errors use fixed messages.
+Typed categories identify process, filesystem, Landlock, endpoint, credential, MCP, and middleware validation failures. Shared raw-schema failures identify a fixed schema location and category. Opaque L7 errors identify the protocol-configuration or policy-validation stage; endpoint conflicts report ambiguous selectors. Parser errors retain a fixed category and numeric line and column when available. File I/O, Rego loading, and internal policy-data failures use fixed messages.
 
-A candidate rejected during validation does not replace the active engine or advance its generation. The supervisor separately applies `policy_validation_failure_mode` and may publish a quarantine generation as described below. The diagnostic bounds cover returned OPA load errors; accepted-policy warnings, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting contracts.
+A rejected engine reload leaves that engine's installed policy, generation, and decisions unchanged. The supervisor then applies its configured rejection posture and workload hold rules described below. These bounds cover returned OPA load errors; accepted-policy warnings, runtime request diagnostics, and gateway-authored policy parser messages have separate reporting contracts.
 
 ## Live Updates
 
-The gateway stores sandbox-authored policy revisions separately from derived
-effective sandbox configuration. Effective configuration can include
-gateway-global policy overrides and provider-profile policy layers. The
-supervisor polls for config revisions and attempts to load new dynamic policy
-into the in-process OPA engine; CLI reads of the latest sandbox policy use the
-same effective configuration path.
+The gateway stores sandbox-authored policy revisions separately from effective configuration, which can include gateway-global overrides and provider-profile layers. An authenticated control poll issues an immutable delivered snapshot of the selected policy, settings, and provider revision. Later changes become desired at the next poll. Observer reads show desired policy and do not prove that the runtime installed it.
 
 The OPA loader checks the object and list shapes of raw policy data before injecting runtime fields, normalizing values, or expanding access presets. It rejects the first malformed container with a fixed structural error that excludes authored keys and values. This check preserves valid versionless OPA data and runtime-only fields. A rejected OPA engine reload leaves that engine's installed policy, generation, and decisions unchanged; the supervisor separately applies its configured runtime rejection mode.
-
-After validating L7 rules, the OPA loader converts nonempty string query and MCP parameter matchers into explicit `glob` objects, including MCP `tool` aliases and deny rules. Matchers representable in both YAML and protobuf therefore expose the same representation to endpoint configuration consumers. Already lowered `glob` and `any` matchers retain their values across reloads; normalization preserves runtime endpoint provenance. Empty scalar query matchers remain an OPA-only form because Rego gives them different behavior from empty `glob` objects.
 
 An explicitly supplied MCP rule `params` value must be a map in both allow and deny rules. Omit the field when using only the `tool` alias; `params: null` is rejected before alias lowering. A rejected raw policy reload preserves the active evaluator and its generation.
 
@@ -256,20 +226,9 @@ boundary for startup, concurrent changes, and sources outside those mutations.
 
 L7 allow and deny append operations carry an explicit rule target and the complete affected binary and port scope. The merge engine resolves one non-provider endpoint within that rule, optionally by exact endpoint path, and compares both scope sets before mutation. A partial declaration, ambiguous target, or changed scope rejects the batch before revision persistence. The declaration records operator intent; it does not grant policy-writing authority or change the stored binary and port sets.
 
-The `[openshell.gateway] policy_validation_failure_mode` configuration controls
-candidates rejected by supervisor runtime validation. Gateway preflight
-rejections never become generations and leave the active policy unchanged. The
-runtime mode defaults to `fail_closed`, which publishes a quarantine generation,
-denies new egress, invalidates existing relays, and leaves the previous policy
-inactive. Operators may explicitly select
-`retain_last_valid`, which keeps the previous generation active. With no
-previous valid generation, the effective mode remains `fail_closed` regardless
-of the configured mode. The gateway distributes this startup configuration to
-sandbox supervisors with each effective policy snapshot. OCSF configuration and finding events state the
-candidate version, validation rationale, configured and effective modes, active
-generation, and whether the previous policy is active. Static controls,
-such as filesystem allowlists and process identity, require a new sandbox
-because they are applied before the child process starts.
+The supervisor prepares policy, middleware and matching provider credentials before publication. It stages the boundary environment while the workload is frozen and new exec is blocked, publishes the matching control generation, and commits the boundary installation without resuming execution. Gateway acceptance authorizes release; only an exact release response and final activation report restore readiness and mark the policy loaded. Provider-only updates use the same path. Confirmation or reconnection alone cannot release a workload.
+
+The `[openshell.gateway] policy_validation_failure_mode` setting controls rejected runtime candidates. Gateway preflight rejections leave the active configuration unchanged. The default `fail_closed` holds the workload and readiness, denies new egress, and invalidates old relays until a valid configuration activates. `retain_last_valid` can keep or restore only a previously accepted configuration whose installation is still known for the same boundary. It never authorizes mixed policy and credentials, uncertain commits, or an initial startup fallback. The gateway distributes this posture with effective snapshots; configuration and finding events identify the rejection and effective posture. After first release authorization, static controls require a new sandbox.
 
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.

@@ -410,6 +410,34 @@ impl ProviderCredentialState {
         inner.current = Arc::new(env);
     }
 
+    /// Apply live environment suppression before publishing this prepared snapshot.
+    ///
+    /// The installation ID names the exact child environment. Preserve it when
+    /// suppression changes no bytes, and replace it when a key is removed. A
+    /// later concurrent suppression is detected again during installation.
+    pub fn inherit_suppressed_environment_keys(&self, live: &Self) {
+        let suppressed = live
+            .inner
+            .read()
+            .expect("provider credential state poisoned")
+            .suppressed_keys
+            .clone();
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+        let mut snapshot = (*inner.current).clone();
+        let prior_len = snapshot.child_env.len();
+        for key in &suppressed {
+            snapshot.child_env.remove(key);
+        }
+        inner.suppressed_keys.extend(suppressed);
+        if snapshot.child_env.len() != prior_len {
+            snapshot.installation_id = uuid::Uuid::new_v4().to_string();
+            inner.current = Arc::new(snapshot);
+        }
+    }
+
     /// Return `child_env` with GCP static config vars resolved to real values.
     ///
     /// The credential pipeline placeholderizes ALL env values, but GCP SDKs
@@ -738,7 +766,15 @@ impl ProviderCredentialState {
     pub fn install_prepared(&self, prepared: &Self) -> usize {
         // Release the candidate lock before taking the live lock, including
         // when a caller passes another handle to the same state.
-        let (snapshot, generations, current_resolver, bindings, non_secret_keys) = {
+        let (
+            snapshot,
+            generations,
+            current_resolver,
+            bindings,
+            non_secret_keys,
+            body_inventory_available,
+            known_body_keys,
+        ) = {
             let candidate = prepared
                 .inner
                 .read()
@@ -749,6 +785,8 @@ impl ProviderCredentialState {
                 candidate.current_resolver.clone(),
                 candidate.static_credential_bindings.clone(),
                 candidate.non_secret_environment_keys.clone(),
+                candidate.body_inventory_available,
+                candidate.known_body_keys.clone(),
             )
         };
         let mut inner = self
@@ -756,8 +794,15 @@ impl ProviderCredentialState {
             .write()
             .expect("provider credential state poisoned");
         let mut snapshot = snapshot;
+        let prepared_len = snapshot.child_env.len();
         for key in &inner.suppressed_keys {
             snapshot.child_env.remove(key);
+        }
+        if snapshot.child_env.len() != prepared_len {
+            // A boundary receipt for the prepared bytes cannot acknowledge an
+            // environment changed by suppression after preparation. Consumers
+            // must hold activation until this new identity is installed.
+            snapshot.installation_id = uuid::Uuid::new_v4().to_string();
         }
         if static_credential_identities(&inner.static_credential_bindings)
             != static_credential_identities(&bindings)
@@ -781,10 +826,10 @@ impl ProviderCredentialState {
         );
         inner.static_credential_bindings = bindings;
         inner.non_secret_environment_keys = non_secret_keys;
-        inner.body_inventory_available = true;
-        inner
-            .known_body_keys
-            .extend(snapshot.child_env.keys().cloned());
+        // A repaired inventory must classify both new and previously issued
+        // placeholders, including removed non-secret provider configuration.
+        inner.body_inventory_available = body_inventory_available;
+        inner.known_body_keys.extend(known_body_keys);
         inner.current = Arc::new(snapshot);
         inner.current.child_env.len()
     }
@@ -2430,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_install_retains_placeholders_for_same_provider_identity() {
+    fn configuration_activation_prepared_install_retains_provider_identity() {
         let make_state = |revision, secret: &str| {
             ProviderCredentialState::from_bound_environment(
                 revision,
@@ -2509,13 +2554,119 @@ mod tests {
         let old_placeholder = live.snapshot().child_env["API_KEY"].clone();
         live.remove_env_key("API_KEY");
         let candidate = make_state(2, "second:API_KEY", "second-secret");
+        let prepared_id = candidate.snapshot().installation_id.clone();
         live.install_prepared(&candidate);
         assert_eq!(observer.snapshot().revision, 2);
         assert!(!observer.snapshot().child_env.contains_key("API_KEY"));
+        assert_ne!(observer.snapshot().installation_id, prepared_id);
         let resolver = observer
             .resolver_for_endpoint("api.example.com", 443, "/")
             .unwrap();
         assert!(resolver.resolve_placeholder(&old_placeholder).is_none());
+    }
+
+    #[test]
+    fn configuration_activation_prepared_suppression_preserves_exact_installation() {
+        let environment = || {
+            ProviderCredentialState::from_environment(
+                1,
+                HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
+        let live = environment();
+        live.remove_env_key("API_KEY");
+        let prepared = environment();
+        let original = prepared.snapshot().installation_id.clone();
+        prepared.inherit_suppressed_environment_keys(&live);
+        let suppressed = prepared.snapshot();
+        assert!(!suppressed.child_env.contains_key("API_KEY"));
+        assert_ne!(suppressed.installation_id, original);
+        prepared.inherit_suppressed_environment_keys(&live);
+        assert_eq!(
+            prepared.snapshot().installation_id,
+            suppressed.installation_id
+        );
+        live.install_prepared(&prepared);
+        assert_eq!(live.snapshot().installation_id, suppressed.installation_id);
+        assert_eq!(live.snapshot().child_env, suppressed.child_env);
+    }
+
+    #[test]
+    fn configuration_activation_prepared_install_repairs_body_inventory() {
+        use crate::secrets::body::BodyCredentialError;
+
+        let make_state = |revision, key: &str| {
+            ProviderCredentialState::from_bound_environment(
+                revision,
+                HashMap::from([(key.to_string(), "provider-region".to_string())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                vec![key.to_string()],
+            )
+            .unwrap()
+        };
+        let live = make_state(1, "OLD_REGION");
+        let old_placeholder = live.snapshot().child_env["OLD_REGION"].clone();
+        live.revoke_static_provider_environment(2);
+        assert!(
+            live.resolver_and_body_classifier_for_endpoint("api.example.com", 443, "/")
+                .1
+                .is_none()
+        );
+
+        let prepared = ProviderCredentialState::from_bound_environment(
+            3,
+            HashMap::from([
+                ("NEW_REGION".to_string(), "provider-region".to_string()),
+                ("API_KEY".to_string(), "new-secret".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "API_KEY".to_string(),
+                binding("api.example.com", 443, "/**"),
+            )]),
+            vec!["NEW_REGION".to_string()],
+        )
+        .unwrap();
+        let new_placeholder = prepared.snapshot().child_env["API_KEY"].clone();
+        let config_placeholder = prepared.snapshot().child_env["NEW_REGION"].clone();
+        live.install_prepared(&prepared);
+        let (_, classifier, revision) =
+            live.resolver_and_body_classifier_for_endpoint("api.example.com", 443, "/");
+        let classifier = classifier.unwrap();
+        assert_eq!(revision, 3);
+        assert_eq!(classifier.check(&new_placeholder), Ok(()));
+        assert_eq!(
+            classifier.check(&old_placeholder),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+
+        let empty = ProviderCredentialState::from_bound_environment(
+            4,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        live.install_prepared(&empty);
+        let classifier = live
+            .resolver_and_body_classifier_for_endpoint("api.example.com", 443, "/")
+            .1
+            .unwrap();
+        assert_eq!(
+            classifier.check(&new_placeholder),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
+        assert_eq!(
+            classifier.check(&config_placeholder),
+            Err(BodyCredentialError::KnownUnavailable)
+        );
     }
 
     #[test]

@@ -111,6 +111,9 @@ impl ProviderReadinessEvidence {
         {
             return Err(Status::invalid_argument("invalid policy fingerprint"));
         }
+        if !observation.provider_env_installation_id.is_empty() {
+            canonical_uuid(&observation.provider_env_installation_id)?;
+        }
         if observation.launch_environment_installed && observation.process_instance_id.is_empty() {
             return Err(Status::invalid_argument(
                 "process instance identity is required",
@@ -402,6 +405,19 @@ pub(super) async fn handle_get_sandbox_provider_status(
         .status
         .as_ref()
         .map_or("", |status| status.main_process_instance_id.as_str());
+    let confirmed_installation_id = active_sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .filter(|admission| {
+            admission.activation_confirmed
+                && admission.state
+                    == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+                && admission.instance_id == active_instance_id
+        })
+        .map_or("", |admission| {
+            admission.provider_env_installation_id.as_str()
+        });
     let session = state
         .supervisor_sessions
         .provider_readiness(sandbox.object_id())?;
@@ -411,7 +427,10 @@ pub(super) async fn handle_get_sandbox_provider_status(
         &current,
         current_reason,
         active_sandbox.phase() == SandboxPhase::Ready as i32,
-        active_instance_id,
+        ActiveProviderInstallation {
+            control_instance_id: active_instance_id,
+            environment_id: confirmed_installation_id,
+        },
         session.as_ref(),
     )?;
     config_update_operation::observe_provider_status(state.store.as_ref(), &mut status).await?;
@@ -443,13 +462,19 @@ fn failure_state(reason: ProviderReadinessReason) -> ProviderReadinessState {
     }
 }
 
+/// Durable control and environment identity that an independent report must match.
+struct ActiveProviderInstallation<'a> {
+    control_instance_id: &'a str,
+    environment_id: &'a str,
+}
+
 fn evaluate_status(
     receipt: ProviderMutationReceipt,
     snapshot_reason: ProviderReadinessReason,
     current: &ProviderDesiredIdentity,
     current_reason: ProviderReadinessReason,
     running: bool,
-    active_instance_id: &str,
+    active_installation: ActiveProviderInstallation<'_>,
     session: Option<&ProviderReadinessEvidence>,
 ) -> Result<ProviderReadinessStatus, Status> {
     let mut status = ProviderReadinessStatus {
@@ -497,7 +522,7 @@ fn evaluate_status(
             ProviderReadinessReason::SupervisorDisconnected,
         );
     } else if let Some(session) = session {
-        if !session.belongs_to_instance(active_instance_id) {
+        if !session.belongs_to_instance(active_installation.control_instance_id) {
             set(
                 &mut status,
                 ProviderReadinessState::Pending,
@@ -530,6 +555,17 @@ fn evaluate_status(
                 );
             } else if reason != ProviderReadinessReason::Unspecified {
                 set(&mut status, failure_state(reason), reason);
+            } else if active_installation.environment_id.is_empty()
+                || observation.provider_env_installation_id != active_installation.environment_id
+            {
+                // A repaired local publication can reuse every logical revision.
+                // Configuration confirmation alone must not reuse installation
+                // evidence from the previous publication in this live session.
+                set(
+                    &mut status,
+                    ProviderReadinessState::Pending,
+                    ProviderReadinessReason::WaitingForProcess,
+                );
             } else if !observation.credentials_installed {
                 set(
                     &mut status,

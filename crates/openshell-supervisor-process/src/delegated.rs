@@ -76,8 +76,12 @@ impl Drop for BoundaryAccess {
 
 /// Start the supervisor access plane using sandbox-supplied exec and
 /// loopback-forwarding capabilities.
+///
+/// The caller supplies the same control instance registered for configuration
+/// admission and boundary attachment so lifecycle reports cannot cross instances.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_boundary_access(
+    instance_id: String,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<&str>,
@@ -88,7 +92,6 @@ pub async fn start_boundary_access(
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
 ) -> Result<BoundaryAccess> {
-    let instance_id = uuid::Uuid::new_v4().to_string();
     let terminating = Arc::new(AtomicBool::new(false));
     let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
         return Ok(BoundaryAccess {

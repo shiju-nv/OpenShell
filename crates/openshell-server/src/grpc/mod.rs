@@ -280,7 +280,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        Box::pin(mutation_replay::run(&self.state, request)).await
     }
 
     async fn begin_rootfs_tar_staging(

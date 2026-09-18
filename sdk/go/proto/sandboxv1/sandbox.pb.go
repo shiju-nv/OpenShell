@@ -1658,9 +1658,12 @@ func (x *NetworkBinary) GetPath() string {
 type GetSandboxConfigRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The sandbox ID.
-	SandboxId     string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// Nonempty only for an authoritative poll by the registered control process.
+	// Empty observer requests never replace the delivered activation snapshot.
+	ConfigurationInstanceId string `protobuf:"bytes,2,opt,name=configuration_instance_id,json=configurationInstanceId,proto3" json:"configuration_instance_id,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigRequest) Reset() {
@@ -1696,6 +1699,13 @@ func (*GetSandboxConfigRequest) Descriptor() ([]byte, []int) {
 func (x *GetSandboxConfigRequest) GetSandboxId() string {
 	if x != nil {
 		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *GetSandboxConfigRequest) GetConfigurationInstanceId() string {
+	if x != nil {
+		return x.ConfigurationInstanceId
 	}
 	return ""
 }
@@ -2006,9 +2016,14 @@ type GetSandboxConfigResponse struct {
 	// Bounded, credential-free admission diagnostic. Empty for admitted policy.
 	ConfigurationError string `protobuf:"bytes,16,opt,name=configuration_error,json=configurationError,proto3" json:"configuration_error,omitempty"`
 	// Registration fence for a new supervisor; capture once and retain on retry.
-	ConfigurationInstanceId string `protobuf:"bytes,15,opt,name=configuration_instance_id,json=configurationInstanceId,proto3" json:"configuration_instance_id,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	ConfigurationInstanceId           string `protobuf:"bytes,15,opt,name=configuration_instance_id,json=configurationInstanceId,proto3" json:"configuration_instance_id,omitempty"`
+	RuntimeGeneration                 string `protobuf:"bytes,17,opt,name=runtime_generation,json=runtimeGeneration,proto3" json:"runtime_generation,omitempty"`
+	ConfigurationBoundaryInstanceId   string `protobuf:"bytes,18,opt,name=configuration_boundary_instance_id,json=configurationBoundaryInstanceId,proto3" json:"configuration_boundary_instance_id,omitempty"`
+	ConfigurationSnapshot             string `protobuf:"bytes,19,opt,name=configuration_snapshot,json=configurationSnapshot,proto3" json:"configuration_snapshot,omitempty"`
+	ConfigurationRegistrationRevision uint64 `protobuf:"varint,20,opt,name=configuration_registration_revision,json=configurationRegistrationRevision,proto3" json:"configuration_registration_revision,omitempty"`
+	ConfigurationDeliveryRevision     uint64 `protobuf:"varint,21,opt,name=configuration_delivery_revision,json=configurationDeliveryRevision,proto3" json:"configuration_delivery_revision,omitempty"`
+	unknownFields                     protoimpl.UnknownFields
+	sizeCache                         protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigResponse) Reset() {
@@ -2151,6 +2166,41 @@ func (x *GetSandboxConfigResponse) GetConfigurationInstanceId() string {
 		return x.ConfigurationInstanceId
 	}
 	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetRuntimeGeneration() string {
+	if x != nil {
+		return x.RuntimeGeneration
+	}
+	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationBoundaryInstanceId() string {
+	if x != nil {
+		return x.ConfigurationBoundaryInstanceId
+	}
+	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationSnapshot() string {
+	if x != nil {
+		return x.ConfigurationSnapshot
+	}
+	return ""
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationRegistrationRevision() uint64 {
+	if x != nil {
+		return x.ConfigurationRegistrationRevision
+	}
+	return 0
+}
+
+func (x *GetSandboxConfigResponse) GetConfigurationDeliveryRevision() uint64 {
+	if x != nil {
+		return x.ConfigurationDeliveryRevision
+	}
+	return 0
 }
 
 // Connection details for one operator-registered supervisor middleware service.
@@ -2394,10 +2444,11 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"2\n" +
 	"\rNetworkBinary\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"8\n" +
+	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"t\n" +
 	"\x17GetSandboxConfigRequest\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x19\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12:\n" +
+	"\x19configuration_instance_id\x18\x02 \x01(\tR\x17configurationInstanceId\"\x19\n" +
 	"\x17GetGatewayConfigRequest\"\x82\x02\n" +
 	"\x18GetGatewayConfigResponse\x12X\n" +
 	"\bsettings\x18\x01 \x03(\v2<.openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +
@@ -2415,7 +2466,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\"\x86\x01\n" +
 	"\x10EffectiveSetting\x128\n" +
 	"\x05value\x18\x01 \x01(\v2\".openshell.sandbox.v1.SettingValueR\x05value\x128\n" +
-	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xb1\b\n" +
+	"\x05scope\x18\x02 \x01(\x0e2\".openshell.sandbox.v1.SettingScopeR\x05scope\"\xfc\n" +
+	"\n" +
 	"\x18GetSandboxConfigResponse\x12;\n" +
 	"\x06policy\x18\x01 \x01(\v2#.openshell.sandbox.v1.SandboxPolicyR\x06policy\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\rR\aversion\x12\x1f\n" +
@@ -2434,7 +2486,12 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x19provider_attachment_epoch\x18\x0e \x01(\tR\x17providerAttachmentEpoch\x125\n" +
 	"\x16configuration_admitted\x18\r \x01(\bR\x15configurationAdmitted\x12/\n" +
 	"\x13configuration_error\x18\x10 \x01(\tR\x12configurationError\x12:\n" +
-	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x1ac\n" +
+	"\x19configuration_instance_id\x18\x0f \x01(\tR\x17configurationInstanceId\x12-\n" +
+	"\x12runtime_generation\x18\x11 \x01(\tR\x11runtimeGeneration\x12K\n" +
+	"\"configuration_boundary_instance_id\x18\x12 \x01(\tR\x1fconfigurationBoundaryInstanceId\x125\n" +
+	"\x16configuration_snapshot\x18\x13 \x01(\tR\x15configurationSnapshot\x12N\n" +
+	"#configuration_registration_revision\x18\x14 \x01(\x04R!configurationRegistrationRevision\x12F\n" +
+	"\x1fconfiguration_delivery_revision\x18\x15 \x01(\x04R\x1dconfigurationDeliveryRevision\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
 	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +

@@ -319,6 +319,7 @@ fn completion(
                 || !observed.policy_active
                 || !observed.launch_environment_installed
                 || observed.process_instance_id.is_empty()
+                || observed.provider_env_installation_id.is_empty()
                 || observed.session_id.is_empty()
                 || status.network_instance_id.is_empty()
                 || (status.state == ProviderReadinessState::Revoked as i32)
@@ -464,6 +465,7 @@ mod tests {
                 policy_active: true,
                 launch_environment_installed: true,
                 process_instance_id: Uuid::new_v4().to_string(),
+                provider_env_installation_id: Uuid::new_v4().to_string(),
                 reason: ProviderReadinessReason::Unspecified.into(),
             }),
             ..Default::default()
@@ -642,6 +644,18 @@ mod tests {
             .unwrap()
             .launch_environment_installed = false;
         assert!(observe_provider_status(&store, &mut partial).await.is_err());
+        let mut missing_installation = ready(&receipt);
+        missing_installation
+            .observed
+            .as_mut()
+            .unwrap()
+            .provider_env_installation_id
+            .clear();
+        assert!(
+            observe_provider_status(&store, &mut missing_installation)
+                .await
+                .is_err()
+        );
         assert_eq!(
             get_provider_operation(&store, &receipt.receipt_id, "default")
                 .await
