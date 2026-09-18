@@ -537,6 +537,26 @@ class Runner:
                 self.tree = candidate_tree
                 guard(self.worktree, self.manifest, candidate_tree)
 
+    def lint(self):
+        """Complete workspace lint after a prior run stopped before all targets."""
+        self.checks(
+            [
+                (
+                    "clippy-workspace",
+                    [
+                        "cargo",
+                        "clippy",
+                        "--locked",
+                        "--workspace",
+                        "--all-targets",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                )
+            ]
+        )
+
     def broad(self):
         """Run the explicit Linux Rust gate scope, retaining each independent failure."""
         standalone = [
@@ -684,7 +704,7 @@ class Runner:
 def main():
     """Keep failed and interrupted attempts distinct from completed qualification."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=["focused", "broad"], required=True)
+    parser.add_argument("--phase", choices=["focused", "broad", "lint"], required=True)
     for option in ("worktree", "bundle", "output"):
         parser.add_argument("--" + option, type=Path, required=True)
     args = parser.parse_args()
