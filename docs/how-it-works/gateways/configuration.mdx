@@ -63,7 +63,7 @@ version = 2
 # ... credential-driver-specific settings ...
 ```
 
-The gateway selector is `compute_driver = "<driver>"`. It accepts one scalar driver name. Omit it to retain auto-detection.
+The gateway selector is `compute_driver = "<driver>"`. It accepts one scalar driver name. Omit it to retain auto-detection. At startup the gateway logs whether the driver was configured or auto-detected, and when it was auto-detected, which drivers were detected and which are installed. The VM driver has no detection probe, so it appears only in the installed list; select it with `compute_driver = "vm"`.
 
 ## Migrate to schema version 2
 

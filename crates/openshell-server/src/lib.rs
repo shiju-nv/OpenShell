@@ -1364,6 +1364,26 @@ impl ComputeDriverSelection {
                 .expect("auto-detected selection has an available driver"),
         }
     }
+
+    /// Describe how the driver was chosen, for the startup log.
+    ///
+    /// Auto-detection picks the first driver whose probe succeeds, and a driver
+    /// with no probe, such as the VM driver, can never be detected. The text
+    /// therefore lists every installed driver as well as the detected ones, so
+    /// an operator can see what to configure. It holds driver names only; no
+    /// configuration values reach the log.
+    fn describe(&self, installed: &[&str]) -> String {
+        match self {
+            Self::Configured { .. } => "configured".to_owned(),
+            Self::AutoDetected(detection) => format!(
+                "auto-detected (detected: {}; installed: {}); set compute_driver in \
+                 gateway.toml, --compute-driver, or OPENSHELL_COMPUTE_DRIVER to choose \
+                 another driver",
+                detection.available.join(", "),
+                installed.join(", "),
+            ),
+        }
+    }
 }
 
 impl ComputeDriverRegistry {
@@ -1611,7 +1631,12 @@ async fn build_compute_runtime(
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     let admission =
         compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
-    info!(driver = %driver.name(), "Using compute driver");
+    let installed: Vec<&str> = registry.installed_driver_names().collect();
+    info!(
+        driver = %driver.name(),
+        selection = %selection.describe(&installed),
+        "Using compute driver"
+    );
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let build_context = ComputeDriverBuildContext {
@@ -2401,6 +2426,54 @@ mod tests {
             "plaintext service HTTP must not return a successful gRPC response: {response:?}"
         );
         stop_listener(shutdown, handle).await;
+    }
+
+    #[test]
+    fn selection_description_lists_detected_and_installed_drivers_when_auto_detected() {
+        let selection =
+            super::ComputeDriverSelection::AutoDetected(super::ComputeDriverDetection {
+                available: vec!["docker".to_owned(), "podman".to_owned()],
+            });
+
+        let text = selection.describe(&["docker", "kubernetes", "podman", "vm"]);
+
+        assert!(text.starts_with("auto-detected"), "{text}");
+        assert!(text.contains("detected: docker, podman;"), "{text}");
+        assert!(
+            text.contains("installed: docker, kubernetes, podman, vm)"),
+            "{text}"
+        );
+        for setting in [
+            "compute_driver",
+            "--compute-driver",
+            "OPENSHELL_COMPUTE_DRIVER",
+        ] {
+            assert!(text.contains(setting), "{setting} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn selection_description_names_drivers_that_detection_cannot_find() {
+        let selection =
+            super::ComputeDriverSelection::AutoDetected(super::ComputeDriverDetection {
+                available: vec!["docker".to_owned()],
+            });
+
+        let text = selection.describe(&["docker", "vm"]);
+
+        assert!(text.contains("detected: docker;"), "{text}");
+        assert!(text.contains("installed: docker, vm)"), "{text}");
+    }
+
+    #[test]
+    fn selection_description_reports_a_configured_driver_as_configured() {
+        let selection = super::ComputeDriverSelection::Configured {
+            name: "vm".to_owned(),
+        };
+
+        let text = selection.describe(&["docker", "vm"]);
+
+        assert_eq!(text, "configured");
     }
 
     #[test]
