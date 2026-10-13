@@ -479,18 +479,21 @@ pub enum ConfigFileError {
 
 const CONFIG_MIGRATION_URL: &str = "https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#migrate-to-schema-version-2";
 
-/// Stable package-preflight failure with no configuration contents attached.
+/// Stable package-preflight failure that never echoes configuration values.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "gateway config preflight failed: path='{}' category={} detected_version={}; the file was preserved unchanged; migrate it before restarting the gateway: {CONFIG_MIGRATION_URL}",
+    "gateway config preflight failed: path='{}' category={} detected_version={}{}; the file was preserved unchanged; migrate it before restarting the gateway: {CONFIG_MIGRATION_URL}",
     path.display(),
     category,
-    detected_version
+    detected_version,
+    unknown_field
 )]
 pub struct ConfigPreflightError {
     path: PathBuf,
     category: &'static str,
     detected_version: String,
+    /// Location of an unknown key, never its value.
+    unknown_field: String,
 }
 
 impl ConfigPreflightError {
@@ -499,6 +502,7 @@ impl ConfigPreflightError {
             path: path.to_path_buf(),
             category: "malformed",
             detected_version: SCHEMA_VERSION.to_string(),
+            unknown_field: String::new(),
         }
     }
 
@@ -665,6 +669,36 @@ fn preflight_error(
         path: path.to_path_buf(),
         category,
         detected_version,
+        unknown_field: String::new(),
+    }
+}
+
+/// Names an unknown key and its line. Quoted keys can hold arbitrary text, so
+/// only a bare key is echoed.
+fn unknown_field(contents: &str, error: &ConfigFileError) -> String {
+    let ConfigFileError::Parse { source, .. } = error else {
+        return String::new();
+    };
+    let Some(span) = source.span() else {
+        return String::new();
+    };
+    let Some(before) = contents.get(..span.start) else {
+        return String::new();
+    };
+    if !source.message().starts_with("unknown field `") {
+        return String::new();
+    }
+    let line = before.matches('\n').count() + 1;
+    match contents.get(span) {
+        Some(key)
+            if !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+        {
+            format!(" unknown_field={key} line={line}")
+        }
+        _ => format!(" unknown_field line={line}"),
     }
 }
 
@@ -692,7 +726,10 @@ pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
             },
         ));
     }
-    parse_and_validate(path, &contents).map_err(|source| preflight_error(path, version, source))
+    parse_and_validate(path, &contents).map_err(|source| ConfigPreflightError {
+        unknown_field: unknown_field(&contents, &source),
+        ..preflight_error(path, version, source)
+    })
 }
 
 /// Load and validate a TOML config file.
@@ -1433,6 +1470,31 @@ ssh_gateway_port = 8080
             assert!(!format!("{error:?}").contains("secret-value"));
             assert!(std::error::Error::source(&error).is_none());
         }
+    }
+
+    #[test]
+    fn preflight_names_unknown_bare_key_without_disclosing_values() {
+        let tmp = write_raw_tmp(
+            "[openshell]\nversion = 2\n\n[openshell.gateway]\nguest_tls_cert = 'secret-value'\n",
+        );
+        let diagnostic = preflight(tmp.path())
+            .expect_err("removed key must fail preflight")
+            .to_string();
+        assert!(diagnostic.contains("category=malformed"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("unknown_field=guest_tls_cert line=5"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("secret-value"), "{diagnostic}");
+
+        // A quoted key can hold arbitrary text, so only its line is reported.
+        let tmp =
+            write_raw_tmp("[openshell]\nversion = 2\n[openshell.gateway]\n'secret key' = 1\n");
+        let diagnostic = preflight(tmp.path())
+            .expect_err("unknown quoted key must fail preflight")
+            .to_string();
+        assert!(diagnostic.contains("unknown_field line=4"), "{diagnostic}");
+        assert!(!diagnostic.contains("secret"), "{diagnostic}");
     }
 
     #[test]
