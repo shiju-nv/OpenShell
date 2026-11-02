@@ -18,7 +18,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2
+from openshell._proto import openshell_pb2, sandbox_pb2
 from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -2818,10 +2818,16 @@ def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None
     proto.host_key_fingerprint = "SHA256:expected"
     assert _sandbox_ref(proto).host_key_fingerprint == "SHA256:expected"
     assert _sandbox_ref(proto).status.ingress_admission is None
-    proto.status.ingress_admission.scope = 3
+    proto.status.ingress_admission.scope = (
+        sandbox_pb2.INGRESS_SCOPE_SHARED_HOST_LOOPBACK
+    )
     proto.status.ingress_admission.ports.append(8080)
     admission = _sandbox_ref(proto).status.ingress_admission
-    assert admission is not None and admission.ports == (8080,) and admission.scope == 3
+    assert (
+        admission is not None
+        and admission.ports == (8080,)
+        and admission.scope == sandbox_pb2.INGRESS_SCOPE_SHARED_HOST_LOOPBACK
+    )
     proto.status.ingress_admission.ports[0] = 9090
     assert admission.ports == (8080,)
 
