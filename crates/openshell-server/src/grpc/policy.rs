@@ -4657,6 +4657,26 @@ async fn handle_update_config_inner(
             super::persistence_error_to_status(error, "acquire policy mutation lock")
         })?;
     frozen::ensure_mutable_by_id(state.store.as_ref(), &sandbox_id).await?;
+    // Start takes the same mutation lock. Re-read lifecycle and static baseline
+    // after acquiring it so an earlier Stopped observation cannot authorize a
+    // replacement after a new generation has already claimed its grants.
+    let current = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("reload sandbox for policy update failed: {error}"))
+        })?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if current.object_name() != sandbox.object_name()
+        || current.object_workspace() != sandbox.object_workspace()
+    {
+        return Err(Status::aborted(
+            "sandbox scope changed while waiting for policy update; retry explicitly",
+        ));
+    }
+    let sandbox = current;
+    response_annotations = sandbox_metadata_annotations(&sandbox);
     if has_merge_ops {
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -4784,9 +4804,12 @@ async fn handle_update_config_inner(
     }
 
     let startup_blocked = crate::policy_store::permits_initial_static_policy_repair(&sandbox);
-    let should_backfill_policy = if startup_blocked && !sandbox_caller {
-        // No child has consumed static restrictions yet. A complete replacement
-        // must be able to repair every field before the first activation.
+    let stopped_replacement = !sandbox_caller
+        && state.compute.supports_launch_policy()
+        && sandbox.phase() == openshell_core::proto::SandboxPhase::Stopped as i32;
+    let should_backfill_policy = if (startup_blocked || stopped_replacement) && !sandbox_caller {
+        // The initial activation is blocked, or the prior generation is stopped.
+        // Admit a complete replacement before a new workload can consume it.
         true
     } else if let Some(baseline_policy) = spec.policy.as_ref() {
         let comparable_baseline = baseline_policy.clone();
