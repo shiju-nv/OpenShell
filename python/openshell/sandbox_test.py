@@ -2014,6 +2014,7 @@ class _FakeSandboxStub:
     def Health(
         self, request: object, timeout: float | None = None
     ) -> openshell_pb2.HealthResponse:
+        _ = request, timeout
         return openshell_pb2.HealthResponse(
             supports_sampled_resource_budget=self.sampled_budget_ack
         )
@@ -2370,10 +2371,10 @@ def test_sampled_budget_requires_gateway_acknowledgement(template: bool) -> None
     stub = _FakeSandboxStub()
     budget = sandbox_pb2.SampledResourceBudget(resident_bytes=4096)
     if template:
-        client = _template_client_with_fake_stub(stub)
+        template_client = _template_client_with_fake_stub(stub)
 
         def write() -> object:
-            return client.create(
+            return template_client.create(
                 workspace="default", name="budget", sampled_budget=budget
             )
     else:

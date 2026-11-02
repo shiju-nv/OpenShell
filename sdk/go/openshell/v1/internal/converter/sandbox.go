@@ -640,6 +640,7 @@ func resourceDurationToProto(d *types.ResourceDuration) *durationpb.Duration {
 	return &durationpb.Duration{Seconds: d.Seconds, Nanos: d.Nanos}
 }
 
+// SampledBudgetFromProto copies a protobuf budget into the SDK model.
 func SampledBudgetFromProto(b *sb.SampledResourceBudget) *types.SampledResourceBudget {
 	if b == nil {
 		return nil
@@ -651,6 +652,8 @@ func SampledBudgetFromProto(b *sb.SampledResourceBudget) *types.SampledResourceB
 	}
 	return result
 }
+
+// SampledBudgetToProto copies an SDK budget into its protobuf form.
 func SampledBudgetToProto(b *types.SampledResourceBudget) *sb.SampledResourceBudget {
 	if b == nil {
 		return nil
