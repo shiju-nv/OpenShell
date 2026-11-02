@@ -38,7 +38,13 @@ import {
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
-import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import {
+  PolicySource,
+  type SampledResourceBudgetSchema,
+  type SandboxPolicySchema,
+  SettingScope,
+  type SettingValueSchema,
+} from './gen/sandbox_pb.js';
 import { ProviderClient } from './providers.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
@@ -79,9 +85,21 @@ export type {
   SandboxWorkloadTemplate,
   SandboxWorkloadTemplateSpec,
 } from './gen/openshell_pb.js';
-export type { SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
+export type { SampledResourceBudget, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 export type { ConnectOptions };
 export { errorCode };
+
+// Health acknowledges that the gateway preserves sampled fields on writes.
+// It is available to workspace users; driver admission still decides support.
+async function requireSampledBudgetSupport(grpc: Client<typeof OpenShell>): Promise<void> {
+  const health = await grpc.health({});
+  if (!health.supportsSampledResourceBudget) {
+    throw new SdkError(
+      'invalid_config',
+      'gateway does not acknowledge sampled resource budgets; upgrade it before creating this workload',
+    );
+  }
+}
 
 // ---- Curated public types --------------------------------------------------
 
@@ -163,6 +181,8 @@ export interface SandboxSpec {
   environment?: Record<string, string>;
   providers?: string[];
   gpu?: boolean;
+  /** Explicit sampled budgets, distinct from hard CPU and memory quotas. */
+  sampledBudget?: MessageInitShape<typeof SampledResourceBudgetSchema>;
   /** Exact canonical command. Empty selects the gateway scratch shell. */
   command?: string[];
   /** Allocate a retained pseudo-terminal for the canonical command. */
@@ -1117,6 +1137,9 @@ export class SandboxTemplateClient {
     options?: SandboxTemplateWorkspaceOptions | null,
   ): Promise<SandboxWorkloadTemplate> {
     try {
+      if (template.spec?.workload?.resources?.sampledBudget !== undefined) {
+        await requireSampledBudgetSupport(this.grpc);
+      }
       const resp = await this.grpc.createSandboxTemplate({
         workspaceScope: workspaceScope(options),
         template,
@@ -1220,7 +1243,10 @@ export class SandboxClient {
         environment: spec.environment ?? {},
         providers: spec.providers ?? [],
         template: spec.image ? { image: spec.image } : undefined,
-        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+        resourceRequirements:
+          spec.gpu || spec.sampledBudget !== undefined
+            ? { gpu: spec.gpu ? {} : undefined, sampledBudget: spec.sampledBudget }
+            : undefined,
         policy: spec.policy,
         command: spec.command ?? [],
         tty: spec.tty ?? false,
@@ -1228,6 +1254,9 @@ export class SandboxClient {
       };
       if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
 
+      if (specInit.resourceRequirements?.sampledBudget !== undefined) {
+        await requireSampledBudgetSupport(this.grpc);
+      }
       const resp = await this.grpc.createSandbox({
         workspaceScope: workspaceScope(spec),
         name: spec.name ?? '',
@@ -1242,7 +1271,7 @@ export class SandboxClient {
       });
       return sandboxRef(resp.sandbox, resp.serviceUrls);
     } catch (e) {
-      throw fromConnect(e);
+      throw e instanceof SdkError ? e : fromConnect(e);
     }
   }
 
