@@ -160,6 +160,12 @@ fi
 
 echo "==> Checking out ${LIBKRUN_REF}..."
 cd libkrun
+PATCH="${ROOT}/tasks/scripts/vm/patches/libkrun-macos-absolute-firmware.patch"
+# Remove the previous build's uncommitted patch before switching pins.
+if ! git diff --quiet -- src/libkrun/src/lib.rs &&
+    git apply --unidiff-zero --reverse --check "$PATCH" 2>/dev/null; then
+    git apply --unidiff-zero --reverse "$PATCH"
+fi
 git fetch origin --tags
 git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "tags/${LIBKRUN_REF}" 2>/dev/null || {
     echo "Error: Could not checkout ${LIBKRUN_REF}" >&2
@@ -169,6 +175,15 @@ cd ..
 
 LIBKRUN_COMMIT=$(git -C libkrun rev-parse HEAD)
 echo "    Commit: ${LIBKRUN_COMMIT}"
+
+# The pinned libkrun opens firmware by a bare name. Hardened dyld rejects
+# that lookup, so expose a setter for the driver's canonical absolute path.
+if git -C libkrun apply --unidiff-zero --check "$PATCH"; then
+    git -C libkrun apply --unidiff-zero "$PATCH"
+elif ! git -C libkrun apply --unidiff-zero --reverse --check "$PATCH"; then
+    echo "Error: libkrun firmware path patch does not match ${LIBKRUN_COMMIT}" >&2
+    exit 1
+fi
 
 cd libkrun
 

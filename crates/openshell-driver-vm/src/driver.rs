@@ -6,6 +6,9 @@
 #[path = "preparation.rs"]
 mod preparation;
 
+#[path = "image_cache_admin.rs"]
+pub mod image_cache_admin;
+
 #[cfg(test)]
 #[path = "registry_cache_tests.rs"]
 mod registry_cache_tests;
@@ -21,10 +24,10 @@ use crate::lifecycle::{
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
-    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image_with_cleanup,
+    rootfs_image_needs_recovery, sandbox_guest_init_path, sandbox_guest_runtime_identity,
+    sandbox_guest_user_ids_from_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -128,6 +131,8 @@ const REGISTRY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
 const VM_CONSOLE_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
+/// Minimum time between `ExportingRootfs` byte-count updates for a local image.
+const EXPORT_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Mirrors the Docker/Podman `type` tag so their bind entries parse
 /// unchanged; virtiofs can only share host directories.
@@ -219,6 +224,7 @@ const GUEST_BOUNDARY_CONFIG_ENV: &str = "OPENSHELL_VM_SANDBOX_BOOTSTRAP";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const HOST_BOUNDARY_GENERATION_FILE: &str = "boundary-generation";
+const PENDING_GUEST_GENERATIONS_FILE: &str = "pending-guest-generations";
 /// Per-sandbox host-only copy of the gateway-normalized destination trust.
 ///
 /// This file is deliberately outside the VM disks. The host supervisor is the
@@ -248,6 +254,10 @@ const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
+const SANDBOX_OVERLAY_UNPUBLISHED_FILE: &str = "overlay-unpublished";
+const SANDBOX_OVERLAY_PUBLISHED_FILE: &str = "overlay-published";
+const SANDBOX_OVERLAY_RUNNING_FILE: &str = "overlay-running-unconfirmed";
+const SANDBOX_OVERLAY_FLUSH_ACK_FILE: &str = "overlay-flush-ack";
 const SANDBOX_OWNER_STATE_FILE: &str = "sandbox-owner-state";
 const SANDBOX_OWNER_STATE_V1: &str = "sandbox-owner-v1";
 const SANDBOX_OWNER_STATE_V2: &str = "sandbox-owner-v2";
@@ -1494,6 +1504,9 @@ impl VmDriver {
             );
         }
         configure_main_exit_marker(&mut command, state_dir);
+        command
+            .arg("--termination-ack-marker")
+            .arg(state_dir.join(SANDBOX_OVERLAY_FLUSH_ACK_FILE));
         if let Some(tls) = tls_paths {
             command.env(openshell_core::sandbox_env::TLS_CA, &tls.ca);
         }
@@ -1811,7 +1824,11 @@ impl VmDriver {
             self.fail_provisioning(
                 &sandbox_id,
                 &state_dir,
-                "ProvisioningFailed",
+                if err.message().contains("OverlayDiskFull:") {
+                    "OverlayDiskFull"
+                } else {
+                    "ProvisioningFailed"
+                },
                 err.message(),
                 overlay_preparation == OverlayPreparation::Fresh,
             )
@@ -1893,6 +1910,24 @@ impl VmDriver {
             .await?
         };
         let image_identity = image_plan.image_identity.clone();
+        let bootstrap_image_ref = self.bootstrap_image_ref()?;
+        if let Err(error) = image_cache_admin::record_use(
+            &self.config.state_dir,
+            &image_plan.bootstrap_image_identity,
+            Some(bootstrap_image_ref.as_str()),
+        ) {
+            warn!(%error, "vm driver: could not record bootstrap cache use");
+        }
+        if image_plan.image_disk.is_some()
+            && let Err(error) = record_prepared_image_use(
+                &self.config.state_dir,
+                &image_identity,
+                &image_ref,
+                driver_config_had_rootfs_tar,
+            )
+        {
+            warn!(%error, "vm driver: could not record prepared image cache use");
+        }
         self.ensure_provisioning_active(&sandbox.id).await?;
         info!(
             sandbox_id = %sandbox.id,
@@ -1928,6 +1963,10 @@ impl VmDriver {
                 "Preparing writable VM overlay disk".to_string(),
             ),
         );
+        let previous_overlay_size = tokio::fs::metadata(&overlay_disk)
+            .await
+            .ok()
+            .map(|m| m.len());
         let sandbox_owner_state = self
             .prepare_overlay_in_worker(
                 &sandbox.id,
@@ -1940,10 +1979,35 @@ impl VmDriver {
             )
             .await
             .map_err(|err| Status::internal(format!("prepare guest overlay disk failed: {err}")))?;
+        if let Some(previous_size) = previous_overlay_size {
+            let recovered_size = tokio::fs::metadata(&overlay_disk)
+                .await
+                .map_err(|error| Status::internal(format!("stat recovered overlay: {error}")))?
+                .len();
+            if recovered_size > previous_size {
+                self.publish_platform_event(
+                    sandbox.id.clone(),
+                    platform_event(
+                        "vm",
+                        "Warning",
+                        "OverlayDiskFull",
+                        format!(
+                            "VM overlay was nearly full and grew by {} MiB for recovery; remove files or increase [openshell.drivers.vm] overlay_disk_mib for new sandboxes",
+                            (recovered_size - previous_size) / (1024 * 1024)
+                        ),
+                    ),
+                );
+            }
+        }
         self.ensure_provisioning_active(&sandbox.id).await?;
 
-        if let Err(err) =
-            write_sandbox_image_metadata(&state_dir, &image_ref, &image_identity).await
+        if let Err(err) = write_sandbox_image_metadata(
+            &state_dir,
+            &image_ref,
+            &image_identity,
+            &image_plan.bootstrap_image_identity,
+        )
+        .await
         {
             return Err(Status::internal(format!(
                 "write sandbox image metadata failed: {err}"
@@ -2240,7 +2304,7 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let mut child = match command.spawn() {
+        let mut child = match spawn_vm_launcher_with_overlay_run(&mut command, &state_dir) {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -3395,8 +3459,8 @@ impl VmDriver {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref()?;
         // Keep the driver trace continuous across the worker boundary. The
-        // first Pulled event completes bootstrap resolution; later events
-        // belong to the requested workload image.
+        // first Pulled or BootstrapImageReady event completes bootstrap
+        // resolution; later events belong to the requested workload image.
         let mut bootstrap_span = overlay.is_none().then(|| {
             tracing::info_span!(
                 "vm.resolve_bootstrap_image",
@@ -3460,7 +3524,9 @@ impl VmDriver {
                                 Status::internal(format!("decode image preparation event: {error}"))
                             })?;
                         if matches!(event.payload.as_ref(), Some(watch_sandboxes_event::Payload::PlatformEvent(value))
-                            if value.event.as_ref().is_some_and(|event| event.reason == "Pulled")) {
+                            if value.event.as_ref().is_some_and(|event| {
+                                event.reason == "Pulled" || event.reason == "BootstrapImageReady"
+                            })) {
                             bootstrap_span.take();
                         }
                         let _ = self.events.send(event);
@@ -3544,8 +3610,16 @@ impl VmDriver {
     ) -> Result<RuntimeImagePlan, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let bootstrap_image_ref = self.bootstrap_image_ref()?;
+        // The bootstrap image completes the image step only when it is also
+        // the workload image. Otherwise the workload image completes it.
+        let bootstrap_is_workload =
+            rootfs_tar_path.is_none() && image_ref.trim() == bootstrap_image_ref.trim();
         let bootstrap_image_identity = self
-            .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
+            .ensure_cached_bootstrap_rootfs_image(
+                sandbox_id,
+                &bootstrap_image_ref,
+                bootstrap_is_workload,
+            )
             .await?;
         let root_disk = image_cache_rootfs_image(&self.config.state_dir, &bootstrap_image_identity);
 
@@ -3561,7 +3635,7 @@ impl VmDriver {
             });
         }
 
-        if image_ref.trim() == bootstrap_image_ref.trim() {
+        if bootstrap_is_workload {
             return span_status.finish(Ok(RuntimeImagePlan {
                 root_disk,
                 image_disk: None,
@@ -3654,11 +3728,72 @@ impl VmDriver {
 
         let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
         let overlay_metadata = tokio::fs::metadata(&overlay_disk).await;
-        let recover_preserved_overlay = preparation == OverlayPreparation::PreserveExisting
-            && overlay_metadata.as_ref().is_ok_and(fs::Metadata::is_file);
-        let publish_new_overlay = preparation == OverlayPreparation::Fresh
-            || matches!(overlay_metadata, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
-        if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
+        let overlay_exists = match overlay_metadata {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => {
+                return Err(format!(
+                    "overlay path {} is not a regular file",
+                    overlay_disk.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!("stat overlay {}: {error}", overlay_disk.display()));
+            }
+        };
+        let guest_flush_acknowledged = verify_overlay_shutdown(state_dir)?;
+        if preparation == OverlayPreparation::PreserveExisting
+            && overlay_exists
+            && !guest_flush_acknowledged
+            && rootfs_image_needs_recovery(&overlay_disk)?
+        {
+            return Err(format!(
+                "OverlayDiskFull: saved overlay {} has an unconfirmed ext4 journal; refusing to replay it without a guest filesystem flush acknowledgement",
+                overlay_disk.display()
+            ));
+        }
+        let published_marker = state_dir.join(SANDBOX_OVERLAY_PUBLISHED_FILE);
+        let unpublished_marker = state_dir.join(SANDBOX_OVERLAY_UNPUBLISHED_FILE);
+        let published = tokio::fs::try_exists(&published_marker)
+            .await
+            .map_err(|error| format!("inspect {}: {error}", published_marker.display()))?;
+        let unpublished = tokio::fs::try_exists(&unpublished_marker)
+            .await
+            .map_err(|error| format!("inspect {}: {error}", unpublished_marker.display()))?;
+        let publish_new_overlay = match (preparation, overlay_exists) {
+            (OverlayPreparation::Fresh, false) if !published => {
+                persist_overlay_marker(state_dir, SANDBOX_OVERLAY_UNPUBLISHED_FILE, true)?;
+                true
+            }
+            (OverlayPreparation::Fresh, _) => {
+                return Err(format!(
+                    "existing overlay state {} cannot be replaced during fresh preparation",
+                    overlay_disk.display()
+                ));
+            }
+            (OverlayPreparation::PreserveExisting, true) => {
+                // Legacy overlays acquire the marker before any repair, so a
+                // later missing image can never be mistaken for a first start.
+                persist_overlay_marker(state_dir, SANDBOX_OVERLAY_PUBLISHED_FILE, true)?;
+                false
+            }
+            (OverlayPreparation::PreserveExisting, false) if unpublished && !published => true,
+            (OverlayPreparation::PreserveExisting, false) => {
+                return Err(format!(
+                    "OverlayDiskFull: saved overlay {} is missing; refusing to create an empty replacement",
+                    overlay_disk.display()
+                ));
+            }
+        };
+        let cleanup_paths = if preparation == OverlayPreparation::PreserveExisting && overlay_exists
+        {
+            pending_guest_generation_paths(state_dir).await?
+        } else {
+            Vec::new()
+        };
+        if publish_new_overlay
+            && !overlay_template_image_ready(&template_path, overlay_size_bytes).await?
+        {
             let _cache_guard = self.image_cache_lock.lock().await;
             let template_path = template_path.clone();
             let staging_dir = self.image_staging_dir("overlay-template");
@@ -3676,6 +3811,7 @@ impl VmDriver {
         }
 
         let overlay_to_recover = overlay_disk.clone();
+        let state_dir_for_publish = state_dir.to_path_buf();
         let staging_dir = self.image_staging_dir("writable-overlay");
         let result = tokio::task::spawn_blocking(move || {
             if publish_new_overlay {
@@ -3688,10 +3824,14 @@ impl VmDriver {
                 prepare_sandbox_overlay_image(
                     &template_path,
                     &staging_overlay,
-                    preparation,
+                    OverlayPreparation::Fresh,
                     overlay_size_bytes,
                 )?;
-                fs::rename(&staging_overlay, &overlay_disk).map_err(|error| error.to_string())
+                publish_sandbox_overlay_image(
+                    &state_dir_for_publish,
+                    &staging_overlay,
+                    &overlay_disk,
+                )
             } else {
                 prepare_sandbox_overlay_image(
                     &template_path,
@@ -3704,10 +3844,26 @@ impl VmDriver {
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?;
         result?;
-        if recover_preserved_overlay {
-            tokio::task::spawn_blocking(move || recover_rootfs_image(&overlay_to_recover))
-                .await
-                .map_err(|error| format!("overlay recovery panicked: {error}"))??;
+        if preparation == OverlayPreparation::PreserveExisting && overlay_exists {
+            tokio::task::spawn_blocking(move || {
+                recover_rootfs_image_with_cleanup(&overlay_to_recover, &cleanup_paths)
+            })
+            .await
+            .map_err(|error| format!("overlay recovery panicked: {error}"))??;
+            let pending = state_dir.join(PENDING_GUEST_GENERATIONS_FILE);
+            if let Err(error) = tokio::fs::remove_file(&pending).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %pending.display(), %error, "could not clear guest cleanup marker");
+            }
+        }
+        if publish_new_overlay {
+            let unpublished = state_dir.join(SANDBOX_OVERLAY_UNPUBLISHED_FILE);
+            if let Err(error) = tokio::fs::remove_file(&unpublished).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %unpublished.display(), %error, "could not clear unpublished overlay marker");
+            }
         }
         if write_owner_state && !owner_state_written_before_prepare {
             write_sandbox_owner_state(state_dir, owner_state).await?;
@@ -3738,31 +3894,39 @@ impl VmDriver {
         &self,
         sandbox_id: &str,
         image_ref: &str,
+        completes_image_step: bool,
     ) -> Result<String, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        if let Some((engine, image_identity)) =
+        let result = if let Some((engine, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
-            let result = self
-                .ensure_cached_local_image_rootfs_image(
-                    sandbox_id,
-                    image_ref,
-                    &engine,
-                    &image_identity,
-                )
-                .await;
-            return span_status.finish(result);
-        }
-
-        span_status.finish(
+            self.ensure_cached_local_image_rootfs_image(
+                sandbox_id,
+                image_ref,
+                &engine,
+                &image_identity,
+            )
+            .await
+        } else {
             self.ensure_cached_registry_rootfs_image(
                 sandbox_id,
                 image_ref,
                 &registry_client(),
                 &registry_auth(image_ref)?,
             )
-            .await,
-        )
+            .await
+        };
+        if let Ok(image_identity) = &result {
+            let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
+            self.publish_bootstrap_image_ready(
+                sandbox_id,
+                image_ref,
+                &image_path,
+                completes_image_step,
+            )
+            .await;
+        }
+        span_status.finish(result)
     }
 
     fn publish_pulling_event(&self, sandbox_id: &str, image_ref: &str) {
@@ -3777,15 +3941,9 @@ impl VmDriver {
         );
     }
 
-    /// A registry-sourced root disk found in the cache: `Pulling`, the
-    /// `CacheHit` progress and `Pulled`, so the image step still advances.
-    async fn publish_registry_cache_hit(
-        &self,
-        sandbox_id: &str,
-        image_ref: &str,
-        image_identity: &str,
-        image_path: &Path,
-    ) {
+    /// A registry-sourced root disk found in the cache: `Pulling` and the
+    /// `CacheHit` progress. The caller reports the image as ready.
+    fn publish_registry_cache_hit(&self, sandbox_id: &str, image_ref: &str, image_identity: &str) {
         self.publish_pulling_event(sandbox_id, image_ref);
         self.publish_vm_progress(
             sandbox_id,
@@ -3798,8 +3956,6 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
-        self.publish_pulled_event(sandbox_id, image_ref, image_path)
-            .await;
     }
 
     async fn ensure_cached_registry_rootfs_image(
@@ -3827,13 +3983,7 @@ impl VmDriver {
                     image_path = %image_path.display(),
                     "vm driver: root disk image cache hit (digest-pinned, no registry call)"
                 );
-                self.publish_registry_cache_hit(
-                    sandbox_id,
-                    image_ref,
-                    &image_identity,
-                    &image_path,
-                )
-                .await;
+                self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity);
                 return span_status.finish(Ok(image_identity));
             }
         }
@@ -3887,8 +4037,7 @@ impl VmDriver {
                 image_path = %image_path.display(),
                 "vm driver: root disk image cache hit (no build needed)"
             );
-            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity, &image_path)
-                .await;
+            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity);
             return span_status.finish(Ok(image_identity));
         }
 
@@ -3940,8 +4089,6 @@ impl VmDriver {
                     ("image_identity".to_string(), image_identity.clone()),
                 ]),
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-                .await;
             return span_status.finish(Ok(image_identity));
         }
 
@@ -3954,8 +4101,6 @@ impl VmDriver {
             &image_identity,
         )
         .await?;
-        self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-            .await;
         span_status.finish(Ok(image_identity))
     }
 
@@ -4064,8 +4209,6 @@ impl VmDriver {
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-                .await;
             return Ok(cache_identity);
         }
 
@@ -4102,15 +4245,11 @@ impl VmDriver {
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
             );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-                .await;
             return Ok(cache_identity);
         }
 
         self.build_cached_local_image_rootfs_image(sandbox_id, docker, image_ref, &cache_identity)
             .await?;
-        self.publish_pulled_event(sandbox_id, image_ref, &image_path)
-            .await;
         Ok(cache_identity)
     }
 
@@ -4120,6 +4259,7 @@ impl VmDriver {
         image_ref: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
+        self.publish_pulling_event(sandbox_id, image_ref);
         if let Some((docker, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
@@ -4177,22 +4317,22 @@ impl VmDriver {
         let rootfs_archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         self.reset_image_staging_dir(&staging_dir).await?;
 
-        self.publish_vm_progress(
-            sandbox_id,
-            "ExportingRootfs",
-            format!("Exporting rootfs from local image \"{image_ref}\""),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
-                ("image_identity".to_string(), cache_identity.clone()),
-            ]),
-        );
-        if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &rootfs_archive).await
+        let exported_bytes = match self
+            .export_local_image_rootfs_with_progress(
+                sandbox_id,
+                docker,
+                image_ref,
+                &cache_identity,
+                &rootfs_archive,
+            )
+            .await
         {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(err);
-        }
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(err);
+            }
+        };
 
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
@@ -4207,6 +4347,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &staging_dir,
             &payload,
+            Some(exported_bytes),
         )
         .await?;
 
@@ -4222,6 +4363,8 @@ impl VmDriver {
         tar_path: &Path,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
+        let tar_display = tar_path.display().to_string();
+        self.publish_pulling_event(sandbox_id, &tar_display);
         let request_staging_dir = tar_path.parent().map(Path::to_path_buf);
         let cleanup_request_staging = || async {
             if let Some(d) = &request_staging_dir {
@@ -4254,7 +4397,6 @@ impl VmDriver {
         };
         let cache_identity = rootfs_tar_cache_identity(&source_digest, &self.config);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
-        let tar_display = tar_path.display().to_string();
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
             self.publish_prepared_cache_hit(
@@ -4336,6 +4478,10 @@ impl VmDriver {
             )));
         }
         cleanup_request_staging().await;
+        let staged_bytes = tokio::fs::metadata(&rootfs_archive)
+            .await
+            .ok()
+            .map(|meta| meta.len());
 
         let payload = GuestImagePayload {
             image_ref: tar_display.clone(),
@@ -4350,6 +4496,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &staging_dir,
             &payload,
+            staged_bytes,
         )
         .await?;
 
@@ -4499,6 +4646,7 @@ impl VmDriver {
             bootstrap_root_disk,
             &staging_dir,
             &payload,
+            u64::try_from(total_bytes).ok().filter(|bytes| *bytes > 0),
         )
         .await?;
 
@@ -4536,6 +4684,7 @@ impl VmDriver {
         bootstrap_root_disk: &Path,
         staging_dir: &Path,
         payload: &GuestImagePayload,
+        image_bytes: Option<u64>,
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
@@ -4559,20 +4708,38 @@ impl VmDriver {
         })?
         .map_err(Status::internal)?;
 
+        let driver_for_progress = self.clone();
+        let progress_sandbox_id = sandbox_id.to_string();
+        let progress_image_ref = image_ref.to_string();
+        let progress_image_source = image_source.to_string();
+        let progress_image_identity = image_identity.to_string();
         let payload_for_disk = payload.clone();
         let prepared_image_for_disk = prepared_image.clone();
-        self.publish_vm_progress(
-            sandbox_id,
-            "CreatingRootDisk",
-            "Formatting prepared VM image disk".to_string(),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), image_source.to_string()),
-                ("image_identity".to_string(), image_identity.to_string()),
-            ]),
-        );
         tokio::task::spawn_blocking(move || {
-            create_image_prep_disk(&prepared_image_for_disk, image_size, &payload_for_disk)
+            create_image_prep_disk(
+                &prepared_image_for_disk,
+                image_size,
+                &payload_for_disk,
+                |_| {
+                    driver_for_progress.publish_workload_image_ready(
+                        &progress_sandbox_id,
+                        &progress_image_ref,
+                        &progress_image_source,
+                        false,
+                        image_bytes,
+                    );
+                    driver_for_progress.publish_vm_progress(
+                        &progress_sandbox_id,
+                        "CreatingRootDisk",
+                        "Formatting prepared VM image disk".to_string(),
+                        HashMap::from([
+                            ("image_ref".to_string(), progress_image_ref),
+                            ("image_source".to_string(), progress_image_source),
+                            ("image_identity".to_string(), progress_image_identity),
+                        ]),
+                    );
+                },
+            )
         })
         .await
         .map_err(|err| Status::internal(format!("prepared image disk build panicked: {err}")))?
@@ -4702,6 +4869,46 @@ impl VmDriver {
         )))
     }
 
+    /// Export a local image's rootfs to `tar_path`, reporting the bytes
+    /// written so far as `ExportingRootfs` progress. Returns the archive size.
+    async fn export_local_image_rootfs_with_progress(
+        &self,
+        sandbox_id: &str,
+        docker: &Docker,
+        image_ref: &str,
+        image_identity: &str,
+        tar_path: &Path,
+    ) -> Result<u64, Status> {
+        let metadata = |exported_bytes: Option<u64>| {
+            let mut metadata = HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "local_docker".to_string()),
+                ("image_identity".to_string(), image_identity.to_string()),
+            ]);
+            if let Some(bytes) = exported_bytes {
+                metadata.insert("exported_bytes".to_string(), bytes.to_string());
+            }
+            metadata
+        };
+        self.publish_vm_progress(
+            sandbox_id,
+            "ExportingRootfs",
+            format!("Exporting rootfs from local image \"{image_ref}\""),
+            metadata(None),
+        );
+        export_local_image_rootfs_to_path(docker, image_ref, tar_path, |exported_bytes| {
+            self.publish_vm_progress(
+                sandbox_id,
+                "ExportingRootfs",
+                format!(
+                    "Exporting rootfs from local image \"{image_ref}\": {exported_bytes} bytes"
+                ),
+                metadata(Some(exported_bytes)),
+            );
+        })
+        .await
+    }
+
     fn publish_prepared_cache_hit(
         &self,
         sandbox_id: &str,
@@ -4720,6 +4927,7 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
+        self.publish_workload_image_ready(sandbox_id, image_ref, image_source, true, None);
     }
 
     fn publish_prepared_cache_miss(
@@ -4779,18 +4987,15 @@ impl VmDriver {
                 Status::internal(format!("create image cache staging dir failed: {err}"))
             })?;
 
-        self.publish_vm_progress(
-            sandbox_id,
-            "ExportingRootfs",
-            format!("Exporting rootfs from local image \"{image_ref}\""),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
-                ("image_identity".to_string(), image_identity.to_string()),
-            ]),
-        );
-        if let Err(err) =
-            export_local_image_rootfs_to_path(docker, image_ref, &exported_rootfs).await
+        if let Err(err) = self
+            .export_local_image_rootfs_with_progress(
+                sandbox_id,
+                docker,
+                image_ref,
+                image_identity,
+                &exported_rootfs,
+            )
+            .await
         {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
@@ -5229,6 +5434,11 @@ impl VmDriver {
 #[doc(hidden)]
 pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), String> {
     let (request, directory) = preparation::read_request(request_path)?;
+    let _cache_lease = image_cache_admin::lock_cache(
+        &request.config.state_dir,
+        image_cache_admin::LockMode::Shared,
+    )
+    .map_err(|error| format!("lock image cache for preparation: {error}"))?;
     validate_sandbox_id(&request.sandbox_id).map_err(|error| error.message().to_string())?;
     preparation::watch_parent(request.parent_pid)?;
     tracing_subscriber::fmt()
@@ -5266,7 +5476,7 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
                 .map(preparation::Output::Overlay)
         } else if request.bootstrap_only {
             let identity = driver
-                .ensure_cached_bootstrap_rootfs_image(&request.sandbox_id, &request.image_ref)
+                .ensure_cached_bootstrap_rootfs_image(&request.sandbox_id, &request.image_ref, true)
                 .await?;
             Ok(preparation::Output::Images(RuntimeImagePlan {
                 root_disk: image_cache_rootfs_image(&driver.config.state_dir, &identity),
@@ -5940,11 +6150,15 @@ fn is_docker_not_found_error(err: &BollardError) -> bool {
     )
 }
 
+/// Stream `docker export` of a temporary container into `tar_path` and return
+/// the archive size. `on_progress` receives the bytes written so far, at most
+/// once per [`EXPORT_PROGRESS_INTERVAL`].
 async fn export_local_image_rootfs_to_path(
     docker: &Docker,
     image_ref: &str,
     tar_path: &Path,
-) -> Result<(), Status> {
+    mut on_progress: impl FnMut(u64) + Send,
+) -> Result<u64, Status> {
     let container_name = format!(
         "openshell-vm-rootfs-export-{}",
         std::time::SystemTime::now()
@@ -5984,6 +6198,8 @@ async fn export_local_image_rootfs_to_path(
             Status::internal(format!("create {} failed: {err}", tar_path.display()))
         })?;
         let mut stream = docker.export_container(&container_id);
+        let mut exported_bytes = 0_u64;
+        let mut last_report = std::time::Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| {
                 Status::failed_precondition(format!(
@@ -5993,10 +6209,16 @@ async fn export_local_image_rootfs_to_path(
             file.write_all(&chunk).await.map_err(|err| {
                 Status::internal(format!("write {} failed: {err}", tar_path.display()))
             })?;
+            exported_bytes = exported_bytes.saturating_add(chunk.len() as u64);
+            if last_report.elapsed() >= EXPORT_PROGRESS_INTERVAL {
+                last_report = std::time::Instant::now();
+                on_progress(exported_bytes);
+            }
         }
-        file.flush()
-            .await
-            .map_err(|err| Status::internal(format!("flush {} failed: {err}", tar_path.display())))
+        file.flush().await.map_err(|err| {
+            Status::internal(format!("flush {} failed: {err}", tar_path.display()))
+        })?;
+        Ok(exported_bytes)
     }
     .await;
 
@@ -6008,9 +6230,9 @@ async fn export_local_image_rootfs_to_path(
         .await;
 
     match (export_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(exported_bytes), Ok(())) => Ok(exported_bytes),
         (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(Status::internal(format!(
+        (Ok(_), Err(err)) => Err(Status::internal(format!(
             "failed to remove temporary export container for local Docker image '{image_ref}': {err}"
         ))),
     }
@@ -6353,8 +6575,17 @@ impl VmDriver {
         self.publish_platform_event(sandbox_id.to_string(), event);
     }
 
-    /// Emit a `Pulled` platform event with progress metadata for the CLI.
-    async fn publish_pulled_event(&self, sandbox_id: &str, image_ref: &str, image_path: &Path) {
+    /// Report the cached bootstrap root disk. It completes the image step
+    /// (`Pulled`) only when the bootstrap image is also the workload image;
+    /// otherwise `BootstrapImageReady` is a progress detail and the workload
+    /// image completes the step.
+    async fn publish_bootstrap_image_ready(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_path: &Path,
+        completes_image_step: bool,
+    ) {
         let mut metadata = HashMap::from([("image_ref".to_string(), image_ref.to_string())]);
         let size_suffix = tokio::fs::metadata(image_path).await.map_or_else(
             |_| String::new(),
@@ -6363,11 +6594,37 @@ impl VmDriver {
                 format!(" Image size: {} bytes.", meta.len())
             },
         );
+        let (reason, message) = if completes_image_step {
+            (
+                "Pulled",
+                format!("Successfully pulled image \"{image_ref}\".{size_suffix}"),
+            )
+        } else {
+            (
+                "BootstrapImageReady",
+                format!("VM bootstrap image \"{image_ref}\" is ready.{size_suffix}"),
+            )
+        };
+        self.publish_vm_progress(sandbox_id, reason, message, metadata);
+    }
+
+    /// Complete the image step for a workload image that differs from the
+    /// bootstrap image, once its payload is staged and before the root disk
+    /// is formatted. `image_bytes` is the payload size: the exported rootfs
+    /// for a local image, the layer total for a registry image.
+    fn publish_workload_image_ready(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_source: &str,
+        cache_hit: bool,
+        image_bytes: Option<u64>,
+    ) {
         self.publish_vm_progress(
             sandbox_id,
             "Pulled",
-            format!("Successfully pulled image \"{image_ref}\".{size_suffix}"),
-            metadata,
+            workload_image_ready_message(image_ref, image_source, cache_hit, image_bytes),
+            workload_image_ready_metadata(image_ref, image_source, cache_hit, image_bytes),
         );
     }
 }
@@ -6925,6 +7182,132 @@ fn sandbox_overlay_image(state_dir: &Path) -> PathBuf {
     state_dir.join(SANDBOX_OVERLAY_IMAGE)
 }
 
+fn persist_overlay_marker(
+    state_dir: &Path,
+    name: &str,
+    allow_existing: bool,
+) -> Result<(), String> {
+    let path = state_dir.join(name);
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if allow_existing && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if path.is_file() {
+                return Ok(());
+            }
+            return Err(format!(
+                "overlay marker {} is not a regular file",
+                path.display()
+            ));
+        }
+        Err(error) => return Err(format!("create overlay marker {}: {error}", path.display())),
+    };
+    file.write_all(b"overlay-marker-v1\n")
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::File::open(state_dir)?.sync_all())
+        .map_err(|error| format!("persist overlay marker {}: {error}", path.display()))
+}
+
+fn publish_sandbox_overlay_image(
+    state_dir: &Path,
+    staged_overlay: &Path,
+    overlay_disk: &Path,
+) -> Result<(), String> {
+    fs::rename(staged_overlay, overlay_disk)
+        .map_err(|error| format!("publish overlay {}: {error}", overlay_disk.display()))?;
+    // Make the final image name durable before the marker can say it was
+    // published. A failed marker write leaves an existing image to recover.
+    fs::File::open(state_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync overlay directory {}: {error}", state_dir.display()))?;
+    persist_overlay_marker(state_dir, SANDBOX_OVERLAY_PUBLISHED_FILE, false)
+}
+
+fn remove_overlay_marker(state_dir: &Path, name: &str) -> Result<(), String> {
+    let path = state_dir.join(name);
+    match fs::remove_file(&path) {
+        Ok(()) => fs::File::open(state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("remove overlay marker {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove overlay marker {}: {error}", path.display())),
+    }
+}
+
+fn verify_overlay_shutdown(state_dir: &Path) -> Result<bool, String> {
+    let running = state_dir.join(SANDBOX_OVERLAY_RUNNING_FILE);
+    if !running.try_exists().map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
+    let ack = state_dir.join(SANDBOX_OVERLAY_FLUSH_ACK_FILE);
+    if !ack.try_exists().map_err(|error| error.to_string())? {
+        return Err(format!(
+            "OverlayDiskFull: guest filesystem flush was not acknowledged for {}; refusing to recover the saved overlay",
+            state_dir.display()
+        ));
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviousOverlayRunState {
+    running: bool,
+    acknowledged: bool,
+}
+
+fn begin_overlay_run(state_dir: &Path) -> Result<PreviousOverlayRunState, String> {
+    let previous = PreviousOverlayRunState {
+        running: state_dir
+            .join(SANDBOX_OVERLAY_RUNNING_FILE)
+            .try_exists()
+            .map_err(|error| error.to_string())?,
+        acknowledged: state_dir
+            .join(SANDBOX_OVERLAY_FLUSH_ACK_FILE)
+            .try_exists()
+            .map_err(|error| error.to_string())?,
+    };
+    // Record the possible VM run before removing the old acknowledgement.
+    // The launcher cannot start until the acknowledgement is durably gone.
+    persist_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE, true)?;
+    if let Err(error) = remove_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE) {
+        rollback_overlay_run(state_dir, previous)?;
+        return Err(error);
+    }
+    Ok(previous)
+}
+
+fn rollback_overlay_run(state_dir: &Path, previous: PreviousOverlayRunState) -> Result<(), String> {
+    if previous.acknowledged {
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE, true)?;
+    }
+    if !previous.running {
+        remove_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE)?;
+    }
+    Ok(())
+}
+
+fn spawn_vm_launcher_with_overlay_run(
+    command: &mut Command,
+    state_dir: &Path,
+) -> Result<Child, String> {
+    // A restart after an unacknowledged guest flush cannot claim that the
+    // disk is healthy, even if journal replay happens to be clean.
+    let previous = begin_overlay_run(state_dir)?;
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            rollback_overlay_run(state_dir, previous).map_err(|rollback| {
+                format!("launch VM helper: {error}; restore overlay markers: {rollback}")
+            })?;
+            Err(error.to_string())
+        }
+    }
+}
+
 fn overlay_template_image(root: &Path, size_bytes: u64) -> PathBuf {
     image_cache_root_dir(root)
         .join(OVERLAY_TEMPLATE_CACHE_DIR)
@@ -7382,22 +7765,57 @@ fn unique_image_cache_suffix() -> String {
     format!("{}-{counter}", openshell_core::time::now_ms())
 }
 
+fn record_prepared_image_use(
+    state_dir: &Path,
+    image_identity: &str,
+    image_ref: &str,
+    from_rootfs_tar: bool,
+) -> Result<(), std::io::Error> {
+    image_cache_admin::record_use(
+        state_dir,
+        image_identity,
+        (!from_rootfs_tar).then_some(image_ref),
+    )
+}
+
+async fn write_sandbox_identity_file(
+    state_dir: &Path,
+    filename: &str,
+    identity: &str,
+) -> Result<(), std::io::Error> {
+    let sequence = IMAGE_CACHE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = state_dir.join(format!(".{filename}.{}.{sequence}.tmp", std::process::id()));
+    let result = async {
+        write_private_file(&temporary, format!("{identity}\n").into_bytes()).await?;
+        tokio::fs::rename(&temporary, state_dir.join(filename)).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
+}
+
 async fn write_sandbox_image_metadata(
     state_dir: &Path,
     image_ref: &str,
     image_identity: &str,
+    bootstrap_image_identity: &str,
 ) -> Result<(), std::io::Error> {
-    tokio::fs::write(
-        state_dir.join(IMAGE_IDENTITY_FILE),
-        format!("{image_identity}\n"),
+    // Write the bootstrap reference first. If this fails, the old image
+    // identity still protects its disk when prune scans persisted state.
+    write_sandbox_identity_file(
+        state_dir,
+        image_cache_admin::BOOTSTRAP_IDENTITY_FILE,
+        bootstrap_image_identity,
     )
     .await?;
+    write_sandbox_identity_file(state_dir, IMAGE_IDENTITY_FILE, image_identity).await?;
     tokio::fs::write(
         state_dir.join(IMAGE_REFERENCE_FILE),
         format!("{image_ref}\n"),
     )
     .await?;
-
     Ok(())
 }
 
@@ -7449,24 +7867,25 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
         Err(error) => return Err(format!("read boundary generation marker: {error}")),
     };
     if !generation.is_empty() {
-        let overlay = sandbox_runtime_disk_paths(state_dir).overlay_disk;
-        let generation_for_cleanup = generation.clone();
-        tokio::task::spawn_blocking(move || {
-            let tls = guest_boundary_tls_paths(&generation_for_cleanup);
-            for guest_path in [
-                PathBuf::from(guest_boundary_config_path(&generation_for_cleanup)),
-                tls.certificate_chain_path,
-                tls.private_key_path,
-            ] {
-                remove_rootfs_image_file(
-                    &overlay,
-                    &overlay_upper_path(&guest_path.to_string_lossy()),
-                )?;
-            }
-            Ok::<(), String>(())
-        })
-        .await
-        .map_err(|error| format!("guest authentication cleanup task failed: {error}"))??;
+        // The guest may have left ext4 metadata in its journal. Writing with
+        // debugfs before e2fsck replays that journal can corrupt saved files.
+        // Queue guest credential cleanup until recovery has completed.
+        let pending = state_dir.join(PENDING_GUEST_GENERATIONS_FILE);
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&pending)
+            .await
+            .map_err(|error| format!("open {}: {error}", pending.display()))?;
+        file.write_all(format!("{generation}\n").as_bytes())
+            .await
+            .map_err(|error| format!("persist {}: {error}", pending.display()))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("sync {}: {error}", pending.display()))?;
+        restrict_owner_read_write(&pending)
+            .await
+            .map_err(|error| format!("protect {}: {error}", pending.display()))?;
     }
     for path in [
         state_dir.join(HOST_AUTH_BUNDLE_FILE),
@@ -7480,6 +7899,35 @@ async fn remove_runtime_generation_material(state_dir: &Path) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+async fn pending_guest_generation_paths(state_dir: &Path) -> Result<Vec<String>, String> {
+    let pending = state_dir.join(PENDING_GUEST_GENERATIONS_FILE);
+    let contents = match tokio::fs::read_to_string(&pending).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read {}: {error}", pending.display())),
+    };
+    let mut paths = Vec::new();
+    for generation in contents.lines() {
+        if generation.is_empty()
+            || generation.len() > 128
+            || !generation
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!("invalid guest generation in {}", pending.display()));
+        }
+        let tls = guest_boundary_tls_paths(generation);
+        for guest_path in [
+            PathBuf::from(guest_boundary_config_path(generation)),
+            tls.certificate_chain_path,
+            tls.private_key_path,
+        ] {
+            paths.push(overlay_upper_path(&guest_path.to_string_lossy()));
+        }
+    }
+    Ok(paths)
 }
 
 async fn clear_explicit_start_markers(state_dir: &Path) -> Result<(), std::io::Error> {
@@ -7618,34 +8066,32 @@ fn prepare_sandbox_overlay_image(
     expected_size_bytes: u64,
 ) -> Result<(), String> {
     if preparation == OverlayPreparation::PreserveExisting {
-        match fs::metadata(overlay_disk) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
-                return Ok(());
-            }
-            Ok(metadata) if metadata.is_file() => {
-                return Err(format!(
-                    "existing overlay disk '{}' has size {}, expected {}",
-                    overlay_disk.display(),
-                    metadata.len(),
-                    expected_size_bytes
-                ));
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "existing overlay path '{}' is not a file",
-                    overlay_disk.display()
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
-                    "stat overlay disk {}: {err}",
-                    overlay_disk.display()
-                ));
-            }
-        }
+        return match fs::metadata(overlay_disk) {
+            Ok(metadata) if metadata.is_file() => Ok(()),
+            Ok(_) => Err(format!(
+                "existing overlay path '{}' is not a file",
+                overlay_disk.display()
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "OverlayDiskFull: saved overlay {} is missing; refusing to create an empty replacement",
+                overlay_disk.display()
+            )),
+            Err(err) => Err(format!(
+                "stat overlay disk {}: {err}",
+                overlay_disk.display()
+            )),
+        };
     }
 
+    let template_metadata = fs::metadata(template_path)
+        .map_err(|error| format!("stat overlay template {}: {error}", template_path.display()))?;
+    if !template_metadata.is_file() || template_metadata.len() != expected_size_bytes {
+        return Err(format!(
+            "overlay template '{}' must be a {} byte file",
+            template_path.display(),
+            expected_size_bytes
+        ));
+    }
     create_sandbox_overlay_image_from_template(template_path, overlay_disk)
 }
 
@@ -7871,6 +8317,7 @@ fn create_image_prep_disk(
     image_path: &Path,
     size_bytes: u64,
     payload: &GuestImagePayload,
+    on_payload_staged: impl FnOnce(&Path),
 ) -> Result<(), String> {
     let staging_dir = overlay_staging_dir(image_path);
     if staging_dir.exists() {
@@ -7886,6 +8333,7 @@ fn create_image_prep_disk(
         fs::create_dir_all(staging_dir.join("config"))
             .map_err(|err| format!("create image-prep config dir: {err}"))?;
         stage_guest_image_payload(&staging_dir, payload)?;
+        on_payload_staged(&staging_dir);
         create_ext4_image_from_dir_with_size(&staging_dir, image_path, size_bytes)
     })();
 
@@ -7916,15 +8364,15 @@ fn stage_guest_image_payload(
         GuestImagePayloadSource::RegistryOciLayout { layout_dir } => {
             fs::write(image_dir.join("source"), b"oci-layout")
                 .map_err(|err| format!("write guest image source: {err}"))?;
-            copy_dir_recursive(layout_dir, &image_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR))?;
+            stage_dir_recursive(layout_dir, &image_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR))?;
         }
         GuestImagePayloadSource::LocalDocker { rootfs_archive } => {
             fs::write(image_dir.join("source"), b"local-docker")
                 .map_err(|err| format!("write guest image source: {err}"))?;
             let dest = image_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
-            fs::copy(rootfs_archive, &dest).map_err(|err| {
+            link_or_copy_file(rootfs_archive, &dest).map_err(|err| {
                 format!(
-                    "copy guest image rootfs archive {} to {}: {err}",
+                    "stage guest image rootfs archive {} at {}: {err}",
                     rootfs_archive.display(),
                     dest.display()
                 )
@@ -7935,7 +8383,26 @@ fn stage_guest_image_payload(
     Ok(())
 }
 
-fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
+/// Stage a driver-owned payload file for `mke2fs -d` without a second full
+/// copy: hard link it when `dest` is on the same filesystem, else copy it.
+/// The payload sources are private staging files that nothing modifies after
+/// staging, and the formatter only reads them, so sharing the inode is safe.
+fn link_or_copy_file(source: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::hard_link(source, dest) {
+        Ok(()) => Ok(()),
+        Err(link_error) => {
+            tracing::debug!(
+                source = %source.display(),
+                dest = %dest.display(),
+                error = %link_error,
+                "vm driver: hard link failed, copying image payload"
+            );
+            fs::copy(source, dest).map(|_| ())
+        }
+    }
+}
+
+fn stage_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", dest.display()))?;
     for entry in fs::read_dir(source).map_err(|err| format!("read {}: {err}", source.display()))? {
         let entry = entry.map_err(|err| format!("read {}: {err}", source.display()))?;
@@ -7944,15 +8411,15 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<(), String> {
         let metadata = fs::symlink_metadata(&source_path)
             .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
         if metadata.file_type().is_dir() {
-            copy_dir_recursive(&source_path, &dest_path)?;
+            stage_dir_recursive(&source_path, &dest_path)?;
         } else if metadata.file_type().is_file() {
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| format!("create {}: {err}", parent.display()))?;
             }
-            fs::copy(&source_path, &dest_path).map_err(|err| {
+            link_or_copy_file(&source_path, &dest_path).map_err(|err| {
                 format!(
-                    "copy {} to {}: {err}",
+                    "stage {} at {}: {err}",
                     source_path.display(),
                     dest_path.display()
                 )
@@ -8312,8 +8779,19 @@ fn attach_vm_progress_metadata(event: &mut PlatformEvent) {
         "WaitingForImageCacheLock" => {
             mark_progress_detail(&mut event.metadata, "Waiting for image cache lock");
         }
+        "BootstrapImageReady" => {
+            mark_progress_detail(&mut event.metadata, "VM bootstrap image ready");
+        }
         "ExportingRootfs" => {
-            mark_progress_detail(&mut event.metadata, "Exporting local image rootfs");
+            let detail = event
+                .metadata
+                .get("exported_bytes")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or_else(
+                    || "Exporting local image rootfs".to_string(),
+                    |bytes| format!("Exporting local image rootfs ({})", format_bytes(bytes)),
+                );
+            mark_progress_detail(&mut event.metadata, detail);
         }
         "PreparingRootfs" => mark_progress_detail(&mut event.metadata, "Preparing rootfs"),
         "CreatingRootDisk" => mark_progress_detail(&mut event.metadata, "Formatting root disk"),
@@ -8332,14 +8810,61 @@ fn pulling_image_from_message(message: &str) -> Option<String> {
 }
 
 fn pulled_label(event: &PlatformEvent) -> String {
-    event
-        .metadata
+    let metadata = &event.metadata;
+    let label = if metadata
+        .get("cache_hit")
+        .is_some_and(|value| value == "true")
+    {
+        "Image ready (cached)"
+    } else {
+        match metadata.get("image_source").map(String::as_str) {
+            Some("local_docker") => "Local image exported",
+            Some("rootfs_tar") => "Rootfs tar staged",
+            _ => "Image pulled",
+        }
+    };
+    metadata
         .get("image_size_bytes")
         .and_then(|value| value.parse::<u64>().ok())
         .map_or_else(
-            || "Image pulled".to_string(),
-            |bytes| format!("Image pulled ({})", format_bytes(bytes)),
+            || label.to_string(),
+            |bytes| format!("{label} ({})", format_bytes(bytes)),
         )
+}
+
+fn workload_image_ready_message(
+    image_ref: &str,
+    image_source: &str,
+    cache_hit: bool,
+    image_bytes: Option<u64>,
+) -> String {
+    let size_suffix = image_bytes.map_or_else(String::new, |bytes| format!(" ({bytes} bytes)"));
+    if cache_hit {
+        format!("Using cached VM image disk for \"{image_ref}\"")
+    } else {
+        match image_source {
+            "local_docker" => format!("Exported local image \"{image_ref}\"{size_suffix}"),
+            "rootfs_tar" => format!("Staged rootfs tar \"{image_ref}\"{size_suffix}"),
+            _ => format!("Successfully pulled image \"{image_ref}\"{size_suffix}"),
+        }
+    }
+}
+
+fn workload_image_ready_metadata(
+    image_ref: &str,
+    image_source: &str,
+    cache_hit: bool,
+    image_bytes: Option<u64>,
+) -> HashMap<String, String> {
+    let mut metadata = HashMap::from([
+        ("image_ref".to_string(), image_ref.to_string()),
+        ("image_source".to_string(), image_source.to_string()),
+        ("cache_hit".to_string(), cache_hit.to_string()),
+    ]);
+    if let Some(bytes) = image_bytes {
+        metadata.insert("image_size_bytes".to_string(), bytes.to_string());
+    }
+    metadata
 }
 
 fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
@@ -8370,6 +8895,7 @@ mod tests {
     use prost_types::{Struct, Value, value::Kind};
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
     use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -9166,6 +9692,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_bootstrap_identity_write_preserves_prior_image_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path();
+        tokio::fs::write(state_dir.join(IMAGE_IDENTITY_FILE), b"prior-image\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(state_dir.join(image_cache_admin::BOOTSTRAP_IDENTITY_FILE))
+            .await
+            .unwrap();
+
+        assert!(
+            write_sandbox_image_metadata(
+                state_dir,
+                "new-image",
+                "new-image-id",
+                "new-bootstrap-id",
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(IMAGE_IDENTITY_FILE))
+                .await
+                .unwrap(),
+            "prior-image\n"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_cache_use_has_no_image_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_id = "sandbox-prepared-rootfs-ext4-umoci-v4-openshell-rootfs-tar";
+        let disk = image_cache_rootfs_image(temp.path(), cache_id);
+        fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        fs::write(&disk, b"disk").unwrap();
+
+        record_prepared_image_use(temp.path(), cache_id, "unrelated/image:tag", true).unwrap();
+        let lease = image_cache_admin::lock_cache(temp.path(), image_cache_admin::LockMode::Shared)
+            .unwrap();
+        let entry = lease.list().unwrap().pop().unwrap();
+        assert_eq!(entry.image_ref, None);
+        assert!(entry.last_used_unix_ms.is_some());
+    }
+
     async fn assert_inactive_restore_retains_identity(marker: &str, reason: &str) {
         let temp = tempfile::tempdir().unwrap();
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
@@ -9199,9 +9770,20 @@ mod tests {
         )
         .await
         .unwrap();
-        write_sandbox_image_metadata(&state_dir, "unused-image", "sha256:original-image")
-            .await
-            .unwrap();
+        write_sandbox_image_metadata(
+            &state_dir,
+            "unused-image",
+            "sha256:original-image",
+            "sha256:bootstrap-image",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(state_dir.join(image_cache_admin::BOOTSTRAP_IDENTITY_FILE))
+                .await
+                .unwrap(),
+            "sha256:bootstrap-image\n"
+        );
         tokio::fs::write(state_dir.join(marker), b"inactive\n")
             .await
             .unwrap();
@@ -9716,6 +10298,109 @@ mod tests {
                 .get(PROGRESS_ACTIVE_STEP_KEY)
                 .map(String::as_str),
             Some(PROGRESS_STEP_STARTING_SANDBOX)
+        );
+    }
+
+    fn vm_progress_event(reason: &str, metadata: HashMap<String, String>) -> PlatformEvent {
+        let mut event = platform_event("vm", "Normal", reason, String::new());
+        event.metadata = metadata;
+        attach_vm_progress_metadata(&mut event);
+        event
+    }
+
+    fn progress_value<'a>(event: &'a PlatformEvent, key: &str) -> Option<&'a str> {
+        event.metadata.get(key).map(String::as_str)
+    }
+
+    #[test]
+    fn vm_workload_pulled_event_labels_each_image_source() {
+        let cases = [
+            (
+                "local_docker",
+                false,
+                Some(5 * 1024 * 1024 * 1024),
+                "Local image exported (5.0 GB)",
+            ),
+            ("registry", false, Some(44_040_192), "Image pulled (42 MB)"),
+            ("registry", false, None, "Image pulled"),
+            (
+                "rootfs_tar",
+                false,
+                Some(44_040_192),
+                "Rootfs tar staged (42 MB)",
+            ),
+            ("local_docker", true, None, "Image ready (cached)"),
+            ("registry", true, None, "Image ready (cached)"),
+        ];
+        for (source, cache_hit, bytes, label) in cases {
+            let event = vm_progress_event(
+                "Pulled",
+                workload_image_ready_metadata("local-big:1", source, cache_hit, bytes),
+            );
+            assert_eq!(
+                progress_value(&event, PROGRESS_COMPLETE_STEP_KEY),
+                Some(PROGRESS_STEP_PULLING_IMAGE),
+                "{source}"
+            );
+            assert_eq!(
+                progress_value(&event, PROGRESS_COMPLETE_LABEL_KEY),
+                Some(label),
+                "{source} cache_hit={cache_hit}"
+            );
+            assert_eq!(
+                progress_value(&event, PROGRESS_ACTIVE_STEP_KEY),
+                Some(PROGRESS_STEP_STARTING_SANDBOX)
+            );
+        }
+    }
+
+    #[test]
+    fn vm_workload_image_ready_message_names_the_local_export() {
+        assert_eq!(
+            workload_image_ready_message("local-big:1", "local_docker", false, Some(1234)),
+            "Exported local image \"local-big:1\" (1234 bytes)"
+        );
+        assert_eq!(
+            workload_image_ready_message("local-big:1", "local_docker", true, None),
+            "Using cached VM image disk for \"local-big:1\""
+        );
+    }
+
+    #[test]
+    fn vm_bootstrap_image_ready_event_does_not_complete_image_step() {
+        // The bootstrap image of a different workload image is a detail of
+        // the image step, never "Image pulled" for the requested image.
+        let event = vm_progress_event(
+            "BootstrapImageReady",
+            HashMap::from([
+                ("image_ref".to_string(), "bootstrap:latest".to_string()),
+                ("image_size_bytes".to_string(), "536870912".to_string()),
+            ]),
+        );
+        assert_eq!(progress_value(&event, PROGRESS_COMPLETE_STEP_KEY), None);
+        assert_eq!(progress_value(&event, PROGRESS_COMPLETE_LABEL_KEY), None);
+        assert_eq!(progress_value(&event, PROGRESS_ACTIVE_STEP_KEY), None);
+        assert_eq!(
+            progress_value(&event, PROGRESS_ACTIVE_DETAIL_KEY),
+            Some("VM bootstrap image ready")
+        );
+    }
+
+    #[test]
+    fn vm_exporting_rootfs_event_reports_exported_bytes() {
+        let event = vm_progress_event(
+            "ExportingRootfs",
+            HashMap::from([("exported_bytes".to_string(), "44040192".to_string())]),
+        );
+        assert_eq!(
+            progress_value(&event, PROGRESS_ACTIVE_DETAIL_KEY),
+            Some("Exporting local image rootfs (42 MB)")
+        );
+
+        let event = vm_progress_event("ExportingRootfs", HashMap::new());
+        assert_eq!(
+            progress_value(&event, PROGRESS_ACTIVE_DETAIL_KEY),
+            Some("Exporting local image rootfs")
         );
     }
 
@@ -11412,22 +12097,400 @@ mod tests {
     }
 
     #[test]
-    fn prepare_sandbox_overlay_creates_missing_overlay_on_start() {
+    fn prepare_sandbox_overlay_preserves_recovery_growth_on_later_starts() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let template = base.join("template.ext4");
+        let overlay = base.join("overlay.ext4");
+        std::fs::write(&template, b"fresh-overlay").unwrap();
+        std::fs::write(&overlay, b"saved-overlay-with-recovery-space").unwrap();
+
+        prepare_sandbox_overlay_image(
+            &template,
+            &overlay,
+            OverlayPreparation::PreserveExisting,
+            "saved-overlay".len() as u64,
+        )
+        .expect("preserve grown overlay");
+
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            b"saved-overlay-with-recovery-space"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn failed_vm_launcher_spawn_restores_previous_overlay_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path();
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::write(&overlay, b"saved workload data").unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE, false).unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE, false).unwrap();
+
+        let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
+        spawn_vm_launcher_with_overlay_run(&mut command, state_dir)
+            .expect_err("launcher spawn must fail");
+        assert!(verify_overlay_shutdown(state_dir).unwrap());
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"saved workload data");
+
+        remove_overlay_marker(state_dir, SANDBOX_OVERLAY_RUNNING_FILE).unwrap();
+        remove_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE).unwrap();
+        let mut command = Command::new("/openshell-test/nonexistent-vm-launcher");
+        spawn_vm_launcher_with_overlay_run(&mut command, state_dir)
+            .expect_err("first launcher spawn must fail");
+        assert!(!state_dir.join(SANDBOX_OVERLAY_RUNNING_FILE).exists());
+        assert!(!state_dir.join(SANDBOX_OVERLAY_FLUSH_ACK_FILE).exists());
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"saved workload data");
+    }
+
+    #[tokio::test]
+    async fn failed_publish_marker_preserves_overlay_for_restore() {
+        if ["mke2fs", "e2fsck", "debugfs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path();
+        let source = state_dir.join("source");
+        let staging = state_dir.join("staging-overlay.ext4");
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/saved.txt"), b"saved workload data\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &staging, 64 * 1024 * 1024).unwrap();
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_UNPUBLISHED_FILE, false).unwrap();
+        let marker = state_dir.join(SANDBOX_OVERLAY_PUBLISHED_FILE);
+        std::fs::create_dir(&marker).unwrap();
+        let error = publish_sandbox_overlay_image(state_dir, &staging, &overlay)
+            .expect_err("marker write must fail after publishing the complete image");
+        assert!(error.contains("marker"), "{error}");
+        assert!(overlay.exists());
+        assert!(!staging.exists());
+        std::fs::remove_dir(&marker).unwrap();
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+        driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect("restore the already published image after marker failure");
+        assert!(marker.is_file());
+        let output =
+            std::process::Command::new(openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap())
+                .args(["-R", "cat /upper/saved.txt"])
+                .arg(&overlay)
+                .output()
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"saved workload data\n");
+    }
+
+    #[tokio::test]
+    async fn missing_published_overlay_refuses_empty_replacement() {
+        let base = tempfile::tempdir().unwrap();
+        let state_dir = base.path();
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_PUBLISHED_FILE, false).unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+
+        let error = driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect_err("previously published overlay must not be replaced");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert!(!overlay.exists());
+        assert!(!overlay_template_image(state_dir, 64 * 1024 * 1024).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_dirty_overlay_without_flush_ack_refuses_journal_replay() {
+        if openshell_core::e2fsprogs::resolve(&["mke2fs"]).is_err() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let state_dir = base.path();
+        let source = state_dir.join("source");
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/recover.txt"), b"saved marker\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &overlay, 64 * 1024 * 1024).unwrap();
+        let mut image = std::fs::read(&overlay).unwrap();
+        image[1024 + 0x60] |= 0x4; // ext4 incompat RECOVER: journal replay pending.
+        std::fs::write(&overlay, &image).unwrap();
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+        let error = driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect_err("legacy dirty image cannot be replayed without a flush ack");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert!(error.contains("unconfirmed ext4 journal"), "{error}");
+        assert_eq!(std::fs::read(&overlay).unwrap(), image);
+    }
+
+    #[tokio::test]
+    async fn stopped_full_overlay_keeps_saved_files_or_refuses_start() {
+        if ["mke2fs", "e2fsck", "debugfs", "resize2fs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let state_dir = base.path();
+        let source = state_dir.join("source");
+        let overlay = state_dir.join(SANDBOX_OVERLAY_IMAGE);
+        let generation = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::create_dir_all(source.join("upper/.openshell/state")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/recover.txt"), b"saved marker\n").unwrap();
+        std::fs::write(source.join("upper/fill"), vec![b'A'; 55 * 1024 * 1024]).unwrap();
+        std::fs::write(
+            source.join(format!(
+                "upper/.openshell/state/bootstrap-{generation}.json"
+            )),
+            b"old launch configuration",
+        )
+        .unwrap();
+        // The production image builder reserves extra initial headroom. Use
+        // mke2fs directly here to reproduce a guest that later filled it.
+        std::fs::File::create(&overlay)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let formatter = openshell_core::e2fsprogs::resolve(&["mke2fs", "mkfs.ext4"]).unwrap();
+        let mkfs_result = std::process::Command::new(formatter)
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-b",
+                "4096",
+                "-E",
+                "root_owner=0:0",
+                "-d",
+            ])
+            .arg(&source)
+            .arg(&overlay)
+            .output()
+            .unwrap();
+        assert!(mkfs_result.status.success(), "{mkfs_result:?}");
+        let image_header = std::fs::read(&overlay).unwrap();
+        let superblock = &image_header[1024..];
+        let free_blocks = u32::from_le_bytes(superblock[0x0c..0x10].try_into().unwrap());
+        let reserved_blocks = u32::from_le_bytes(superblock[0x08..0x0c].try_into().unwrap());
+        assert!(
+            free_blocks <= reserved_blocks,
+            "the guest must have no usable overlay blocks"
+        );
+        write_sandbox_owner_state(
+            state_dir,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::write(state_dir.join(HOST_BOUNDARY_GENERATION_FILE), generation).unwrap();
+        let saved_image = std::fs::read(&overlay).unwrap();
+
+        remove_runtime_generation_material(state_dir)
+            .await
+            .expect("stop queues guest cleanup");
+        assert_eq!(
+            std::fs::read(&overlay).unwrap(),
+            saved_image,
+            "stop must not write to an image with an unreplayed journal"
+        );
+        assert!(state_dir.join(PENDING_GUEST_GENERATIONS_FILE).exists());
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = state_dir.to_path_buf();
+        driver.config.overlay_disk_mib = 64;
+        begin_overlay_run(state_dir).expect("persist unacknowledged VM run");
+        let error = driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect_err("unacknowledged guest flush must refuse restart");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert_eq!(std::fs::read(&overlay).unwrap(), saved_image);
+        persist_overlay_marker(state_dir, SANDBOX_OVERLAY_FLUSH_ACK_FILE, false)
+            .expect("supervisor acknowledged guest flush");
+        match driver
+            .prepare_runtime_overlay(
+                state_dir,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                let debugfs = openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap();
+                let marker = std::process::Command::new(&debugfs)
+                    .args(["-R", "cat /upper/recover.txt"])
+                    .arg(&overlay)
+                    .output()
+                    .unwrap();
+                assert!(marker.status.success(), "{marker:?}");
+                assert_eq!(marker.stdout, b"saved marker\n");
+                let dump = state_dir.join("saved-fill");
+                let output = std::process::Command::new(&debugfs)
+                    .arg("-R")
+                    .arg(format!("dump /upper/fill {}", dump.display()))
+                    .arg(&overlay)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let contents = std::fs::read(&dump).expect("saved filler survived restart");
+                assert_eq!(contents, vec![b'A'; 55 * 1024 * 1024]);
+                assert!(!state_dir.join(PENDING_GUEST_GENERATIONS_FILE).exists());
+            }
+            Err(error) => {
+                assert!(error.contains("OverlayDiskFull"), "{error}");
+                assert_eq!(std::fs::read(&overlay).unwrap(), saved_image);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn overlay_recovery_preserves_smaller_disk_after_default_increase() {
+        if ["mke2fs", "e2fsck", "debugfs"]
+            .iter()
+            .any(|tool| openshell_core::e2fsprogs::resolve(&[tool]).is_err())
+        {
+            return;
+        }
+
+        let base = unique_temp_dir();
+        let source = base.join("source");
+        let overlay = base.join("overlay.ext4");
+        std::fs::create_dir_all(source.join("upper")).unwrap();
+        std::fs::create_dir_all(source.join("work")).unwrap();
+        std::fs::write(source.join("upper/work.txt"), b"saved work\n").unwrap();
+        create_ext4_image_from_dir_with_size(&source, &overlay, 64 * 1024 * 1024).unwrap();
+        write_sandbox_owner_state(
+            &base,
+            SandboxOwnerIdentity {
+                uid: 1000,
+                gid: 1001,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = base.clone();
+        driver.config.overlay_disk_mib = 128;
+        let template = overlay_template_image(&base, 128 * 1024 * 1024);
+        driver
+            .prepare_runtime_overlay(
+                &base,
+                &overlay,
+                Path::new("/must-not-read-image"),
+                OverlayPreparation::PreserveExisting,
+                None,
+            )
+            .await
+            .expect("start disk created under smaller default");
+
+        assert_eq!(std::fs::metadata(&overlay).unwrap().len(), 64 * 1024 * 1024);
+        assert!(!template.exists());
+        let output =
+            std::process::Command::new(openshell_core::e2fsprogs::resolve(&["debugfs"]).unwrap())
+                .arg("-R")
+                .arg("cat /upper/work.txt")
+                .arg(&overlay)
+                .output()
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"saved work\n");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prepare_sandbox_overlay_refuses_missing_saved_overlay() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let template = base.join("template.ext4");
         let overlay = base.join("overlay.ext4");
         std::fs::write(&template, b"fresh-overlay").unwrap();
 
-        prepare_sandbox_overlay_image(
+        let error = prepare_sandbox_overlay_image(
             &template,
             &overlay,
             OverlayPreparation::PreserveExisting,
             "fresh-overlay".len() as u64,
         )
-        .expect("create missing overlay");
+        .expect_err("a missing saved overlay must not be replaced");
 
-        assert_eq!(std::fs::read(&overlay).unwrap(), b"fresh-overlay");
+        assert!(error.contains("OverlayDiskFull"), "{error}");
+        assert!(!overlay.exists());
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -12988,8 +14051,180 @@ mod tests {
             .unwrap(),
             "blob"
         );
+        let blob = blob_dir.join("abc");
+        let staged_blob = image_dir
+            .join(GUEST_IMAGE_OCI_LAYOUT_DIR)
+            .join("blobs")
+            .join("sha256")
+            .join("abc");
+        assert_eq!(
+            fs::metadata(staged_blob).unwrap().ino(),
+            fs::metadata(blob).unwrap().ino()
+        );
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn stage_guest_image_payload_links_local_rootfs_archive_without_copy() {
+        let base = unique_temp_dir();
+        let staging_dir = base.join("staging");
+        fs::create_dir_all(&base).unwrap();
+        let rootfs_archive = base.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        fs::write(&rootfs_archive, b"exported rootfs").unwrap();
+
+        stage_guest_image_payload(
+            &staging_dir,
+            &GuestImagePayload {
+                image_ref: "local-big:1".to_string(),
+                image_identity: "sha256:local".to_string(),
+                source: GuestImagePayloadSource::LocalDocker {
+                    rootfs_archive: rootfs_archive.clone(),
+                },
+            },
+        )
+        .unwrap();
+
+        let image_dir = staging_dir.join("config").join(GUEST_IMAGE_CONFIG_DIR);
+        let staged = image_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        assert_eq!(
+            fs::read_to_string(image_dir.join("source")).unwrap(),
+            "local-docker"
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"exported rootfs");
+        // Same filesystem: the staged archive is the exported file, not a copy.
+        let source_meta = fs::metadata(&rootfs_archive).unwrap();
+        let staged_meta = fs::metadata(&staged).unwrap();
+        assert_eq!(staged_meta.ino(), source_meta.ino());
+        assert_eq!(staged_meta.nlink(), 2);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn link_or_copy_file_falls_back_to_copy_when_link_fails() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let source = base.join("source.tar");
+        let dest = base.join("dest.tar");
+        fs::write(&source, b"payload").unwrap();
+        // An existing destination makes hard_link fail with EEXIST, which
+        // takes the same fallback as a cross-filesystem EXDEV.
+        fs::write(&dest, b"stale").unwrap();
+
+        link_or_copy_file(&source, &dest).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        let source_meta = fs::metadata(&source).unwrap();
+        let dest_meta = fs::metadata(&dest).unwrap();
+        assert_ne!(dest_meta.ino(), source_meta.ino());
+        assert_eq!(source_meta.nlink(), 1);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn link_or_copy_file_reports_missing_source() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let error = link_or_copy_file(&base.join("missing.tar"), &base.join("dest.tar"))
+            .expect_err("missing source must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!base.join("dest.tar").exists());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn prepared_image_ready_event_requires_payload_staging() {
+        let base = unique_temp_dir();
+        fs::create_dir_all(&base).unwrap();
+        let mut driver = rootfs_tar_test_driver(&base, None);
+        driver.config.state_dir = base.clone();
+        driver.launcher_bin = base.join("missing-launcher");
+        let mut events = driver.events.subscribe();
+
+        let image_identity = "test-image";
+        let staging_dir = driver.image_staging_dir(image_identity);
+        fs::create_dir_all(&staging_dir).unwrap();
+        let archive = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
+        fs::write(&archive, b"payload").unwrap();
+        let payload = GuestImagePayload {
+            image_ref: "local:1".to_string(),
+            image_identity: image_identity.to_string(),
+            source: GuestImagePayloadSource::LocalDocker {
+                rootfs_archive: archive,
+            },
+        };
+
+        let error = driver
+            .build_prepared_image_disk(
+                "sb-local",
+                "local:1",
+                "local_docker",
+                image_identity,
+                Path::new("unused"),
+                &staging_dir,
+                &payload,
+                Some(7),
+            )
+            .await
+            .expect_err("test launcher must fail after staging");
+        assert!(error.message().contains("failed to run image-prep vm"));
+
+        let mut reasons = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload {
+                let event = platform.event.expect("platform event body");
+                if event.reason == "Pulled" {
+                    assert_eq!(
+                        progress_value(&event, PROGRESS_COMPLETE_STEP_KEY),
+                        Some(PROGRESS_STEP_PULLING_IMAGE)
+                    );
+                }
+                reasons.push(event.reason);
+            }
+        }
+        assert_eq!(
+            reasons,
+            vec![
+                "Pulled".to_string(),
+                "CreatingRootDisk".to_string(),
+                "PreparingRootfs".to_string()
+            ]
+        );
+
+        let bad_staging_dir = driver.image_staging_dir("bad-image");
+        fs::create_dir_all(&bad_staging_dir).unwrap();
+        let source_dir = base.join("source-dir");
+        fs::create_dir_all(&source_dir).unwrap();
+        let bad_payload = GuestImagePayload {
+            image_ref: "local:1".to_string(),
+            image_identity: "bad-image".to_string(),
+            source: GuestImagePayloadSource::LocalDocker {
+                rootfs_archive: source_dir,
+            },
+        };
+        let error = driver
+            .build_prepared_image_disk(
+                "sb-local",
+                "local:1",
+                "local_docker",
+                "bad-image",
+                Path::new("unused"),
+                &bad_staging_dir,
+                &bad_payload,
+                None,
+            )
+            .await
+            .expect_err("directory source must fail staging");
+        assert!(error.message().contains("stage guest image rootfs archive"));
+        assert!(
+            events.try_recv().is_err(),
+            "failed staging completed image step"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -13320,6 +14555,41 @@ while :; do sleep 0.05; done"#,
         let archive = request_dir.join("rootfs.tar");
         std::fs::write(&archive, contents).expect("write archive");
         archive
+    }
+
+    #[tokio::test]
+    async fn rootfs_tar_reports_requested_image_before_hashing() {
+        let root = unique_temp_dir();
+        let tar_path = root.join("req-missing").join("rootfs.tar");
+        fs::create_dir_all(tar_path.parent().unwrap()).expect("create request dir");
+        let driver = rootfs_tar_test_driver(&root, None);
+        let mut events = driver.events.subscribe();
+
+        let error = driver
+            .ensure_prepared_rootfs_tar_disk("sb-tar-progress", &tar_path, Path::new("unused"))
+            .await
+            .expect_err("missing archive must fail hashing");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+
+        let event = events
+            .try_recv()
+            .expect("image progress before hash failure");
+        let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload else {
+            panic!("expected platform event");
+        };
+        assert_eq!(platform.sandbox_id, "sb-tar-progress");
+        let progress = platform.event.expect("platform event body");
+        assert_eq!(progress.reason, "Pulling");
+        assert_eq!(
+            progress_value(&progress, PROGRESS_ACTIVE_STEP_KEY),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            progress_value(&progress, PROGRESS_ACTIVE_DETAIL_KEY),
+            tar_path.to_str()
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

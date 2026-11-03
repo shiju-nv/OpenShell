@@ -2352,48 +2352,56 @@ mod tests {
     #[tokio::test]
     async fn ingress_admission_is_checked_before_a_pooled_upstream_is_taken() {
         use openshell_core::proto::{IngressScope, SandboxIngressAdmission};
-        let state = crate::grpc::test_support::test_server_state().await;
-        let endpoint = endpoint();
-        let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: endpoint.sandbox_id.clone(),
-                name: endpoint.sandbox.clone(),
-                workspace: "default".into(),
+        for foreign_driver in [false, true] {
+            let state = crate::grpc::test_support::test_server_state().await;
+            let endpoint = endpoint();
+            let mut sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: endpoint.sandbox_id.clone(),
+                    name: endpoint.sandbox.clone(),
+                    workspace: "default".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        sandbox.status.as_mut().unwrap().ingress_admission = Some(SandboxIngressAdmission {
-            scope: IngressScope::SharedHostLoopback as i32,
-            all_ports: false,
-            ports: vec![9090],
-        });
-        state.store.put_message(&sandbox).await.unwrap();
-        state.store.put_message(&endpoint).await.unwrap();
-        let key = upstream_pool_key(endpoint.object_id(), 8080);
-        let (sender, _peer) = test_upstream().await;
-        state.service_upstreams.put(&key, sender);
-        let result = tokio::time::timeout(
-            Duration::from_millis(250),
-            proxy_to_endpoint(
-                state.clone(),
-                Request::builder().uri("/").body(Body::empty()).unwrap(),
-                "default",
-                endpoint.sandbox,
-                endpoint.name,
-            ),
-        )
-        .await
-        .expect("an unadmitted route must reject before pooled I/O");
-        assert_eq!(
-            result.unwrap_err().reason,
-            ServiceRouteError::endpoint_unavailable().reason
-        );
-        assert!(
-            state.service_upstreams.take(&key).is_some(),
-            "admission must precede taking any pooled connection"
-        );
+            };
+            if foreign_driver {
+                sandbox.metadata.as_mut().unwrap().annotations.insert(
+                    crate::compute::CREATED_BY_DRIVER_ANNOTATION.to_string(),
+                    "vm".to_string(),
+                );
+            }
+            sandbox.set_phase(SandboxPhase::Ready as i32);
+            sandbox.status.as_mut().unwrap().ingress_admission = Some(SandboxIngressAdmission {
+                scope: IngressScope::SharedHostLoopback as i32,
+                all_ports: false,
+                ports: vec![if foreign_driver { 8080 } else { 9090 }],
+            });
+            state.store.put_message(&sandbox).await.unwrap();
+            state.store.put_message(&endpoint).await.unwrap();
+            let key = upstream_pool_key(endpoint.object_id(), 8080);
+            let (sender, _peer) = test_upstream().await;
+            state.service_upstreams.put(&key, sender);
+            let result = tokio::time::timeout(
+                Duration::from_millis(250),
+                proxy_to_endpoint(
+                    state.clone(),
+                    Request::builder().uri("/").body(Body::empty()).unwrap(),
+                    "default",
+                    endpoint.sandbox,
+                    endpoint.name,
+                ),
+            )
+            .await
+            .expect("a foreign or unadmitted route must reject before pooled I/O");
+            assert_eq!(
+                result.unwrap_err().reason,
+                ServiceRouteError::endpoint_unavailable().reason
+            );
+            assert!(
+                state.service_upstreams.take(&key).is_some(),
+                "admission must precede taking any pooled connection"
+            );
+        }
     }
 
     #[tokio::test]

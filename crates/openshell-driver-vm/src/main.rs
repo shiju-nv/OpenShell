@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::sandbox_env::SupervisorOtlpArgs;
+use openshell_driver_vm::driver::image_cache_admin::{self, LockMode};
 #[cfg(target_os = "macos")]
-use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
+use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, VM_RUNTIME_REEXEC_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
     VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
@@ -26,6 +27,9 @@ use tracing::info;
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    #[command(subcommand)]
+    cache_command: Option<CacheCommand>,
+
     /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
     #[arg(
         long,
@@ -113,12 +117,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
     bootstrap_image: String,
 
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_DRIVER_STATE_DIR",
-        default_value = "target/openshell-vm-driver"
-    )]
-    state_dir: PathBuf,
+    #[arg(long, env = "OPENSHELL_VM_DRIVER_STATE_DIR")]
+    state_dir: Option<PathBuf>,
 
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
@@ -275,23 +275,139 @@ struct Args {
     vm_mount: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Inspect or prune the VM driver's prepared-image cache.
+    ImageCache {
+        #[command(subcommand)]
+        action: ImageCacheAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImageCacheAction {
+    /// List committed root disks and their persisted sandbox references.
+    List,
+    /// Remove only entries unreferenced by persisted sandboxes.
+    Prune {
+        #[arg(long, required = true)]
+        unused: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn run_cache_command(state_dir: &Path, command: &CacheCommand) -> Result<()> {
+    match command {
+        CacheCommand::ImageCache {
+            action: ImageCacheAction::List,
+        } => {
+            let lease = image_cache_admin::lock_existing_cache(state_dir, LockMode::Shared)
+                .into_diagnostic()?;
+            println!(
+                "ENTRY\tIMAGE\tALLOCATED_BYTES\tAPPARENT_BYTES\tLAST_USED_UNIX_MS\tCACHE_VERSION\tSANDBOXES"
+            );
+            for entry in lease.list().into_diagnostic()? {
+                let image = entry.image_ref.unwrap_or_else(|| "-".to_owned());
+                let image = image.replace(['\t', '\n', '\r'], " ");
+                let sandboxes = if entry.sandboxes.is_empty() {
+                    "-".to_owned()
+                } else {
+                    entry.sandboxes.join(",")
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    entry.id,
+                    image,
+                    entry.allocated_bytes,
+                    entry.apparent_bytes,
+                    entry
+                        .last_used_unix_ms
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                    entry.cache_version,
+                    sandboxes,
+                );
+            }
+        }
+        CacheCommand::ImageCache {
+            action: ImageCacheAction::Prune { unused, dry_run },
+        } => {
+            if !unused {
+                return Err(miette::miette!("prune requires --unused"));
+            }
+            let mode = if *dry_run {
+                LockMode::Shared
+            } else {
+                LockMode::Exclusive
+            };
+            let lease =
+                image_cache_admin::lock_existing_cache(state_dir, mode).into_diagnostic()?;
+            let report = lease.prune_unused(*dry_run).into_diagnostic()?;
+            let action = if *dry_run { "would remove" } else { "removed" };
+            println!(
+                "{action} {} entries, {} allocated bytes",
+                report.entries.len(),
+                report.allocated_bytes,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(command) = &args.cache_command {
+        let state_dir = args.state_dir.as_deref().ok_or_else(|| {
+            miette::miette!("image-cache requires --state-dir or OPENSHELL_VM_DRIVER_STATE_DIR")
+        })?;
+        return run_cache_command(state_dir, command);
+    }
+    if args.internal_run_vm {
+        return run_internal_vm(&args);
+    }
+
+    // Keep the embedded-runtime marker out of external-runtime launchers.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    // SAFETY: the async driver and its worker threads have not started.
+    unsafe {
+        std::env::remove_var(VM_RUNTIME_REEXEC_ENV);
+    }
+    run_async_driver(args)
+}
+
+fn run_internal_vm(args: &Args) -> Result<()> {
+    ensure_vm_worker_outside_tokio()?;
+    // libkrun forks its worker before any Tokio threads exist.
+    maybe_reexec_internal_vm_with_runtime_env()?;
+    let config = build_vm_launch_config(args).map_err(|err| miette::miette!("{err}"))?;
+    run_vm(&config).map_err(|err| miette::miette!("{err}"))
+}
+
+fn ensure_vm_worker_outside_tokio() -> Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(miette::miette!(
+            "internal VM worker must start before the Tokio runtime"
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn run_async_driver(args: Args) -> Result<()> {
+    let state_dir = args
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("target/openshell-vm-driver"));
     if let Some(request) = args.internal_prepare_image {
         openshell_driver_vm::driver::run_image_preparation_worker(&request)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
         return Ok(());
     }
-    if args.internal_run_vm {
-        // The VM launcher arms procguard after resolving its runtime so its
-        // libkrun worker cannot outlive the launcher.
-        maybe_reexec_internal_vm_with_runtime_env()?;
-        let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
-        run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
-        return Ok(());
-    }
+
+    let _cache_lease =
+        image_cache_admin::lock_cache(&state_dir, LockMode::Shared).into_diagnostic()?;
 
     let _tracing = openshell_otel::install_driver_tracing(
         openshell_driver_vm::otel_tracing::TRACING,
@@ -310,17 +426,17 @@ async fn main() -> Result<()> {
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
-    // Arm procguard so that if the gateway is killed (SIGKILL or crash)
-    // we also die. Without this the driver is reparented to init and
-    // keeps its per-sandbox VM launchers alive forever. Launchers have
-    // their own procguards (armed in `run_vm`) which cascade cleanup of
-    // the libkrun worker the moment this driver exits.
-    if let Err(err) = procguard::die_with_parent() {
-        tracing::warn!(
-            error = %err,
-            "procguard arm failed; gateway crashes may orphan this driver"
-        );
-    }
+    // The managed driver must not serve after its gateway exits. Its own
+    // process group keeps terminal SIGINT away during the gateway shutdown
+    // sweep, so a failed parent-death guard must stop startup instead of
+    // leaving the driver and its VM launchers behind.
+    let expected_gateway_pid = match &listen_mode {
+        ComputeDriverListenMode::Unix {
+            expected_peer_pid, ..
+        } => *expected_peer_pid,
+        ComputeDriverListenMode::Tcp(_) => None,
+    };
+    arm_driver_parent_guard(expected_gateway_pid)?;
 
     let supervisor_otlp = args.otlp.supervisor_otlp();
     let driver = VmDriver::new(VmDriverConfig {
@@ -331,7 +447,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
         supervisor_otlp,
         supervisor_gateway_name: args.gateway_name.clone(),
-        state_dir: args.state_dir.clone(),
+        state_dir,
         launcher_bin: None,
         default_image: args.default_image.clone(),
         bootstrap_image: args.bootstrap_image.clone(),
@@ -406,6 +522,43 @@ async fn main() -> Result<()> {
     };
     socket_cleanup.remove_socket_root();
     result
+}
+
+fn arm_driver_parent_guard(expected_gateway_pid: Option<u32>) -> Result<()> {
+    if let Some(expected) = expected_gateway_pid {
+        ensure_gateway_parent(expected)?;
+    }
+
+    // Launchers arm their own procguards in `run_vm`, which cascade cleanup
+    // to libkrun workers when this driver exits.
+    match procguard::die_with_parent() {
+        Ok(()) => {}
+        Err(err) if expected_gateway_pid.is_some() => {
+            return Err(miette::miette!(
+                "failed to arm managed VM driver parent-death guard: {err}"
+            ));
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "procguard arm failed; driver may outlive its parent");
+        }
+    }
+
+    // A subreaper can adopt an orphan before procguard reads getppid(). In
+    // that case it could arm against the subreaper instead of the gateway.
+    if let Some(expected) = expected_gateway_pid {
+        ensure_gateway_parent(expected)?;
+    }
+    Ok(())
+}
+
+fn ensure_gateway_parent(expected: u32) -> Result<()> {
+    let actual = nix::unistd::getppid().as_raw();
+    if i64::from(actual) != i64::from(expected) {
+        return Err(miette::miette!(
+            "expected gateway parent PID {expected}, found {actual}"
+        ));
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -733,9 +886,9 @@ fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
 fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
     use std::os::unix::process::CommandExt as _;
 
-    const REEXEC_ENV: &str = "__OPENSHELL_DRIVER_VM_REEXEC";
-
-    if std::env::var_os(REEXEC_ENV).is_some() {
+    if std::env::var_os(VM_RUNTIME_REEXEC_ENV).is_some()
+        || std::env::var_os(VM_RUNTIME_DIR_ENV).is_some()
+    {
         return Ok(());
     }
 
@@ -768,7 +921,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
         .args(&args)
         .env("DYLD_LIBRARY_PATH", &joined)
         .env(VM_RUNTIME_DIR_ENV, runtime_dir)
-        .env(REEXEC_ENV, "1")
+        .env(VM_RUNTIME_REEXEC_ENV, "1")
         .exec();
     // `exec()` only returns on failure.
     Err(miette::miette!("failed to re-exec with runtime env: {err}"))
@@ -784,11 +937,66 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode, parse_vm_mount_arg,
+        Args, CacheCommand, ComputeDriverListenMode, ImageCacheAction, PeerCredentials,
+        authorize_peer_credentials, compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn internal_vm_worker_rejects_tokio_context() {
+        assert!(super::ensure_vm_worker_outside_tokio().is_ok());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("Tokio runtime");
+        runtime.block_on(async {
+            let error = super::ensure_vm_worker_outside_tokio().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must start before the Tokio runtime")
+            );
+        });
+    }
+
+    #[test]
+    fn image_cache_commands_parse_and_prune_requires_unused() {
+        let list = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--state-dir",
+            "/tmp/vm-state",
+            "image-cache",
+            "list",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.cache_command,
+            Some(CacheCommand::ImageCache {
+                action: ImageCacheAction::List
+            })
+        ));
+        assert_eq!(list.state_dir, Some(PathBuf::from("/tmp/vm-state")));
+
+        assert!(Args::try_parse_from(["openshell-driver-vm", "image-cache", "prune"]).is_err());
+        let prune = Args::try_parse_from([
+            "openshell-driver-vm",
+            "image-cache",
+            "prune",
+            "--unused",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            prune.cache_command,
+            Some(CacheCommand::ImageCache {
+                action: ImageCacheAction::Prune {
+                    unused: true,
+                    dry_run: true
+                }
+            })
+        ));
+    }
 
     #[test]
     fn corporate_proxy_flags_parse_into_driver_settings() {

@@ -54,6 +54,7 @@ the same information.
 ## Select a Compute Driver
 
 Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.
+When changing the driver, see [Gateway Configuration File](/how-it-works/gateways/configuration) for how the gateway retains sandboxes created by the previous driver.
 
 ```toml
 [openshell]
@@ -242,6 +243,61 @@ Podman also supports `image` mounts, which mount a container image read-only at 
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
 
+### Re-sign the macOS VM driver
+
+For a managed Mac, place the matching `libkrun.dylib` and
+`libkrunfw.5.dylib` in an administrator-owned runtime directory. Use a
+`vm-runtime-darwin-aarch64` archive built with this driver revision. The
+macOS runtime build adds `krun_set_fw_path` to the pinned libkrun so the
+driver can pass a canonical absolute firmware path. Earlier archives lack
+that entry point and cannot boot a hardened driver through this override.
+
+Sign both libraries and `openshell-driver-vm` with the same Developer ID
+Application identity and the hardened runtime. Apple's
+[library validation rule](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.disable-library-validation)
+allows a hardened process to load libraries signed with its Team ID. The
+repository's [VM driver entitlement file](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/entitlements.plist)
+provides `com.apple.security.hypervisor`. A VM boot with matching Developer
+ID signatures has not yet been verified.
+
+If the libraries are ad-hoc signed or signed by a different Team ID, the
+driver also needs `com.apple.security.cs.disable-library-validation`. The
+ad-hoc hardened-runtime VM proof used both entitlements. It did not need
+`com.apple.security.cs.allow-dyld-environment-variables`.
+
+This example stages the two libraries from a newly built matching archive.
+Replace the identity, archive, and paths for your package:
+
+```shell
+mkdir -p runtime
+zstd -dc vm-runtime-darwin-aarch64.tar.zst |
+  tar -xf - -C runtime ./libkrun.dylib ./libkrunfw.5.dylib
+
+identity='Developer ID Application: Your Organization (TEAMID)'
+codesign --force --options runtime --timestamp -s "$identity" runtime/libkrunfw.5.dylib
+codesign --force --options runtime --timestamp -s "$identity" runtime/libkrun.dylib
+codesign --force --options runtime --timestamp \
+  --entitlements crates/openshell-driver-vm/entitlements.plist \
+  -s "$identity" openshell-driver-vm
+
+codesign --verify --strict runtime/libkrunfw.5.dylib
+codesign --verify --strict runtime/libkrun.dylib
+codesign --verify --strict openshell-driver-vm
+```
+
+Set `OPENSHELL_VM_RUNTIME_DIR` to the absolute path of that directory in the
+gateway's service environment, for example:
+
+```shell
+OPENSHELL_VM_RUNTIME_DIR=/opt/example/openshell/runtime \
+  openshell-gateway --config /etc/openshell/gateway.toml
+```
+
+The managed VM driver inherits the setting. It opens both dylibs by canonical
+absolute path inside the selected directory and does not depend on `DYLD_*`
+environment variables. Without the override, it uses its embedded runtime.
+Keep the runtime directory writable only by administrators.
+
 The VM driver is opt-in. Enable it in the gateway TOML file:
 
 ```toml
@@ -260,7 +316,28 @@ Common options in `[openshell.drivers.vm]` are `default_image`, `bootstrap_image
 
 The driver looks up sandbox images in local Docker or Podman before pulling from a registry. On Linux with Podman, start `podman.socket` so the driver can find local images.
 
+The CLI shows the byte count during local image export and completes the image
+step after staging. For rootfs tar sources, it identifies the archive before
+hashing and completes the step after staging or a cache hit.
+
 Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
+
+The VM driver keeps old image disks until you prune them. On the gateway
+host, run cache commands as the account that owns the VM state directory.
+Pass the gateway's existing `state_dir` explicitly to the VM driver
+binary to inspect the cache and preview unused entries:
+
+```shell
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache list
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unused --dry-run
+```
+
+Stop the VM gateway and any older standalone VM driver using the same
+state directory before running `image-cache prune --unused` without `--dry-run`.
+Prune preserves disks referenced by kept sandboxes, including
+stopped ones. Older entries can lack an image reference or last-use timestamp
+in the listing. Disks prepared from a rootfs tar have no container image
+reference in the listing.
 
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
@@ -271,6 +348,17 @@ If the gateway is briefly unavailable while a VM starts, its supervisor retries 
 When you run `openshell sandbox stop` while the main process is running, OpenShell terminates the workload and flushes the guest root filesystem before acknowledging termination. The guest waits up to three seconds for the flush. The host allows up to 22 seconds for supervisor shutdown, then up to five seconds to stop the VM.
 
 Flush errors and timeouts produce warnings while shutdown continues. If a signal kills the supervisor, the driver warns that the guest flush was not confirmed and recent writes may be lost. A completed stop does not guarantee persistence after a failed or timed-out flush. This flush does not cover stops after the main process has already exited.
+
+When you start a stopped MicroVM sandbox, the driver checks its overlay filesystem. If fewer than 32 MiB are usable after repair, it grows the sparse disk by at least 64 MiB and rechecks free space before booting. It can grow further in the same start if needed. The sandbox watch stream reports an `OverlayDiskFull` warning when the disk grows. If a previous start left the sandbox in Error, stop it before retrying. After it reaches Ready, download its work and remove the files that filled the disk:
+
+```shell
+openshell sandbox stop full
+openshell sandbox start full
+openshell sandbox download full /sandbox/work ./work
+openshell sandbox exec full -- rm -f /sandbox/fill
+```
+
+If recovery would discard saved blocks, needs interactive filesystem repair, or cannot grow the disk, start reports `OverlayDiskFull` and retains the original overlay for inspection. The driver also refuses to replace a missing saved overlay with an empty one, or to replay an unacknowledged dirty journal. Recovery needs `resize2fs` and free space on the gateway host. A later full-disk restart can grow the disk again. `overlay_disk_mib` sets the initial size of new sandboxes, not a limit on recovery growth; changing it does not resize an existing overlay.
 
 ### MicroVM Mounts
 

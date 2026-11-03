@@ -32,6 +32,10 @@ impl Fixture {
                 "test \"$1\" = -V || exit 64\ntest \"$#\" = 1 || exit 65\nread ignored && exit 66\ntest \"$PREFLIGHT_TEST_ENV\" = inherited || exit 67\necho '{name} 1.47.4' >&2"
             ));
         }
+        fixture.tool(
+            "resize2fs",
+            "test \"$#\" = 0 || exit 64\nread ignored && exit 66\ntest \"$PREFLIGHT_TEST_ENV\" = inherited || exit 67\necho 'resize2fs 1.47.4' >&2\nexit 1",
+        );
         fixture
     }
 
@@ -119,7 +123,7 @@ async fn local_vm_reports_tools_without_starting_driver_or_creating_state() {
     let output = fixture.run(&[]).await;
     assert!(output.status.success(), "{}", combined(&output));
     let report = String::from_utf8_lossy(&output.stdout);
-    for name in ["mke2fs", "debugfs", "e2fsck"] {
+    for name in ["mke2fs", "debugfs", "e2fsck", "resize2fs"] {
         let path = fixture
             .tools
             .join(name)

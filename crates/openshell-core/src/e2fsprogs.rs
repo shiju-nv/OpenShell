@@ -85,9 +85,9 @@ fn resolve_in(names: &[&str], dirs: &[PathBuf]) -> Result<PathBuf, String> {
     ))
 }
 
-/// Check a formatter, `debugfs`, and `e2fsck` without creating images or driver state.
+/// Check a formatter, `debugfs`, `e2fsck`, and `resize2fs` without creating images or driver state.
 ///
-/// Each selected executable receives only `-V`, with null stdin, a five-second
+/// Version probes use `-V`, or no arguments for `resize2fs`, with null stdin, a five-second
 /// deadline, and at most 8 KiB captured per stream. Errors retain the selected
 /// path and the tool's diagnostics. Image health requires a separate check.
 pub async fn preflight(cancellation: watch::Receiver<bool>) -> Result<Vec<String>, String> {
@@ -113,18 +113,26 @@ async fn preflight_in_with_cancellation(
         (&["mke2fs", "mkfs.ext4"][..], "mke2fs"),
         (&["debugfs"][..], "debugfs"),
         (&["e2fsck"][..], "e2fsck"),
+        (&["resize2fs"][..], "resize2fs"),
     ] {
         let result = async {
             let path = resolve_in(names, dirs)?;
             let label = path.display();
-            let output = run_version_probe(Command::new(&path), &mut cancellation)
+            let mut command = Command::new(&path);
+            let probe = if identity == "resize2fs" { "" } else { "-V" };
+            if !probe.is_empty() {
+                command.arg(probe);
+            }
+            let output = run_version_probe(command, &mut cancellation)
                 .await
-                .map_err(|error| format!("run {label} -V: {error}. {INSTALL_GUIDANCE}"))?;
+                .map_err(|error| format!("run {label} {probe}: {error}. {INSTALL_GUIDANCE}"))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !output.status.success() {
+            // With no filesystem argument resize2fs prints its version and exits 1.
+            let expected_exit = i32::from(identity == "resize2fs");
+            if output.status.code() != Some(expected_exit) {
                 return Err(format!(
-                    "{label} -V failed with status {}\nstdout: {stdout}\nstderr: {stderr}\n{INSTALL_GUIDANCE}",
+                    "{label} {probe} failed with status {}\nstdout: {stdout}\nstderr: {stderr}\n{INSTALL_GUIDANCE}",
                     output.status
                 ));
             }
@@ -221,7 +229,6 @@ async fn run_version_probe(
     }
     let mut command = tokio::process::Command::from(command);
     command
-        .arg("-V")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -379,6 +386,11 @@ mod tests {
                 &format!("test \"$1\" = -V || exit 64\necho '{name} 1.47.4' >&2"),
             );
         }
+        fake_e2fs_tool(
+            directory,
+            "resize2fs",
+            "test \"$#\" = 0 || exit 64\necho 'resize2fs 1.47.4' >&2\nexit 1",
+        );
     }
 
     #[tokio::test]
@@ -412,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_preflight_requires_debugfs_and_recovery_tool() {
-        for missing in ["debugfs", "e2fsck"] {
+        for missing in ["debugfs", "e2fsck", "resize2fs"] {
             let temp = tempfile::tempdir().expect("partial installation");
             fake_e2fs_installation(temp.path());
             fs::remove_file(temp.path().join(missing)).expect("remove required tool");
@@ -425,6 +437,22 @@ mod tests {
                 "earlier path lost: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn filesystem_preflight_rejects_failed_resize_probe() {
+        let temp = tempfile::tempdir().expect("private prefix");
+        fake_e2fs_installation(temp.path());
+        fake_e2fs_tool(
+            temp.path(),
+            "resize2fs",
+            "echo 'resize2fs 1.47.4' >&2\nexit 42",
+        );
+        let error = preflight_in(&[temp.path().to_path_buf()])
+            .await
+            .expect_err("failed resize2fs must reject preparation");
+        assert!(error.contains("failed with status"), "{error}");
+        assert!(error.contains("resize2fs"), "{error}");
     }
 
     #[cfg(target_os = "linux")]

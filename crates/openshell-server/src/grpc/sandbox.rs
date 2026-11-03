@@ -903,6 +903,7 @@ async fn handle_create_sandbox_inner(
 /// rewriting retained legacy records or accepting driver-supplied evidence.
 fn project_public_sandbox(state: &ServerState, mut sandbox: Sandbox) -> Sandbox {
     state.compute.project_ingress_admission(&mut sandbox);
+    state.compute.project_driver_availability(&mut sandbox);
     sandbox
 }
 
@@ -1163,8 +1164,12 @@ pub(super) async fn handle_list_sandboxes(
         state.compute.project_ingress_admission(sandbox);
     }
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    let mut sandboxes = page.messages;
+    for sandbox in &mut sandboxes {
+        state.compute.project_driver_availability(sandbox);
+    }
     Ok(Response::new(ListSandboxesResponse {
-        sandboxes: page.messages,
+        sandboxes,
         next_page_token,
     }))
 }
@@ -2795,6 +2800,7 @@ pub(super) async fn handle_exec_sandbox(
         completion.ensure_target(sandbox.object_id())?;
     }
 
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     require_ready_sandbox(&sandbox)?;
 
     // Open a relay channel through the supervisor session. Use a 15s
@@ -2925,6 +2931,7 @@ pub(super) async fn handle_forward_tcp(
         MinWorkspaceRole::User,
     )
     .await?;
+    state.compute.validate_compute_driver_binding(&sandbox)?;
 
     if let relay_open::Target::Tcp(target) = &target {
         state.compute.admit_ingress_port(&sandbox, target.port)?;
@@ -3362,6 +3369,7 @@ pub(super) async fn handle_exec_sandbox_interactive_start(
         completion.ensure_target(sandbox.object_id())?;
     }
 
+    state.compute.validate_compute_driver_binding(&sandbox)?;
     require_ready_sandbox(&sandbox)?;
 
     let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
@@ -3452,6 +3460,7 @@ pub(super) async fn handle_create_ssh_session(
     )
     .await?;
     let sandbox_id = sandbox.object_id().to_string();
+    state.compute.validate_compute_driver_binding(&sandbox)?;
 
     if !sandbox_relay_reachable(state, &sandbox) {
         return Err(Status::failed_precondition("sandbox is not ready"));
@@ -10788,6 +10797,209 @@ mod tests {
             first_page.sandboxes[0].object_id(),
             second_page.sandboxes[0].object_id()
         );
+    }
+
+    #[tokio::test]
+    async fn foreign_driver_blocks_ssh_tcp_and_service_exposure() {
+        use openshell_core::proto::open_shell_client::OpenShellClient;
+        use openshell_core::proto::open_shell_server::OpenShellServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let state = test_server_state_with_driver("docker").await;
+        let mut sandbox = test_sandbox("foreign", Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::compute::CREATED_BY_DRIVER_ANNOTATION.to_string(),
+            "vm".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let stored = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = handle_create_ssh_session(
+            &state,
+            authed_request(CreateSshSessionRequest {
+                sandbox: "foreign".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+
+        let error = crate::grpc::service::expose_service_endpoint(
+            &state,
+            "default",
+            &sandbox,
+            "web",
+            8080,
+            ServiceAuthorizationMode::Strip,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<ServiceEndpoint>(
+                    "default",
+                    &crate::service_routing::endpoint_key("foreign", "web"),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let principal = authed_request(())
+            .extensions_mut()
+            .remove::<crate::auth::principal::Principal>()
+            .unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(OpenShellServer::with_interceptor(
+                    crate::grpc::OpenShellService::new(state.clone()),
+                    move |mut request: Request<()>| {
+                        request.extensions_mut().insert(principal.clone());
+                        Ok(request)
+                    },
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let mut client = OpenShellClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+        let frame = TcpForwardFrame {
+            payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+                TcpForwardInit {
+                    sandbox: "foreign".into(),
+                    workspace: "default".into(),
+                    target: Some(loopback_tcp_target()),
+                    ..Default::default()
+                },
+            )),
+        };
+        let error = client
+            .forward_tcp(tokio_stream::iter([frame]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
+        server.abort();
+
+        assert_eq!(
+            state
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap(),
+            Some(stored),
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_driver_responses_show_unavailable_without_changing_store() {
+        use tokio_stream::StreamExt as _;
+
+        let state = test_server_state_with_driver("docker").await;
+        let mut sandbox = test_sandbox("foreign", Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            crate::compute::CREATED_BY_DRIVER_ANNOTATION.to_string(),
+            "vm".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        let stored = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = Some(openshell_core::proto::workspace_selector(
+            "default".to_string(),
+        ));
+
+        let got = handle_get_sandbox(
+            &state,
+            authed_request(GetSandboxRequest {
+                name: "foreign".to_string(),
+                workspace_scope: scope.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        let listed = handle_list_sandboxes(
+            &state,
+            authed_request(ListSandboxesRequest {
+                workspace_scope: scope.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut watched = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: "foreign".to_string(),
+                workspace_scope: scope.clone(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let event = watched.next().await.unwrap().unwrap();
+        let openshell_core::proto::sandbox_stream_event::Payload::Sandbox(watch_sandbox) =
+            event.payload.unwrap()
+        else {
+            panic!("watch must send the sandbox snapshot first");
+        };
+        watched.disconnect_and_wait().await;
+        assert_eq!(listed.sandboxes.len(), 1);
+        for response in [&got, &listed.sandboxes[0], &watch_sandbox] {
+            assert_eq!(response.phase(), SandboxPhase::Ready as i32);
+            let condition = response
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .find(|condition| condition.r#type == "Ready")
+                .unwrap();
+            assert_eq!(condition.status, "False");
+            assert_eq!(condition.reason, "ComputeDriverMismatch");
+            assert!(condition.message.contains("'vm'"));
+            assert!(condition.message.contains("'docker'"));
+        }
+        let current = state
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current, stored);
+
+        let error = handle_exec_sandbox(
+            &state,
+            authed_request(ExecSandboxRequest {
+                sandbox: "foreign".to_string(),
+                command: vec!["true".to_string()],
+                workspace_scope: scope,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("compute driver 'vm'"));
     }
 
     #[tokio::test]

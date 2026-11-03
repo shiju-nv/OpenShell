@@ -1491,12 +1491,31 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, `e2fsck`, and `resize2fs` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- If a stopped VM sandbox reports `OverlayDiskFull`, check host free space and `resize2fs`, then retry start. Once it reaches Ready, download its work and remove the files that filled the overlay. The driver retains the overlay if repair or growth fails.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.
 - Host virtualization support is enabled.
+- On macOS with `OPENSHELL_VM_RUNTIME_DIR` set in the gateway service
+  environment, the directory contains `libkrun.dylib` and
+  `libkrunfw.5.dylib` from the matching runtime build. Use
+  `codesign -dv --verbose=2` on both libraries and `openshell-driver-vm` to
+  compare their Team IDs. A hardened driver needs
+  `com.apple.security.cs.disable-library-validation` for ad-hoc libraries or
+  libraries signed by another Team ID. The runtime must export
+  `krun_set_fw_path`; older archives lack the absolute firmware path support.
+  See the
+  [macOS signing recipe](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes#re-sign-the-macos-vm-driver).
 - The sandbox supervisor can establish its authenticated gateway session.
+
+If the VM host reports `No space left on device`, inspect committed image disks
+with `openshell-driver-vm --state-dir <configured-state-dir> image-cache list`.
+Preview cleanup with `image-cache prune --unused --dry-run` using the same
+`--state-dir`. The state directory must already exist. Stop the VM gateway and
+any older standalone VM driver before running `image-cache prune --unused`
+without `--dry-run`; the driver protects persisted sandbox references and
+refuses cleanup while its process holds the cache lease.
 
 For `vm.mounts` (virtiofs host bind mounts) failures, also verify:
 

@@ -166,7 +166,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | Configuration key | Default | Purpose |
 |---|---|---|
 | `grpc_endpoint` | empty | Required. URL the native host supervisor uses to reach the gateway. Host loopback such as `http://127.0.0.1:<port>` is valid. Legacy guest aliases are normalized to host loopback. This endpoint is never sent into the VM. |
-| `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, and image cache. Relative paths are resolved to absolute paths at driver startup. |
+| `state_dir` | OpenShell state directory under `vm-driver` (fallback: `target/openshell-vm-driver`) | Per-sandbox overlay disks, console logs, and image cache. Relative paths are resolved to absolute paths at driver startup. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Falls back only to the operator-configured `default_image`; the driver refuses to start when both are empty. |
@@ -213,10 +213,14 @@ payload to a temporary bootstrap VM, and guest init runs `umoci raw unpack` onto
 Linux-owned ext4 storage. The resulting disk is cached under
 `<state-dir>/images/<cache-id>/rootfs.ext4` and attached read-only to later
 sandboxes. Local Docker images are still exported as rootfs tar archives and
-prepared inside the bootstrap VM. The driver checks that a prepared disk
-contains the unpacked rootfs before caching it; on failure it caches nothing
-and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
-tune registry layer download parallelism (default `4`, maximum `16`).
+prepared inside the bootstrap VM. Local exports report bytes written as
+progress, and the image step completes once the payload is staged. The driver
+hard-links staged rootfs archives and registry layout blobs into the disk-format
+input tree when possible, falling back to a copy across filesystems. The driver
+checks that a prepared disk contains the unpacked rootfs before caching it; on
+failure, it caches nothing and reports the image-prep console tail. Set
+`OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to tune registry layer download
+parallelism (default `4`, maximum `16`).
 Registry pulls in both caches use the resolved digest as an immutable reference.
 The driver verifies the downloaded manifest against that digest before downloading
 layers. For multi-platform images, it verifies the index and then the selected
@@ -239,6 +243,40 @@ Image and writable-overlay preparation run in owned worker processes. Stopping o
 
 At startup, the driver reclaims inactive attempts in this directory. It preserves active attempts, committed image caches, and unmarked staging from older releases. Concurrent preparations serialize image-cache publication; an interrupted attempt cannot publish a partial disk over an existing cache entry. Gateway upload slots for `rootfs_tar_path` keep their existing, separate lifecycle.
 
+### Inspect and prune image disks
+
+Run the VM driver binary on the gateway host. Pass the gateway's existing
+`state_dir` explicitly; cache commands reject an omitted or missing state directory:
+
+```shell
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache list
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unused --dry-run
+```
+
+`list` reports each committed root disk's cache ID, image reference, allocated
+and apparent bytes, last-use Unix timestamp in milliseconds, cache layout
+version, and persisted sandbox IDs that reference it. Older entries without
+cache metadata show `-` for the image reference and last use. Disks prepared
+from a rootfs tar show `-` for image reference because no container image
+produced them. New cache uses record this metadata without changing the disk
+contents.
+
+Stop the VM gateway before removing entries, then run:
+
+```shell
+openshell-driver-vm --state-dir /path/to/vm-driver-state image-cache prune --unused
+```
+
+Prune removes only committed disks that no persisted sandbox references. It
+leaves disks referenced by stopped sandboxes in place. For sandboxes created
+before bootstrap identities were persisted, it conservatively preserves all
+bootstrap disks. Prune refuses to run while a current driver holds the state
+lock or an older driver is reachable at the default state socket. Stop older
+standalone drivers that use a custom socket explicitly; their socket is outside
+this check. The reported bytes are the disks' allocated bytes before removal.
+Filesystem snapshots and shared blocks can make actual free space differ.
+Nothing is removed automatically.
+
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
 with the prepared image rootfs as lowerdir when present, otherwise the bootstrap
@@ -246,6 +284,26 @@ rootfs is used directly. Writes to `/sandbox` and other mutable paths land in
 the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.
+
+On restart, the driver checks a preserved overlay with read-only `e2fsck`,
+then replays the journal and checks the filesystem on a private copy before
+writing new launch files. If fewer than 32 MiB are available after the check,
+it grows the sparse disk and ext4 filesystem by at least 64 MiB and rechecks
+usable space before booting. Recovery can grow further in the same start.
+The driver refuses a full overlay if journal replay or repair would release
+saved blocks, or if preen requests orphan reconnection or another interactive
+repair. The original image remains untouched in these cases. Guest credential
+cleanup runs on the recovered copy after journal replay. VM shutdown flushes
+the guest filesystem and records a durable acknowledgement. A restart refuses
+an unacknowledged flush, and older overlays with an unreplayed journal are
+refused if no acknowledgement exists.
+The driver publishes an `OverlayDiskFull` warning when it grows the disk. Later
+full-disk restarts can grow it again. `overlay_disk_mib` sets the initial size
+of new overlays; it is not a hard cap on recovery growth, and changing it does
+not resize existing overlays. Recovery requires `resize2fs` on the gateway
+host. A missing previously published overlay is never replaced with an empty
+one. A failed recovery reports `OverlayDiskFull` and retains the original
+image for inspection.
 
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
@@ -297,7 +355,7 @@ create TAP devices or install nftables/iptables rules.
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - Rust toolchain
-- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, `debugfs`, `e2fsck`, and `resize2fs`) for root and overlay disk image creation and recovery
 - Guest-sandbox cross-compile toolchain (needed on macOS, and on Linux when host arch differs from the guest):
   - Matching static guest target: `rustup target add aarch64-unknown-linux-musl` (or `x86_64-unknown-linux-musl` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` cross-compiles the Linux guest `openshell-sandbox` and its matching `openshell-supervisor`.
@@ -336,6 +394,17 @@ Homebrew installs `openshell`, `openshell-gateway`, and the self-contained
 driver with the Hypervisor entitlement in `post_install` and owns the `brew
 services` gateway lifecycle. The service also leaves `OPENSHELL_DRIVERS` unset
 so driver choice remains automatic unless the user explicitly overrides it.
+
+For organization-signed macOS packages, `OPENSHELL_VM_RUNTIME_DIR` selects a
+separately signed runtime instead of extracting the embedded libraries. The
+driver resolves both dylibs to canonical absolute paths inside that directory
+and passes the firmware path to libkrun before creating a VM context. This
+avoids `DYLD_*` loader variables and process-wide working-directory changes.
+The runtime must be built with the `krun_set_fw_path` entry point added by
+`build-libkrun-macos.sh`; older runtime archives lack it and are rejected.
+The directory must contain `libkrun.dylib` and `libkrunfw.5.dylib` from
+the matching VM runtime build. Keep it writable only by administrators. See
+the [macOS re-signing recipe](../../docs/how-it-works/sandboxes/runtimes.mdx#re-sign-the-macos-vm-driver).
 
 ## TODOs
 
