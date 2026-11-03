@@ -26,16 +26,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::endpoint_status::{EndpointResult, EndpointStatusSnapshot};
 use crate::proto::{
-    DenialSummary, EndpointObservation as ProtoEndpointObservation,
+    ConfigurationAdmissionState, DenialSummary, EndpointObservation as ProtoEndpointObservation,
     EndpointResult as ProtoEndpointResult, ExchangeProviderSubjectTokenRequest,
     GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, NetworkActivitySummary,
     PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    ReportEndpointStatusRequest, ReportPolicyStatusRequest, ReportSandboxConfigurationRequest,
+    SandboxConfigurationAdmission, SandboxPolicy as ProtoSandboxPolicy,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
     open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
+use crate::startup_policy::{AttachPolicyRefusal, POLICY_REVISION_CREATED_HEADER};
 use crate::time::{duration_to_std, timestamp_to_millis};
 use crate::token_grant_failure::{TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -1249,7 +1251,7 @@ pub async fn fetch_policy(
 /// Callers that must acknowledge the exact revision they loaded should retain
 /// this snapshot instead of re-fetching metadata after policy construction.
 /// The snapshot also carries the external middleware registrations required
-/// by the policy.
+/// by the policy. Pass the workspace once it is known.
 #[tracing::instrument(
     name = "supervisor.gateway.fetch_settings_snapshot",
     skip_all,
@@ -1258,6 +1260,7 @@ pub async fn fetch_policy(
 pub async fn fetch_settings_snapshot(
     gateway: &GatewayEndpoint,
     sandbox_name: &str,
+    workspace: Option<&str>,
 ) -> Result<SettingsPollResult> {
     let status = ClientSpanStatus::current();
     debug!(endpoint = %gateway.url(), sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
@@ -1266,7 +1269,7 @@ pub async fn fetch_settings_snapshot(
         fetch_settings_snapshot_with_client(
             &mut client,
             sandbox_name,
-            None,
+            workspace,
             gateway.supported_capabilities.clone(),
         )
         .await,
@@ -1315,125 +1318,61 @@ async fn fetch_policy_with_client(
     })?))
 }
 
-/// Sync a locally-discovered policy using an existing client connection.
-async fn sync_policy_with_client(
-    client: &mut OpenShellClient<AuthedChannel>,
-    sandbox: &str,
-    policy: &ProtoSandboxPolicy,
-    workspace: &str,
-) -> Result<()> {
-    client
-        .update_config(UpdateConfigRequest {
-            sandbox: sandbox.to_string(),
-            workspace_scope: Some(crate::proto::workspace_selector(workspace)),
-            policy: Some(policy.clone()),
-            ..Default::default()
-        })
-        .await
-        .map_err(grpc_status_error)
-        .wrap_err("failed to sync policy to server")?;
-
-    Ok(())
-}
-
-/// Discover and sync policy using a single gRPC connection.
+/// Sync a policy to the gateway and return the revision it confirms this call created.
 ///
-/// Performs the full discovery flow (fetch → sync → re-fetch) over one
-/// channel instead of establishing three separate connections.
-pub async fn discover_and_sync_policy(
-    gateway: &GatewayEndpoint,
-    sandbox: &str,
-    discovered_policy: &ProtoSandboxPolicy,
-    workspace: &str,
-) -> Result<ProtoSandboxPolicy> {
-    debug!(
-        endpoint = %gateway.url(),
-        sandbox = %sandbox,
-        "Syncing discovered policy and re-fetching canonical version"
-    );
-
-    let mut client = connect(gateway).await?;
-
-    // Sync the discovered policy to the gateway.
-    sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
-
-    // Re-fetch from the gateway to get the canonical version/hash.
-    fetch_settings_snapshot_with_client(
-        &mut client,
-        sandbox,
-        Some(workspace),
-        gateway.supported_capabilities.clone(),
-    )
-    .await?
-    .policy
-    .ok_or_else(|| miette::miette!("Server still returned no policy after sync — this is a bug"))
-}
-
-/// Sync an enriched policy back to the gateway.
-///
-/// Used by the supervisor to push baseline-path-enriched policies so the
-/// gateway stores the effective policy users see via `openshell sandbox get`.
+/// An older gateway or a deduplicated write returns no creation receipt.
+#[tracing::instrument(
+    name = "supervisor.gateway.sync_startup_policy",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn sync_policy(
     gateway: &GatewayEndpoint,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
-) -> Result<()> {
-    debug!(endpoint = %gateway.url(), sandbox = %sandbox, "Syncing enriched policy to gateway");
-    let mut client = connect(gateway).await?;
-    sync_policy_with_client(&mut client, sandbox, policy, workspace).await
-}
-
-/// Sync an enriched policy and return the authoritative revision snapshot.
-#[tracing::instrument(
-    name = "supervisor.gateway.sync_policy_and_fetch_snapshot",
-    skip_all,
-    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
-)]
-pub async fn sync_policy_and_fetch_snapshot(
-    gateway: &GatewayEndpoint,
-    sandbox: &str,
-    policy: &ProtoSandboxPolicy,
-    workspace: &str,
-) -> Result<SettingsPollResult> {
+) -> Result<Option<u32>> {
     let status = ClientSpanStatus::current();
+    debug!(endpoint = %gateway.url(), sandbox = %sandbox, "Syncing policy to gateway");
     let mut client = connect(gateway).await?;
-    sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    status.finish(
-        fetch_settings_snapshot_with_client(
-            &mut client,
-            sandbox,
-            Some(workspace),
-            gateway.supported_capabilities.clone(),
-        )
-        .await,
-    )
+    let response = status.finish(
+        client
+            .update_config(UpdateConfigRequest {
+                sandbox: sandbox.to_string(),
+                workspace_scope: Some(crate::proto::workspace_selector(workspace)),
+                policy: Some(policy.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(grpc_status_error)
+            .wrap_err("failed to sync policy to server"),
+    )?;
+    let created = response
+        .metadata()
+        .get(POLICY_REVISION_CREATED_HEADER)
+        .is_some_and(|value| value.as_bytes() == b"true");
+    let version = response.get_ref().version;
+    Ok((created && version > 0).then_some(version))
 }
 
 /// Report an exact runtime configuration generation. Pending registration uses
 /// the snapshot's instance fence; retain that snapshot across registration retries.
-#[tracing::instrument(
-    name = "supervisor.gateway.report_sandbox_configuration",
-    skip_all,
-    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
-)]
 pub async fn report_sandbox_configuration(
     gateway: &GatewayEndpoint,
     sandbox_id: &str,
     instance_id: &str,
     snapshot: Option<&SettingsPollResult>,
-    state: crate::proto::ConfigurationAdmissionState,
+    state: ConfigurationAdmissionState,
     error: &str,
 ) -> Result<()> {
-    let status = ClientSpanStatus::current();
-    let mut client = connect(gateway).await?;
-    client
-        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+    send_sandbox_configuration_report(
+        gateway,
+        tonic::Request::new(ReportSandboxConfigurationRequest {
             sandbox_id: sandbox_id.to_string(),
             expected_instance_id: snapshot.map_or_else(String::new, |snapshot| {
                 snapshot.configuration_instance_id.clone()
             }),
-            admission: Some(crate::proto::SandboxConfigurationAdmission {
+            admission: Some(SandboxConfigurationAdmission {
                 instance_id: instance_id.to_string(),
                 state: state.into(),
                 policy_version: snapshot.map_or(0, |snapshot| snapshot.version),
@@ -1444,7 +1383,42 @@ pub async fn report_sandbox_configuration(
                     .map_or(0, |snapshot| snapshot.provider_env_revision),
                 error: error.to_string(),
             }),
-        })
+        }),
+    )
+    .await
+}
+
+/// Report that Attach refused the configuration this supervisor accepted at startup.
+pub async fn report_attach_policy_refusal(
+    gateway: &GatewayEndpoint,
+    sandbox_id: &str,
+    mut admission: SandboxConfigurationAdmission,
+    reason: AttachPolicyRefusal,
+) -> Result<()> {
+    admission.state = ConfigurationAdmissionState::Rejected.into();
+    admission.error.clear();
+    let mut request = tonic::Request::new(ReportSandboxConfigurationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        admission: Some(admission),
+        expected_instance_id: String::new(),
+    });
+    reason.write_metadata(request.metadata_mut());
+    send_sandbox_configuration_report(gateway, request).await
+}
+
+#[tracing::instrument(
+    name = "supervisor.gateway.report_sandbox_configuration",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+async fn send_sandbox_configuration_report(
+    gateway: &GatewayEndpoint,
+    request: tonic::Request<ReportSandboxConfigurationRequest>,
+) -> Result<()> {
+    let status = ClientSpanStatus::current();
+    let mut client = connect(gateway).await?;
+    client
+        .report_sandbox_configuration(request)
         .await
         .map_err(grpc_status_error)?;
     status.finish(Ok(()))

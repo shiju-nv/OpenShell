@@ -43,6 +43,7 @@ mod linux {
         SandboxId, SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SystemJwtClock,
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
+    use openshell_core::startup_policy::AttachPolicyRefusal;
     use openshell_isolation_interface::contract::{
         BoundaryConfirmation, LoopbackTarget, ResolvedWorkloadIdentity,
     };
@@ -3755,7 +3756,11 @@ mod linux {
             if !(bound && takeover)
                 && let Err(error) = validate_vm_policy_identity(&self.config, &policy)
             {
-                return guest_error(BoundaryErrorKind::Denied, error);
+                return Response::Error {
+                    kind: BoundaryErrorKind::Denied,
+                    message: error,
+                    attach_policy_refusal: Some(AttachPolicyRefusal::WorkloadIdentityMismatch),
+                };
             }
             let accepted = match &*state {
                 RuntimeState::AwaitingAttach => {
@@ -4807,6 +4812,7 @@ mod linux {
         Response::Error {
             kind,
             message: message.into(),
+            attach_policy_refusal: None,
         }
     }
 
@@ -7034,10 +7040,19 @@ mod linux {
                 (None, Some(wrong_group), "run_as_group", wrong_group),
             ] {
                 let response = boundary.attach(vm_identity_test_policy(user, group), false);
-                let Response::Error { kind, message } = response else {
+                let Response::Error {
+                    kind,
+                    message,
+                    attach_policy_refusal,
+                } = response
+                else {
                     panic!("conflicting identity was attached: {response:?}");
                 };
                 assert_eq!(kind, BoundaryErrorKind::Denied);
+                assert_eq!(
+                    attach_policy_refusal,
+                    Some(AttachPolicyRefusal::WorkloadIdentityMismatch)
+                );
                 assert!(
                     message.contains(&format!("{field} '{requested}'")),
                     "{message}"
@@ -9069,6 +9084,7 @@ mod linux {
                     serve_request(&boundary, &principal(2), request),
                     Response::Error {
                         kind: BoundaryErrorKind::Denied,
+                        attach_policy_refusal: None,
                         ..
                     }
                 ));

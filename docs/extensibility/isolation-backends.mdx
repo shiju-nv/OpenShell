@@ -34,6 +34,15 @@ The supervisor's concrete RPC client, `OpenShellRuntimeBackend`, lives in
 The admission sequence is Attach, Confirm, then StartAgent. No workload code
 runs before StartAgent.
 
+When a backend refuses a policy at Attach, it can return `Denied` with an
+`attach_policy_refusal` reason, such as a workload user or group mismatch.
+`openshell sandbox get` then shows `ConfigurationReady: False (ConfigurationInvalid)`
+with a short explanation. The supervisor log contains the backend's full error.
+To recover, delete the sandbox and create it again with a policy the backend accepts.
+
+To see these reasons, use a backend, supervisor, and gateway that support
+Attach policy refusal reporting.
+
 External compute drivers advertise `openshell.compute.isolation-backend` to
 accept an operator-selected `IsolationBackendRegistration`, including its Unix,
 TCP, or vsock endpoint. The driver provisions the resource and delivers the

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
+use openshell_core::startup_policy::AttachPolicyRefusal;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
@@ -32,8 +33,13 @@ pub use openshell_core::policy::SandboxPolicy;
 pub enum BackendError {
     /// Descriptor missing, malformed, unsupported, or mismatched against admission.
     Descriptor(String),
-    /// Authenticated attachment rejection (incompatible or already-bound resource).
+    /// Authentication, ownership, or an unclassified attachment rejection.
     Denied(String),
+    /// The backend evaluated the policy during Attach and refused it.
+    AttachPolicyRefused {
+        reason: AttachPolicyRefusal,
+        detail: String,
+    },
     /// Boundary temporarily unavailable.
     Unavailable(String),
     /// The selected backend does not implement an optional contract operation.
@@ -56,7 +62,7 @@ pub enum BackendError {
 pub enum BackendErrorKind {
     /// Descriptor or backend mismatch.
     Invalid,
-    /// Authenticated attachment rejection.
+    /// Authentication or attachment rejection.
     Denied,
     /// Transient inability to serve an operation.
     Unavailable,
@@ -75,7 +81,7 @@ impl BackendError {
     pub fn kind(&self) -> BackendErrorKind {
         match self {
             Self::Descriptor(_) => BackendErrorKind::Invalid,
-            Self::Denied(_) => BackendErrorKind::Denied,
+            Self::Denied(_) | Self::AttachPolicyRefused { .. } => BackendErrorKind::Denied,
             Self::Unavailable(_) => BackendErrorKind::Unavailable,
             Self::Unsupported(_) => BackendErrorKind::Unsupported,
             Self::Attach(_) | Self::Confirm(_) | Self::Process(_) => BackendErrorKind::Failed,
@@ -89,6 +95,9 @@ impl fmt::Display for BackendError {
         match self {
             Self::Descriptor(m) => write!(f, "descriptor error: {m}"),
             Self::Denied(m) => write!(f, "attachment denied: {m}"),
+            Self::AttachPolicyRefused { detail, .. } => {
+                write!(f, "attachment policy refused: {detail}")
+            }
             Self::Unavailable(m) => write!(f, "boundary unavailable: {m}"),
             Self::Unsupported(m) => write!(f, "operation unsupported: {m}"),
             Self::Attach(m) => write!(f, "attachment failed: {m}"),

@@ -239,7 +239,18 @@ message NetworkConnected {
 }
 message Error {
   BoundaryErrorKind kind = 1;
+  // Private runtime details for supervisor diagnostics.
   string message = 2;
+  // Set with DENIED only when Attach rejected the policy itself. Omit for
+  // authentication, ownership, and transport failures. Supervisors may use
+  // recognized reasons in public status without exposing message.
+  optional AttachPolicyRefusal attach_policy_refusal = 3;
+}
+
+enum AttachPolicyRefusal {
+  ATTACH_POLICY_REFUSAL_UNSPECIFIED = 0;
+  ATTACH_POLICY_REFUSAL_WORKLOAD_IDENTITY_MISMATCH = 1;
+  ATTACH_POLICY_REFUSAL_POLICY_PROFILE_MISMATCH = 2;
 }
 
 enum BoundaryErrorKind {

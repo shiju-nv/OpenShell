@@ -21,6 +21,7 @@ use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, NetworkMode, NetworkPolicy,
     ProcessPolicy, ProxyPolicy, SandboxPolicy,
 };
+use openshell_core::startup_policy::AttachPolicyRefusal;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
@@ -1039,6 +1040,8 @@ pub enum Response {
     Error {
         kind: BoundaryErrorKind,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_policy_refusal: Option<AttachPolicyRefusal>,
     },
 }
 

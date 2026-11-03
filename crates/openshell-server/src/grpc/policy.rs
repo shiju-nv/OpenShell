@@ -80,6 +80,7 @@ use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
     SandboxPolicy as ProtoSandboxPolicy, StaticCredentialEndpointBinding,
 };
+use openshell_core::startup_policy::{AttachPolicyRefusal, POLICY_REVISION_CREATED_HEADER};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
@@ -4952,13 +4953,20 @@ async fn handle_update_config_inner(
     spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    Ok(update_config_response(
+    let mut response = update_config_response(
         u32::try_from(next_version).unwrap_or(0),
         hash,
         0,
         false,
         response_annotations,
-    ))
+    );
+    if sandbox_caller {
+        response.metadata_mut().insert(
+            POLICY_REVISION_CREATED_HEADER,
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -5126,6 +5134,26 @@ fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     }
 }
 
+/// Both admissions name the same instance and configuration generation.
+fn same_generation(
+    current: &openshell_core::proto::SandboxConfigurationAdmission,
+    reported: &openshell_core::proto::SandboxConfigurationAdmission,
+) -> bool {
+    (
+        &current.instance_id,
+        current.policy_version,
+        &current.policy_hash,
+        current.config_revision,
+        current.provider_env_revision,
+    ) == (
+        &reported.instance_id,
+        reported.policy_version,
+        &reported.policy_hash,
+        reported.config_revision,
+        reported.provider_env_revision,
+    )
+}
+
 fn configuration_generation_matches(
     admission: &openshell_core::proto::SandboxConfigurationAdmission,
     config: &GetSandboxConfigResponse,
@@ -5162,6 +5190,12 @@ pub(super) async fn handle_report_sandbox_configuration(
         .map_err(|_| Status::invalid_argument("invalid admission state"))?;
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
+    }
+    let attach_refusal = AttachPolicyRefusal::from_metadata(request.metadata())?;
+    if attach_refusal.is_some() && reported != ConfigurationAdmissionState::Rejected {
+        return Err(Status::invalid_argument(
+            "an Attach policy refusal requires a rejected admission",
+        ));
     }
     let Some(_mutation_guard) = state
         .compute
@@ -5214,6 +5248,7 @@ pub(super) async fn handle_report_sandbox_configuration(
             "supervisor configuration instance has changed",
         ));
     }
+    let mut rejected_desired_generation = reported == ConfigurationAdmissionState::Rejected;
     if reported == ConfigurationAdmissionState::Accepted {
         let mut config_request = Request::new(GetSandboxConfigRequest {
             supported_capabilities: vec![
@@ -5234,8 +5269,17 @@ pub(super) async fn handle_report_sandbox_configuration(
         }
         admission.error.clear();
     } else if reported == ConfigurationAdmissionState::Rejected {
-        // Runtime error strings may contain parser payloads. Only gateway-authored
-        // diagnostics may be exposed verbatim through public sandbox status.
+        if attach_refusal.is_some()
+            && current.is_none_or(|current| {
+                current.state != i32::from(ConfigurationAdmissionState::Accepted)
+                    || !same_generation(current, &admission)
+            })
+        {
+            return Err(Status::aborted(
+                "accepted startup configuration has changed",
+            ));
+        }
+
         let mut config_request = Request::new(GetSandboxConfigRequest {
             supported_capabilities: vec![
                 openshell_core::extension_protocol::POLICY_CEDAR_V1.to_string(),
@@ -5244,20 +5288,32 @@ pub(super) async fn handle_report_sandbox_configuration(
             name: sandbox_name,
         });
         *config_request.extensions_mut() = request.extensions().clone();
-        admission.error = match handle_get_sandbox_config(state, config_request).await {
-            Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
-                return Err(Status::aborted("rejected configuration generation has changed"));
+        let desired = handle_get_sandbox_config(state, config_request).await;
+        if let Some(refusal) = attach_refusal {
+            // This refusal applies to the startup that accepted the report's
+            // generation. Only a refusal of the desired generation can extend
+            // the repair window for it.
+            rejected_desired_generation = desired
+                .is_ok_and(|config| configuration_generation_matches(&admission, config.get_ref()));
+            admission.error = refusal.message().to_string();
+        } else {
+            // Runtime error strings may contain parser payloads. Only gateway-authored
+            // diagnostics may be exposed verbatim through public sandbox status.
+            admission.error = match desired {
+                Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
+                    return Err(Status::aborted("rejected configuration generation has changed"));
+                }
+                Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
+                _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
+            };
+            if let Some(current) = current
+                && current.state == i32::from(ConfigurationAdmissionState::Accepted)
+            {
+                // A rejected desired update does not invalidate an accepted runtime.
+                let error = admission.error;
+                admission = current.clone();
+                admission.error = error;
             }
-            Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
-            _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
-        };
-        if let Some(current) = current
-            && current.state == i32::from(ConfigurationAdmissionState::Accepted)
-        {
-            // A rejected desired update does not invalidate an accepted runtime.
-            let error = admission.error;
-            admission = current.clone();
-            admission.error = error;
         }
     } else {
         admission.error.clear();
@@ -5291,7 +5347,7 @@ pub(super) async fn handle_report_sandbox_configuration(
             state.config.provisioning_repair_window_seconds * 1000,
         )
         .map_err(Status::internal)?;
-        if reported == ConfigurationAdmissionState::Rejected {
+        if rejected_desired_generation {
             crate::compute::provisioning_deadline::record_rejection(
                 record,
                 now_ms,
@@ -9518,6 +9574,184 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configuration_admission_records_refusal_of_accepted_generation() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission, SandboxPhase,
+        };
+        let state = test_server_state().await;
+        let refusal = AttachPolicyRefusal::WorkloadIdentityMismatch;
+        for (sandbox_id, desired_changes) in [("refused-current", false), ("refused-stale", true)] {
+            let mut sandbox = test_sandbox(
+                sandbox_id,
+                sandbox_id,
+                openshell_policy::restrictive_default_policy(),
+                Vec::new(),
+            );
+            sandbox.set_phase(SandboxPhase::Starting.into());
+            state.store.put_message(&sandbox).await.unwrap();
+            let instance_id = uuid::Uuid::new_v4().to_string();
+            let report = |admission, reason: Option<AttachPolicyRefusal>| {
+                let mut request = with_sandbox(
+                    Request::new(ReportSandboxConfigurationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        admission: Some(admission),
+                        expected_instance_id: String::new(),
+                    }),
+                    sandbox_id,
+                );
+                if let Some(reason) = reason {
+                    reason.write_metadata(request.metadata_mut());
+                }
+                request
+            };
+            let snapshot = || async {
+                handle_get_sandbox_config(
+                    &state,
+                    with_sandbox(
+                        Request::new(GetSandboxConfigRequest {
+                            name: sandbox_id.to_string(),
+                            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                                "default",
+                            )),
+                            ..Default::default()
+                        }),
+                        sandbox_id,
+                    ),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            };
+            let saved_status = || async {
+                state
+                    .store
+                    .get_message::<Sandbox>(sandbox_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .unwrap()
+            };
+            handle_report_sandbox_configuration(
+                &state,
+                report(
+                    SandboxConfigurationAdmission {
+                        instance_id: instance_id.clone(),
+                        state: Admission::Pending.into(),
+                        ..Default::default()
+                    },
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            let config = snapshot().await;
+            let accepted = SandboxConfigurationAdmission {
+                instance_id,
+                state: Admission::Accepted.into(),
+                policy_version: config.version,
+                policy_hash: config.policy_hash,
+                config_revision: config.config_revision,
+                provider_env_revision: config.provider_env_revision,
+                error: String::new(),
+            };
+            handle_report_sandbox_configuration(&state, report(accepted.clone(), None))
+                .await
+                .unwrap();
+            assert_eq!(
+                handle_report_sandbox_configuration(
+                    &state,
+                    report(accepted.clone(), Some(refusal))
+                )
+                .await
+                .unwrap_err()
+                .code(),
+                Code::InvalidArgument
+            );
+
+            let refused = SandboxConfigurationAdmission {
+                state: Admission::Rejected.into(),
+                error: "private backend detail".to_string(),
+                ..accepted
+            };
+            if desired_changes {
+                // An ordinary rejection leaves the accepted runtime accepted.
+                handle_report_sandbox_configuration(&state, report(refused.clone(), None))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    saved_status().await.configuration_admission.unwrap().state,
+                    i32::from(Admission::Accepted),
+                );
+                handle_update_config(
+                    &state,
+                    with_user(Request::new(UpdateConfigRequest {
+                        sandbox: sandbox_id.to_string(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        setting_key: "ocsf_json_enabled".to_string(),
+                        setting_value: Some(SettingValue {
+                            value: Some(setting_value::Value::BoolValue(true)),
+                        }),
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .unwrap();
+                let desired = snapshot().await;
+                assert_ne!(desired.config_revision, refused.config_revision);
+                assert_eq!(
+                    handle_report_sandbox_configuration(&state, report(refused.clone(), None))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::Aborted,
+                );
+                let other_generation = SandboxConfigurationAdmission {
+                    config_revision: desired.config_revision,
+                    ..refused.clone()
+                };
+                assert_eq!(
+                    handle_report_sandbox_configuration(
+                        &state,
+                        report(other_generation, Some(refusal)),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                    Code::Aborted,
+                );
+            }
+
+            handle_report_sandbox_configuration(&state, report(refused.clone(), Some(refusal)))
+                .await
+                .unwrap();
+            let status = saved_status().await;
+            let saved_admission = status.configuration_admission.unwrap();
+            assert_eq!(saved_admission.state, i32::from(Admission::Rejected));
+            assert!(same_generation(&saved_admission, &refused));
+            let ready = status
+                .conditions
+                .iter()
+                .find(|condition| condition.r#type == "ConfigurationReady")
+                .unwrap();
+            assert_eq!(
+                (
+                    ready.status.as_str(),
+                    ready.reason.as_str(),
+                    ready.message.as_str()
+                ),
+                ("False", "ConfigurationInvalid", refusal.message()),
+            );
+            assert_eq!(
+                status.provisioning.unwrap().first_rejection_time.is_some(),
+                !desired_changes,
+                "the repair clock tracks rejections of the desired generation",
+            );
+        }
+    }
+
     #[test]
     fn configuration_diagnostic_is_bounded_and_removes_control_characters() {
         let diagnostic = bounded_configuration_diagnostic(&format!("rule\n{}", "é".repeat(1000)));
@@ -10571,6 +10805,53 @@ mod tests {
                     .expect("global policy setting"),
                 canonical,
                 "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_write_receipt_distinguishes_created_and_deduplicated_revisions() {
+        let state = test_server_state().await;
+        let policy = mcp_policy_with_versions(&["2025-11-25"]);
+        state
+            .store
+            .put_message(&test_sandbox(
+                "write-receipt",
+                "write-receipt",
+                policy.clone(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let mut narrowed = policy.clone();
+        narrowed.network_policies.clear();
+        for (candidate, expected_version, created) in [
+            (policy.clone(), 1, true),
+            (policy, 1, false),
+            (narrowed.clone(), 2, true),
+            (narrowed, 2, false),
+        ] {
+            let response = handle_update_config(
+                &state,
+                with_sandbox(
+                    Request::new(UpdateConfigRequest {
+                        sandbox: "write-receipt".into(),
+                        workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                        policy: Some(candidate),
+                        ..Default::default()
+                    }),
+                    "write-receipt",
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.get_ref().version, expected_version);
+            assert_eq!(
+                response
+                    .metadata()
+                    .get(POLICY_REVISION_CREATED_HEADER)
+                    .map(|receipt| receipt.to_str().unwrap()),
+                created.then_some("true"),
             );
         }
     }

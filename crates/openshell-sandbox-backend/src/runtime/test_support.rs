@@ -192,6 +192,10 @@ impl Peer {
                     _ => w::BoundaryErrorKind::Process,
                 },
                 message: e.to_string(),
+                attach_policy_refusal: match e {
+                    BackendError::AttachPolicyRefused { reason, .. } => Some(reason),
+                    _ => None,
+                },
             });
             send(
                 &out,
@@ -478,6 +482,7 @@ fn error_response(e: BackendError) -> Response {
             _ => w::BoundaryErrorKind::Process,
         },
         message: e.to_string(),
+        attach_policy_refusal: None,
     }
 }
 async fn send_response<F: ProtocolFrame>(out: &Sender<F>, id: String, response: Response) {

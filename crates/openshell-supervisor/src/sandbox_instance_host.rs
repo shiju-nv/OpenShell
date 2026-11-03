@@ -940,7 +940,8 @@ mod tests {
                 .unwrap();
                 let _ = identity_tx.send(observed);
                 let _ =
-                    openshell_core::grpc_client::fetch_settings_snapshot(&gateway, sandbox).await;
+                    openshell_core::grpc_client::fetch_settings_snapshot(&gateway, sandbox, None)
+                        .await;
                 let dispatch = tracing::Dispatch::new(
                     tracing_subscriber::registry()
                         .with(openshell_supervisor_process::log_push::LogPushLayer::thread_bound()),
@@ -964,7 +965,7 @@ mod tests {
                         () = &mut shutdown => return Ok(0),
                         Some(()) = calls.recv() => {
                             let _ = openshell_core::grpc_client::fetch_settings_snapshot(
-                                &gateway, sandbox,
+                                &gateway, sandbox, None,
                             )
                             .await;
                         }
@@ -1244,9 +1245,10 @@ mod tests {
         assert!(host.status("relinquished").is_none());
         assert!(!dir.exists());
         let revoked = GatewayEndpoint::new("http://127.0.0.1:9", credentials);
-        let error = openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "relinquished")
-            .await
-            .unwrap_err();
+        let error =
+            openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "relinquished", None)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("revoked"), "{error}");
         // The key is free for a later term of the same instance.
         assert_eq!(
@@ -1314,9 +1316,10 @@ mod tests {
             }
         );
         let revoked = GatewayEndpoint::new("http://127.0.0.1:9", credentials);
-        let error = openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "panicking")
-            .await
-            .unwrap_err();
+        let error =
+            openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "panicking", None)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("revoked"), "{error}");
         assert!(
             host.remove("panicking", Duration::from_secs(1))
@@ -1378,9 +1381,10 @@ mod tests {
         assert!(host.status("sandbox-alpha").is_none());
         assert_eq!(alpha.alive.recv().await, None, "alpha's tasks stopped");
         let revoked = GatewayEndpoint::new(gateway_url.as_str(), alpha.credentials.clone());
-        let error = openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "sandbox-alpha")
-            .await
-            .unwrap_err();
+        let error =
+            openshell_core::grpc_client::fetch_settings_snapshot(&revoked, "sandbox-alpha", None)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("revoked"), "{error}");
 
         beta.call_again.send(()).await.unwrap();

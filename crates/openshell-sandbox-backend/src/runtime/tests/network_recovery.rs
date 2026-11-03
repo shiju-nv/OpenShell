@@ -128,6 +128,7 @@ impl NetworkPeer {
                     Response::Error {
                         kind: BoundaryErrorKind::Unavailable,
                         message: "another connection with this epoch is still active".into(),
+                        attach_policy_refusal: None,
                     }
                 } else {
                     self.attached.store(true, Ordering::Release);
@@ -176,6 +177,7 @@ impl NetworkPeer {
                     Reply::Leaf(kind) => Response::Error {
                         kind,
                         message: "network mediation unavailable".into(),
+                        attach_policy_refusal: None,
                     },
                     Reply::Idle => {
                         self.state.release.notified().await;

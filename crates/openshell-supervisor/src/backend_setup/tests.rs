@@ -117,6 +117,7 @@ struct Observed {
     deny_confirmation: AtomicBool,
     require_networking: AtomicBool,
     active: AtomicBool,
+    attach_error: Mutex<Option<BackendError>>,
     starts: AtomicUsize,
     releases: AtomicUsize,
     suspendable: AtomicBool,
@@ -310,6 +311,10 @@ impl PreparedBackend for TestLaunch {
                 Ok(match request {
                     Request::Attach { .. } => {
                         observed.record("attach");
+                        let attach_error = observed.attach_error.lock().unwrap().take();
+                        if let Some(error) = attach_error {
+                            return Err(error);
+                        }
                         if observed.active.swap(true, Ordering::SeqCst) {
                             return Err(BackendError::Denied("already attached".into()));
                         }
@@ -583,6 +588,46 @@ async fn attachment_receives_live_supervisor_services() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
+}
+
+#[tokio::test]
+async fn attach_policy_refusal_keeps_its_reason_and_private_details() {
+    let setup = TestSetup::new();
+    *setup.observed.attach_error.lock().unwrap() = Some(BackendError::AttachPolicyRefused {
+        reason: AttachPolicyRefusal::PolicyProfileMismatch,
+        detail: "policy conflicts with the backend's private profile".into(),
+    });
+    let error = setup
+        .select()
+        .attach(setup.services(), policy(), agent())
+        .await
+        .err()
+        .expect("the backend refuses the policy");
+    assert_eq!(
+        attach_policy_refusal(&error),
+        Some(AttachPolicyRefusal::PolicyProfileMismatch)
+    );
+    assert!(error.to_string().contains("private profile"));
+}
+
+#[tokio::test]
+async fn infrastructure_and_ownership_failures_are_not_policy_refusals() {
+    for failure in [
+        BackendError::Attach("mediation transport failed".into()),
+        BackendError::Unavailable("backend unavailable".into()),
+        BackendError::Denied("already attached".into()),
+    ] {
+        let setup = TestSetup::new();
+        *setup.observed.attach_error.lock().unwrap() = Some(failure);
+        let error = setup
+            .select()
+            .attach(setup.services(), policy(), agent())
+            .await
+            .err()
+            .expect("backend infrastructure failure must fail startup");
+        assert_eq!(attach_policy_refusal(&error), None);
+        assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use openshell_core::jwt::{SandboxId, SessionJwtVerifier, SessionTokenProfile, SystemJwtClock};
+use openshell_core::startup_policy::AttachPolicyRefusal;
 use openshell_isolation_interface::contract::BoundaryConfirmation;
 use openshell_sandbox_backend::{boundary_protocol as wire, sandbox_auth::*};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -167,7 +168,7 @@ impl Runtime {
         self.ended.send_replace(true);
         self.registry.mark_terminal();
     }
-    fn validate_policy(&self, policy: &wire::SandboxPolicyWire) -> Result<(), Status> {
+    fn validate_policy(&self, policy: &wire::SandboxPolicyWire) -> Result<(), &'static str> {
         for (selector, expected) in [
             (
                 &policy.run_as_user,
@@ -182,9 +183,7 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|value| value != &expected.to_string())
             {
-                return Err(Status::permission_denied(
-                    "process identity differs from admitted host identity",
-                ));
+                return Err("process identity differs from admitted host identity");
             }
         }
         Ok(())
@@ -287,7 +286,13 @@ impl Runtime {
         let mut state = self.state.lock().await;
         let response = match &envelope.request {
             Q::Attach { policy, .. } => {
-                self.validate_policy(policy)?;
+                if let Err(message) = self.validate_policy(policy) {
+                    return Ok(R::Error {
+                        kind: wire::BoundaryErrorKind::Denied,
+                        message: message.to_string(),
+                        attach_policy_refusal: Some(AttachPolicyRefusal::WorkloadIdentityMismatch),
+                    });
+                }
                 if state
                     .policy
                     .as_ref()
@@ -618,6 +623,7 @@ impl sandbox_protocol_server::SandboxProtocol for Arc<Runtime> {
                         _ => wire::BoundaryErrorKind::Denied,
                     },
                     message: error.message().to_string(),
+                    attach_policy_refusal: None,
                 },
             };
             let attached = matches!(response, wire::Response::ProcessAttached { .. });

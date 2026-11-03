@@ -69,6 +69,7 @@ pub mod settings;
 pub mod shell;
 pub mod ssh_handoff;
 pub mod ssh_host_key;
+pub mod startup_policy;
 pub mod telemetry;
 pub mod time;
 pub mod token_endpoint;

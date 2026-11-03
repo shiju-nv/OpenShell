@@ -10,6 +10,7 @@ use crate::{
     boundary_protocol::{self as w, FrameError},
     proto as p,
 };
+use openshell_core::startup_policy::AttachPolicyRefusal;
 use openshell_isolation_interface::contract as c;
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,7 @@ enumeration!(w::LandlockCompatibilityWire, p::LandlockCompatibility, {BestEffort
 enumeration!(w::RuntimeHelperWire, p::RuntimeHelper, { Sftp });
 enumeration!(w::ProcessKindWire, p::ProcessKind, {Main, Exec});
 enumeration!(w::BoundaryErrorKind, p::BoundaryErrorKind, {Invalid, Denied, Unavailable, Terminated, Process, Unsupported});
+enumeration!(AttachPolicyRefusal, p::AttachPolicyRefusal, {WorkloadIdentityMismatch, PolicyProfileMismatch});
 enumeration!(c::TcpOpenDenial, p::TcpOpenDenial, {PolicyDenied, IdentityUnavailable, InvalidDestination, ResourceExhausted, MediationUnavailable});
 enumeration!(c::DnsTransport, p::DnsTransport, {Udp, Tcp});
 fn enum_value<E: TryFrom<i32>>(value: i32) -> Result<E, FrameError> {
@@ -710,9 +712,16 @@ impl WireMessage for w::ResponseEnvelope {
                 policy_generation: *policy_generation,
                 timing: Some(timing.to_proto()?),
             }),
-            W::Error { kind, message } => P::Error(p::Error {
+            W::Error {
+                kind,
+                message,
+                attach_policy_refusal,
+            } => P::Error(p::Error {
                 kind: kind.to_proto()? as i32,
                 message: message.clone(),
+                attach_policy_refusal: attach_policy_refusal
+                    .map(|reason| reason.to_proto().map(|value| value as i32))
+                    .transpose()?,
             }),
         };
         Ok(p::ResponseEnvelope {
@@ -776,6 +785,10 @@ impl WireMessage for w::ResponseEnvelope {
             P::Error(v) => W::Error {
                 kind: w::BoundaryErrorKind::from_proto(enum_value(v.kind)?)?,
                 message: v.message,
+                attach_policy_refusal: v
+                    .attach_policy_refusal
+                    .and_then(|reason| p::AttachPolicyRefusal::try_from(reason).ok())
+                    .and_then(|reason| AttachPolicyRefusal::from_proto(reason).ok()),
             },
         };
         Ok(Self {
@@ -841,6 +854,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_policy_refusal_preserves_known_reasons_and_accepts_legacy_denials() {
+        let response = w::ResponseEnvelope {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            response: w::Response::Error {
+                kind: w::BoundaryErrorKind::Denied,
+                message: "private backend detail".into(),
+                attach_policy_refusal: Some(AttachPolicyRefusal::WorkloadIdentityMismatch),
+            },
+        };
+        let encoded = response.to_proto().unwrap();
+        assert_eq!(
+            w::ResponseEnvelope::from_proto(encoded.clone()).unwrap(),
+            response
+        );
+        for reason in [None, Some(0), Some(99)] {
+            let mut legacy = encoded.clone();
+            let Some(p::response_envelope::Response::Error(error)) = legacy.response.as_mut()
+            else {
+                unreachable!();
+            };
+            error.attach_policy_refusal = reason;
+            let decoded = w::ResponseEnvelope::from_proto(legacy).unwrap();
+            assert_eq!(
+                decoded.response,
+                w::Response::Error {
+                    kind: w::BoundaryErrorKind::Denied,
+                    message: "private backend detail".into(),
+                    attach_policy_refusal: None,
+                }
+            );
+        }
+    }
 
     #[test]
     fn request_validation_rejects_missing_context_and_unknown_signal() {

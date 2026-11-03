@@ -13,6 +13,7 @@ use miette::Result;
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{SessionBearerTokenSlot, SupervisorAuthBundle};
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::startup_policy::AttachPolicyRefusal;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
@@ -85,6 +86,17 @@ pub trait PreparedBackend: Send + Sync {
         self: Box<Self>,
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError>;
+}
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error(transparent)]
+pub(crate) struct BackendAttachError(pub(crate) BackendError);
+
+pub(crate) fn attach_policy_refusal(error: &miette::Report) -> Option<AttachPolicyRefusal> {
+    match &error.downcast_ref::<BackendAttachError>()?.0 {
+        BackendError::AttachPolicyRefused { reason, .. } => Some(*reason),
+        _ => None,
+    }
 }
 
 /// Created only after name and launch identity checks. Consuming attachment
@@ -203,7 +215,7 @@ impl SelectedBackend {
                 },
             )
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(BackendAttachError)?;
         Ok((bound, built.proxy_listener))
     }
 }

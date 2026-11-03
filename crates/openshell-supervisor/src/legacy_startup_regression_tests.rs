@@ -15,11 +15,22 @@ use std::sync::atomic::Ordering;
 use tonic::codegen::tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::codegen::{Body, BoxFuture, BoxStream, Bytes, Service, StdError, http};
 
+#[derive(Clone)]
+struct PolicySyncCase {
+    write: UpdateConfigResponse,
+    created: bool,
+    snapshot: GetSandboxConfigResponse,
+}
+
 #[derive(Clone, Default)]
 struct LegacyReadyProbe {
     ready_event: Arc<tokio::sync::Notify>,
     premature_ready: Arc<AtomicBool>,
     discovered: Arc<AtomicBool>,
+    policy_sync: Arc<std::sync::Mutex<Option<PolicySyncCase>>>,
+    policy_reports: Arc<std::sync::Mutex<Vec<ReportPolicyStatusRequest>>>,
+    attach_refusal:
+        Arc<std::sync::Mutex<Option<(ReportSandboxConfigurationRequest, AttachPolicyRefusal)>>>,
 }
 
 #[derive(Clone)]
@@ -73,6 +84,41 @@ impl tonic::server::StreamingService<SupervisorMessage> for LegacyConnect {
 }
 
 struct FixedUnary<R>(R);
+
+struct PolicyStatusRecorder(LegacyReadyProbe);
+
+struct ConfigurationReportRecorder(LegacyReadyProbe);
+
+impl tonic::server::UnaryService<ReportSandboxConfigurationRequest>
+    for ConfigurationReportRecorder
+{
+    type Response = ReportSandboxConfigurationResponse;
+    type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+
+    fn call(&mut self, request: tonic::Request<ReportSandboxConfigurationRequest>) -> Self::Future {
+        let probe = self.0.clone();
+        Box::pin(async move {
+            if let Some(reason) = AttachPolicyRefusal::from_metadata(request.metadata())? {
+                *probe.attach_refusal.lock().unwrap() = Some((request.into_inner(), reason));
+            }
+            Ok(tonic::Response::new(ReportSandboxConfigurationResponse {}))
+        })
+    }
+}
+
+impl tonic::server::UnaryService<ReportPolicyStatusRequest> for PolicyStatusRecorder {
+    type Response = ReportPolicyStatusResponse;
+    type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+
+    fn call(&mut self, request: tonic::Request<ReportPolicyStatusRequest>) -> Self::Future {
+        self.0
+            .policy_reports
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Box::pin(async { Ok(tonic::Response::new(ReportPolicyStatusResponse {})) })
+    }
+}
 
 impl<Q, R> tonic::server::UnaryService<Q> for FixedUnary<R>
 where
@@ -132,10 +178,15 @@ where
                     .await
                 }
                 "/openshell.v1.OpenShell/GetSandboxConfig" => {
-                    let mut policy = openshell_policy::restrictive_default_policy();
-                    enrich_proto_baseline_paths(&mut policy);
-                    legacy_unary::<B, GetSandboxConfigRequest, _>(
-                        request,
+                    let scripted = probe
+                        .policy_sync
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|case| case.snapshot.clone());
+                    let snapshot = scripted.unwrap_or_else(|| {
+                        let mut policy = openshell_policy::restrictive_default_policy();
+                        enrich_proto_baseline_paths(&mut policy);
                         GetSandboxConfigResponse {
                             policy: Some(policy),
                             version: 1,
@@ -147,9 +198,9 @@ where
                             policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
                             policy_validation_failure_mode: "fail_closed".into(),
                             ..Default::default()
-                        },
-                    )
-                    .await
+                        }
+                    });
+                    legacy_unary::<B, GetSandboxConfigRequest, _>(request, snapshot).await
                 }
                 "/openshell.v1.OpenShell/GetSandboxProviderEnvironment" => {
                     legacy_unary::<B, GetSandboxProviderEnvironmentRequest, _>(
@@ -159,29 +210,44 @@ where
                     .await
                 }
                 "/openshell.v1.OpenShell/ReportSandboxConfiguration" => {
-                    legacy_unary::<B, ReportSandboxConfigurationRequest, _>(
-                        request,
-                        ReportSandboxConfigurationResponse::default(),
-                    )
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                        ReportSandboxConfigurationResponse,
+                        ReportSandboxConfigurationRequest,
+                    >::default())
+                    .unary(ConfigurationReportRecorder(probe), request)
                     .await
                 }
                 "/openshell.v1.OpenShell/ReportPolicyStatus" => {
-                    legacy_unary::<B, ReportPolicyStatusRequest, _>(
-                        request,
-                        ReportPolicyStatusResponse::default(),
-                    )
+                    tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+                        ReportPolicyStatusResponse,
+                        ReportPolicyStatusRequest,
+                    >::default())
+                    .unary(PolicyStatusRecorder(probe), request)
                     .await
                 }
                 "/openshell.v1.OpenShell/UpdateConfig" => {
-                    legacy_unary::<B, UpdateConfigRequest, _>(
-                        request,
-                        UpdateConfigResponse {
-                            version: 1,
-                            policy_hash: "legacy-policy".into(),
-                            ..Default::default()
+                    let (write, created) = probe.policy_sync.lock().unwrap().as_ref().map_or_else(
+                        || {
+                            (
+                                UpdateConfigResponse {
+                                    version: 1,
+                                    policy_hash: "legacy-policy".into(),
+                                    ..Default::default()
+                                },
+                                false,
+                            )
                         },
-                    )
-                    .await
+                        |case| (case.write.clone(), case.created),
+                    );
+                    let mut response =
+                        legacy_unary::<B, UpdateConfigRequest, _>(request, write).await;
+                    if created {
+                        response.headers_mut().insert(
+                            openshell_core::startup_policy::POLICY_REVISION_CREATED_HEADER,
+                            http::HeaderValue::from_static("true"),
+                        );
+                    }
+                    response
                 }
                 _ => http::Response::builder()
                     .status(200)
@@ -193,6 +259,78 @@ where
             Ok(response)
         })
     }
+}
+
+#[tokio::test]
+async fn attach_refusal_policy_history_omits_private_backend_diagnostics() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let probe = LegacyReadyProbe::default();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(LegacyGateway {
+                probe: probe.clone(),
+            })
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let gateway = openshell_core::grpc_client::GatewayEndpoint::new(
+        endpoint,
+        openshell_core::grpc_client::GatewayCredentials::from_gateway_token("test-token").unwrap(),
+    );
+    let revision = LoadedPolicyRevision {
+        version: 3,
+        policy_hash: "admitted-policy".into(),
+        config_revision: 7,
+        policy_source: openshell_core::proto::PolicySource::Sandbox,
+        admission_instance_id: Some("instance-1".into()),
+        provider_env_revision: 1,
+    };
+    let origin = LoadedPolicyOrigin::Gateway {
+        revision: Some(revision.clone()),
+        has_last_valid_policy: true,
+    };
+    let refusal = miette::Report::new(backend_setup::BackendAttachError(
+        BackendError::AttachPolicyRefused {
+            reason: AttachPolicyRefusal::WorkloadIdentityMismatch,
+            detail: "PRIVATE-SENTINEL".into(),
+        },
+    ));
+    let reason = backend_setup::attach_policy_refusal(&refusal).unwrap();
+
+    timeout(
+        Duration::from_secs(5),
+        report_attach_refusal(&gateway, "sandbox-id", &origin, Some(&revision), reason),
+    )
+    .await
+    .expect("report the startup-owned policy failure");
+
+    let (report, reported_reason) = probe.attach_refusal.lock().unwrap().take().unwrap();
+    assert_eq!(reported_reason, reason);
+    assert_eq!(report.sandbox_id, "sandbox-id");
+    assert!(report.expected_instance_id.is_empty());
+    let admission = report.admission.unwrap();
+    assert_eq!(
+        admission.state,
+        i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
+    );
+    assert!(admission.error.is_empty());
+
+    {
+        let reports = probe.policy_reports.lock().unwrap();
+        let [report] = reports.as_slice() else {
+            panic!("expected one policy failure report, got {reports:?}");
+        };
+        assert_eq!(report.sandbox_id, "sandbox-id");
+        assert_eq!(report.version, 3);
+        assert_eq!(
+            report.status,
+            i32::from(openshell_core::proto::PolicyStatus::Failed)
+        );
+        assert_eq!(report.load_error, reason.message());
+    }
+    assert!(refusal.to_string().contains("PRIVATE-SENTINEL"));
+    server.abort();
+    let _ = server.await;
 }
 
 struct HeldBackendSetup {
@@ -349,4 +487,57 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         .expect("startup reaches the deliberately held backend")
         .unwrap_err();
     assert!(error.to_string().contains("test boundary remains held"));
+}
+
+#[tokio::test]
+async fn policy_sync_preserves_write_receipt_separately_from_refetched_policy() {
+    for (created, write_version, snapshot_version, expected_receipt) in [
+        (true, 2, 2, Some(2)),
+        (true, 2, 3, Some(2)),
+        (false, 2, 2, None),
+        (true, 0, 2, None),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let probe = LegacyReadyProbe::default();
+        *probe.policy_sync.lock().unwrap() = Some(PolicySyncCase {
+            write: UpdateConfigResponse {
+                version: write_version,
+                ..Default::default()
+            },
+            created,
+            snapshot: GetSandboxConfigResponse {
+                version: snapshot_version,
+                policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
+                policy_validation_failure_mode: "fail_closed".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            },
+        });
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(LegacyGateway { probe })
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let gateway = RemoteStartupGateway {
+            gateway: Some(openshell_core::grpc_client::GatewayEndpoint::new(
+                endpoint,
+                openshell_core::grpc_client::GatewayCredentials::from_gateway_token("test-token")
+                    .unwrap(),
+            )),
+        };
+        let receipt = gateway
+            .sync(
+                "sandbox",
+                &openshell_policy::restrictive_default_policy(),
+                "default",
+            )
+            .await
+            .expect("sync the policy through the production RPC helper");
+        let snapshot = gateway.snapshot("sandbox", Some("default")).await.unwrap();
+        assert_eq!(snapshot.version, snapshot_version);
+        assert_eq!(receipt, expected_receipt);
+        server.abort();
+        let _ = server.await;
+    }
 }

@@ -2156,10 +2156,7 @@ impl BoundaryClient {
                 response.request_id
             )));
         }
-        let response = match response.response {
-            Response::Error { kind, message } => Err(guest_error(kind, message)),
-            response => Ok(response),
-        }?;
+        let response = exchange_response(response.response, &envelope.request)?;
         Ok((stream, response))
     }
 
@@ -2440,10 +2437,7 @@ impl BoundaryClient {
                 "boundary response ID did not match request ID".to_string(),
             ));
         }
-        match response.response {
-            Response::Error { kind, message } => Err(guest_error(kind, message)),
-            response => Ok(response),
-        }
+        exchange_response(response.response, &envelope.request)
     }
 
     async fn mediation_session(&self) -> Result<Arc<ClientMediationSession>, BackendError> {
@@ -2518,7 +2512,7 @@ impl BoundaryClient {
         }
         match response.response {
             Response::MediationReady => {}
-            Response::Error { kind, message } => return Err(guest_error(kind, message)),
+            Response::Error { kind, message, .. } => return Err(guest_error(kind, message)),
             response => return Err(unexpected_response("mediation_ready", &response)),
         }
         Ok(ClientMediationSession::start(stream))
@@ -3048,6 +3042,23 @@ fn unexpected_response(expected: &str, response: &Response) -> BackendError {
     BackendError::Process(format!(
         "expected boundary response {expected:?}, received {response:?}"
     ))
+}
+
+fn exchange_response(response: Response, request: &Request) -> Result<Response, BackendError> {
+    use crate::boundary_protocol::BoundaryErrorKind;
+
+    match response {
+        Response::Error {
+            kind: BoundaryErrorKind::Denied,
+            message,
+            attach_policy_refusal: Some(reason),
+        } if matches!(request, Request::Attach { .. }) => Err(BackendError::AttachPolicyRefused {
+            reason,
+            detail: message,
+        }),
+        Response::Error { kind, message, .. } => Err(guest_error(kind, message)),
+        response => Ok(response),
+    }
 }
 
 fn guest_error(kind: crate::boundary_protocol::BoundaryErrorKind, message: String) -> BackendError {
@@ -3797,6 +3808,7 @@ mod tests {
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
                                 message: "a mediation session is already active".to_string(),
+                                attach_policy_refusal: None,
                             },
                             Request::Wait { process_id } if hold_test_wait(&process_id) => {
                                 // Keep the wait in flight until its transport fails.
@@ -3837,6 +3849,7 @@ mod tests {
                             Request::AcceptNetwork => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Unavailable,
                                 message: "no pending network request".to_string(),
+                                attach_policy_refusal: None,
                             },
                         },
                     }) {
@@ -5835,8 +5848,14 @@ mod tests {
             test_bearer("incorrect-token-incorrect-token"),
         );
 
+        let request = Request::Attach {
+            supervisor_instance_id: client.supervisor_instance_id,
+            policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
+            supervisor_recovery_timeout_secs: None,
+        };
         assert!(matches!(
-            client.exchange(Request::Confirm).await,
+            client.exchange(request).await,
             Err(BackendError::Denied(_))
         ));
         server.abort();
