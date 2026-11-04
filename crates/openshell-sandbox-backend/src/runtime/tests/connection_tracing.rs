@@ -217,7 +217,11 @@ async fn connection_span_closes_on_error_and_cancellation() {
     let subscriber = tracing_subscriber::registry().with(spans.clone());
     async {
         let discovery = tracing::info_span!("supervisor.boundary.discover_policy");
-        let mut waiting = Box::pin(transport.connect(&descriptor).instrument(discovery.clone()));
+        let mut waiting = Box::pin(
+            transport
+                .connect(&descriptor, ATTACH_REQUEST_TIMEOUT)
+                .instrument(discovery.clone()),
+        );
         poll_fn(|context| {
             assert!(waiting.as_mut().poll(context).is_pending());
             Poll::Ready(())
@@ -232,7 +236,7 @@ async fn connection_span_closes_on_error_and_cancellation() {
         wrong_session.tls = test_certificate().client_tls;
         assert!(matches!(
             transport
-                .connect(&wrong_session)
+                .connect(&wrong_session, ATTACH_REQUEST_TIMEOUT)
                 .instrument(discovery.clone())
                 .await,
             Err(BackendError::Descriptor(_))
