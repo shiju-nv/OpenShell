@@ -7,22 +7,27 @@ while writes are blocked — all without restarting anything.
 
 ## Prerequisites
 
-- A running OpenShell gateway (`mise run gateway:docker` for local development)
+- A running OpenShell gateway with no global policy (`mise run gateway:docker` for local development)
 - Docker daemon running
+- A user-owned workload image with `curl` installed at `/usr/bin/curl` and no embedded OpenShell policy
 
 ## What's in this example
 
 | File          | Description                                                          |
 | ------------- | -------------------------------------------------------------------- |
 | `policy.yaml` | Complete policy with the same rule, for `sandbox create --policy`    |
-| `demo.sh`     | Automated script that runs the full walkthrough non-interactively    |
 
 ## Walkthrough
 
 ### 1. Create a sandbox
 
-```bash
-openshell sandbox create --name demo --no-auto-providers
+Replace `registry.example.com/team/agent-tools:1.0` with your workload image.
+
+```shell
+openshell sandbox create \
+  --name demo \
+  --from registry.example.com/team/agent-tools:1.0 \
+  --no-auto-providers
 ```
 
 `--no-auto-providers` skips the provider setup prompt since this
@@ -36,24 +41,15 @@ sandbox@demo:~$
 
 ### 2. Try to reach the GitHub API — blocked
 
-```bash
-curl -s https://api.github.com/zen
+```shell
+curl -sS https://api.github.com/zen
 ```
 
-The request fails. By default, **all outbound network traffic is denied**.
-The sandbox proxy intercepted the HTTPS CONNECT request to
-`api.github.com:443` and rejected it because no network policy authorizes
-`curl` to reach that host.
+The command reports a connection error and exits with a nonzero status
+because no network policy allows `curl` to reach `api.github.com:443`.
 
-```text
-curl: (56) Received HTTP code 403 from proxy after CONNECT
-```
-
-Exit the sandbox (sandboxes are kept running by default; pass `--no-keep` at creation time to delete on exit):
-
-```bash
-exit
-```
+Keep this sandbox shell open for the rest of the walkthrough. Run the
+following `openshell` commands in a second terminal on your host.
 
 ### 3. Check the deny log
 
@@ -61,14 +57,8 @@ exit
 openshell logs demo --since 5m --source sandbox
 ```
 
-You'll see a line like:
-
-```text
-[1775014132.690] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(64) -> api.github.com:443 [policy:- engine:opa] [reason:network connections not allowed by policy]
-```
-
-Every denied connection is logged with the destination, the binary that
-attempted it, and the reason. Nothing gets out silently.
+Look for a `NET:OPEN` entry showing `DENIED` for `/usr/bin/curl` to
+`api.github.com:443`, with reason `transparent_tcp_policy_denied`.
 
 ### 4. Add a read-only GitHub API rule
 
@@ -108,17 +98,15 @@ network_policies:
 revision. No restart required — network rules reload while the sandbox runs.
 
 [`policy.yaml`](policy.yaml) contains the same rule in a complete policy. Use
-it to start a new sandbox with the rule in place:
-`openshell sandbox create --name demo --policy examples/sandbox-policy-quickstart/policy.yaml`.
+it with `--policy examples/sandbox-policy-quickstart/policy.yaml` when
+creating a new sandbox.
 Do not apply it to a running sandbox with `openshell policy set`, which
 replaces the entire policy and is rejected if the file drops a filesystem path
 the sandbox already has.
 
-### 5. Connect and verify: GET works
+### 5. Verify that GET works
 
-```bash
-openshell sandbox connect demo
-```
+Return to the sandbox shell in your first terminal and retry the request:
 
 ```bash
 curl -s https://api.github.com/zen
@@ -161,6 +149,8 @@ curl -s https://api.github.com/octocat
 
 ### 6. Try a write — blocked by L7
 
+In the same sandbox shell, send a POST request:
+
 ```bash
 curl -s -X POST https://api.github.com/repos/octocat/hello-world/issues \
   -H "Content-Type: application/json" \
@@ -174,18 +164,14 @@ like these:
 {...,"error":"policy_denied",...,"policy":"github_api",...,"rule":"POST /repos/octocat/hello-world/issues",...}
 ```
 
-The CONNECT request succeeded (api.github.com is allowed), but the L7
-proxy inspected the HTTP method and returned **403**. `POST` is not in
+The connection succeeds because `api.github.com` is allowed, but the L7
+proxy inspects the HTTP method and returns `403`. `POST` is not in
 the `read-only` preset. Your agent can read code from GitHub but cannot
 create issues, push commits, or modify anything.
 
-Exit the sandbox:
-
-```bash
-exit
-```
-
 ### 7. Check the L7 deny log
+
+Run this in your second terminal on the host, leaving the sandbox shell open:
 
 ```bash
 openshell logs demo --since 5m --source sandbox
@@ -201,6 +187,8 @@ filter them out with `--level warn`. In production, export these events to
 your SIEM for a complete audit trail of every request your agent makes.
 
 ### 8. Clean up
+
+Delete the sandbox from your host terminal:
 
 ```bash
 openshell sandbox delete demo
