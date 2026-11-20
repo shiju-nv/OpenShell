@@ -249,14 +249,16 @@ mod tests {
     // Discovery RPCs move to ServiceDiscovery. Application URL maps add two
     // public-only messages alongside main's public APIs; durable schemas
     // and the public/durable overlap remain unchanged.
+    // The service backend HTTP version is part of both schemas. Legacy
+    // endpoint records omit it and continue to use HTTP/1.1.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "dc96b55350209d252c8eb22a697fede2abf26d6bcb80223774c5fa093dca885b";
+        "3c1c932ec40e0c29a8c844f84d936178c19aec8f233ae0fcb2f7980dc13a70a0";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =
-        "1005cf2557d49ea54a302cc76d837cc1a6c637adb0db73ec9444569e8d39fd71";
+        "ca31950286327bc385fae933bbb9e34d3c9191214f9b549c558bba40957fcc65";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "c7a66485b85999c0227d1eef52b159b3be5c05d68c0a900f5f6303021a46d75f";
+        "d0eead2cd403f6f52ecd9b7df73ca7db15e84dd847e11bc9d50469970204e589";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -800,9 +802,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (369, 31),
-                (104, 22),
-                (88, 22),
+                (369, 32),
+                (104, 23),
+                (88, 23),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -813,7 +815,9 @@ mod tests {
 
     #[test]
     fn service_endpoint_without_authorization_mode_decodes_as_strip() {
-        use openshell_core::proto::{ServiceAuthorizationMode, ServiceEndpoint};
+        use openshell_core::proto::{
+            ServiceAuthorizationMode, ServiceBackendHttpVersion, ServiceEndpoint,
+        };
 
         let endpoint = ServiceEndpoint::decode(
             legacy_bytes(SERVICE_ENDPOINT_WITHOUT_AUTHORIZATION_MODE).as_slice(),
@@ -832,6 +836,10 @@ mod tests {
         assert_eq!(
             crate::service_routing::effective_authorization_mode(endpoint.authorization_mode),
             ServiceAuthorizationMode::Strip
+        );
+        assert_eq!(
+            endpoint.backend_http_version(),
+            ServiceBackendHttpVersion::Unspecified
         );
     }
 

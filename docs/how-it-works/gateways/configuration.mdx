@@ -2321,6 +2321,11 @@ WebSocket services. Application traffic reaches the supervisor directly and uses
 authentication supplied by your application or ingress edge. Gateway service
 ingress remains available independently.
 
+The listener negotiates HTTP/2 and HTTP/1.1 through TLS ALPN. WebSocket upgrades
+use HTTP/1.1. The listener uses HTTP/1.1 to reach the sandbox service by default.
+Set `--backend-http-version 2` when exposing a service to use HTTP/2 on the
+sandbox connection. [Expose long-running services](/how-it-works/sandboxes/overview#expose-long-running-services)
+
 ```toml
 [openshell.supervisor.app_listener]
 enabled = true
@@ -2373,6 +2378,11 @@ unnamed service on sandbox `demo` in workspace `default` uses SNI and Host
 `default--demo.services.example.com`; a service named `web` uses
 `default--demo--web.services.example.com`. Configure DNS or your ingress to reach
 the owning supervisor while preserving that hostname.
+
+For a service with an HTTP/2 backend, any ingress that terminates client TLS
+must connect to the supervisor using HTTP/2 over TLS. Use the service hostname
+for both TLS SNI and HTTP/2 `:authority`. The supervisor checks this match
+per request and applies the service's authorization mode.
 
 Both ingress paths use `[openshell.gateway].service_hostname_format`; the app
 listener has no separate naming mode. Keeping the same installation name and
@@ -2454,7 +2464,8 @@ the listener; configuring `base_url` alone does not enable routing or create DNS
 certificates, or ingress.
 
 When configured, service responses return the application address as `url` and
-`application_url`, with `gateway_url` available as a separate alternative.
+`application_url`. For HTTP/1.1 backends, `gateway_url` is also available when
+gateway service routing is enabled.
 Create-time exposure returns corresponding preferred, application, and gateway
 URL maps. CLI and SDK callers preserve the application origin, including its
 port, when the gateway is reached through a port-forward. With the listener

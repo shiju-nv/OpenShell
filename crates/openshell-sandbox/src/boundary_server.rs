@@ -1820,10 +1820,12 @@ mod linux {
         // Do not retain the response sender while the client request direction
         // stays open: finite exchanges must still observe the server's EOF.
         let invalid_frames = outbound.downgrade();
+        let (cancel_inbound, inbound_cancelled) = tokio::sync::oneshot::channel();
         let mut inbound_closed = connection_closed.clone();
         tokio::spawn(async move {
             tokio::select! {
             _ = inbound_closed.changed() => {},
+            Ok(()) = inbound_cancelled => {},
             () = async {
             let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Request;
             loop {
@@ -1860,6 +1862,7 @@ mod linux {
         tokio::spawn(async move {
             tokio::select! {
             _ = outbound_closed.changed() => {},
+            () = outbound.closed() => {},
             () = async {
             let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Response;
             loop {
@@ -1870,6 +1873,11 @@ mod linux {
                 }
             }
             } => {},
+            }
+            // A reset must release both halves even if the inbound pump is
+            // blocked writing to the local stream. Backend EOF keeps it open.
+            if outbound.is_closed() {
+                let _ = cancel_inbound.send(());
             }
         });
         (application, ReceiverStream::new(outbound_rx))

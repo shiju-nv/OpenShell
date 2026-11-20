@@ -11,13 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use http::{Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, Version, header};
+use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper::rt::Executor as _;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::SettingsPollResult;
-use openshell_core::proto::SandboxServiceRoute;
-use openshell_isolation_interface::contract::LoopbackTarget;
+use openshell_core::proto::{SandboxServiceRoute, ServiceBackendHttpVersion};
+use openshell_isolation_interface::contract::{BoundaryDuplexStream, LoopbackTarget};
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DispositionId,
     HttpActivityBuilder, HttpResponse, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -25,7 +27,7 @@ use openshell_ocsf::{
 use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::Mutex;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
@@ -33,6 +35,8 @@ use tokio_rustls::TlsAcceptor;
 const FRESHNESS: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INSTANCE_CONNECTIONS: usize = 64;
+const MAX_HTTP2_STREAMS: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallRejection {
@@ -134,7 +138,7 @@ impl Config {
             .with_no_client_auth()
             .with_single_cert(certificates, key)
             .into_diagnostic()?;
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let socket = std::net::TcpListener::bind(self.address).into_diagnostic()?;
         socket.set_nonblocking(true).into_diagnostic()?;
         let listener = tokio::net::TcpListener::from_std(socket).into_diagnostic()?;
@@ -305,6 +309,7 @@ impl Routes {
                 || route.target_port == 0
                 || route.target_port > 65535
                 || !matches!(route.authorization_mode, 0..=2)
+                || ServiceBackendHttpVersion::try_from(route.backend_http_version).is_err()
                 || (!route.name.is_empty()
                     && (!openshell_core::app_listener::valid_dns_label(&route.name)
                         || route.name.contains("--")))
@@ -512,7 +517,7 @@ pub struct Router {
 
 struct Accepted {
     tls: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 struct Registration {
@@ -745,8 +750,9 @@ impl BoundListener {
 }
 
 struct Permits {
-    _host: tokio::sync::OwnedSemaphorePermit,
-    _instance: tokio::sync::OwnedSemaphorePermit,
+    _host: OwnedSemaphorePermit,
+    _instance: OwnedSemaphorePermit,
+    relays: Arc<Semaphore>,
 }
 
 impl InstanceListener {
@@ -757,7 +763,9 @@ impl InstanceListener {
         let retained_routes = self.routes.clone();
         let task = tokio::spawn(async move {
             let routes = self.routes.clone();
-            let permits = Arc::new(Semaphore::new(64));
+            let permits = Arc::new(Semaphore::new(MAX_INSTANCE_CONNECTIONS));
+            // Multiplexed requests share the previous per-instance relay budget.
+            let relays = Arc::new(Semaphore::new(MAX_INSTANCE_CONNECTIONS));
             let mut connections = JoinSet::new();
             ocsf_emit!(
                 AppLifecycleBuilder::new(crate::ocsf_ctx())
@@ -780,17 +788,40 @@ impl InstanceListener {
                         };
                         let routes = routes.clone();
                         let connector = connector.clone();
+                        let relays = relays.clone();
                         connections.spawn(async move {
                             let connection_routes = routes.clone();
                             let connection_route = route.clone();
-                            let permit = Arc::new(Permits { _host: host_permit, _instance: instance_permit });
-                            let service = hyper::service::service_fn(move |req| {
+                            let permit = Arc::new(Permits { _host: host_permit, _instance: instance_permit, relays });
+                            let service = move |req| {
                                 proxy(req, sni.clone(), route.clone(), routes.clone(), connector.clone(), permit.clone(), token)
-                            });
-                            let connection = hyper::server::conn::http1::Builder::new()
-                                .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
-                                .max_buf_size(65536).max_headers(64)
-                                .serve_connection(TokioIo::new(tls), service).with_upgrades();
+                            };
+                            let connection = async {
+                                if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                                    let first_request = Arc::new(Notify::new());
+                                    let started = first_request.clone();
+                                    let service = hyper::service::service_fn(move |req| {
+                                        started.notify_one();
+                                        service(req)
+                                    });
+                                    let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                        .max_concurrent_streams(MAX_HTTP2_STREAMS)
+                                        .max_header_list_size(65536)
+                                        .serve_connection(TokioIo::new(tls), service);
+                                    tokio::pin!(connection);
+                                    tokio::select! {
+                                        result = &mut connection => return result,
+                                        () = first_request.notified() => {},
+                                        () = tokio::time::sleep(HANDSHAKE_TIMEOUT) => return Ok(()),
+                                    }
+                                    connection.await
+                                } else {
+                                    hyper::server::conn::http1::Builder::new()
+                                        .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
+                                        .max_buf_size(65536).max_headers(64)
+                                        .serve_connection(TokioIo::new(tls), hyper::service::service_fn(service)).with_upgrades().await
+                                }
+                            };
                             tokio::select! {
                                 _ = connection => {},
                                 () = connection_routes.revoked(&connection_route, token) => {},
@@ -858,31 +889,33 @@ fn emit_denial(message: &str) {
     );
 }
 
-fn authority_matches<B>(req: &Request<B>, sni: &str) -> bool {
+fn request_authority<B>(req: &Request<B>, sni: &str) -> Option<header::HeaderValue> {
     let mut values = req.headers().get_all(header::HOST).iter();
-    let Some(value) = values.next() else {
-        return false;
+    let host = values
+        .next()
+        .map(header::HeaderValue::to_str)
+        .transpose()
+        .ok()?;
+    let uri_authority = req.uri().authority().map(http::uri::Authority::as_str);
+    let value = if req.version() == Version::HTTP_2 {
+        uri_authority?
+    } else {
+        host?
     };
-    if values.next().is_some() {
-        return false;
+    if values.next().is_some()
+        || host.is_some_and(|host| !host.eq_ignore_ascii_case(value))
+        || uri_authority.is_some_and(|uri| !uri.eq_ignore_ascii_case(value))
+        || value.contains('@')
+    {
+        return None;
     }
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    if value.contains('@') {
-        return false;
+    let authority = value.parse::<http::uri::Authority>().ok()?;
+    if !authority.host().eq_ignore_ascii_case(sni)
+        || (authority.port().is_some() && authority.port_u16().is_none())
+    {
+        return None;
     }
-    let Ok(authority) = value.parse::<http::uri::Authority>() else {
-        return false;
-    };
-    if authority.port().is_some() && authority.port_u16().is_none() {
-        return false;
-    }
-    authority.host().eq_ignore_ascii_case(sni)
-        && req
-            .uri()
-            .authority()
-            .is_none_or(|uri| uri.as_str().eq_ignore_ascii_case(value))
+    value.parse().ok()
 }
 
 fn gateway_header(name: &str) -> bool {
@@ -1008,20 +1041,34 @@ async fn proxy(
     if !routes.valid(&route, token) {
         return Ok(error(StatusCode::SERVICE_UNAVAILABLE));
     }
-    if !authority_matches(&req, &sni) {
+    let Some(authority) = request_authority(&req, &sni) else {
         return Ok(error(StatusCode::MISDIRECTED_REQUEST));
+    };
+    let downstream_http2 = req.version() == Version::HTTP_2;
+    let backend_http2 = route.backend_http_version == ServiceBackendHttpVersion::Http2 as i32;
+    if backend_http2 && !downstream_http2 {
+        return Ok(error(StatusCode::HTTP_VERSION_NOT_SUPPORTED));
     }
-    // Keep the public authority after validating it against SNI. The dial target
-    // is loopback, but rewriting Host would break application same-origin checks.
-    let authority = req.headers()[header::HOST].clone();
-    let websocket = req
+    if downstream_http2 && req.method() == Method::CONNECT {
+        return Ok(error(StatusCode::METHOD_NOT_ALLOWED));
+    }
+    let websocket = !downstream_http2
+        && req
+            .headers()
+            .get(header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let te_trailers = req
         .headers()
-        .get(header::UPGRADE)
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        .get(header::TE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"trailers"));
     if !sanitize_headers(req.headers_mut(), route.authorization_mode == 2, websocket) {
         return Ok(error(StatusCode::BAD_REQUEST));
     }
-    let downstream = websocket.then(|| hyper::upgrade::on(&mut req));
+    // Preserve the validated public authority for application same-origin checks.
+    req.headers_mut().insert(header::HOST, authority);
+    let Ok(relay_permit) = permit.relays.clone().try_acquire_owned() else {
+        return Ok(error(StatusCode::SERVICE_UNAVAILABLE));
+    };
     let target = LoopbackTarget::new(
         "127.0.0.1".parse().expect("loopback"),
         u16::try_from(route.target_port).expect("validated route port"),
@@ -1031,25 +1078,37 @@ async fn proxy(
     else {
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
+    let (active, receiver) = watch::channel(());
+    let executor = RelayExecutor {
+        active: receiver,
+        permit: Arc::new(relay_permit),
+    };
+    if backend_http2 {
+        if te_trailers {
+            req.headers_mut()
+                .insert(header::TE, header::HeaderValue::from_static("trailers"));
+        }
+        return Ok(proxy_http2(req, stream, executor, active).await);
+    }
+    let downstream = websocket.then(|| hyper::upgrade::on(&mut req));
     let Ok((mut sender, connection)) =
         hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
     else {
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
-    let upstream_task = tokio::spawn(async move {
-        let _ = connection.with_upgrades().await;
-    });
+    executor.execute(connection.with_upgrades());
     let (mut parts, body) = req.into_parts();
+    if downstream_http2 {
+        parts.version = Version::HTTP_11;
+    }
     parts.uri = parts
         .uri
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .parse()
         .expect("valid path");
-    parts.headers.insert(header::HOST, authority);
     let response = sender.send_request(Request::from_parts(parts, body)).await;
     let Ok(mut response) = response else {
-        upstream_task.abort();
         return Ok(error(StatusCode::BAD_GATEWAY));
     };
     let upgraded = response.status() == StatusCode::SWITCHING_PROTOCOLS && websocket;
@@ -1058,7 +1117,8 @@ async fn proxy(
         let upstream = hyper::upgrade::on(&mut response);
         let downstream = downstream.expect("websocket upgrade");
         tokio::spawn(async move {
-            let _permit = permit;
+            let _connection_permits = permit;
+            let _relay = (active, executor);
             tokio::select! {
                 () = async {
                     if let (Ok(upstream), Ok(downstream)) = tokio::join!(upstream, downstream) {
@@ -1067,17 +1127,76 @@ async fn proxy(
                 } => {},
                 () = routes.revoked(&route, token) => {},
             }
-            upstream_task.abort();
         });
         let (parts, _) = response.into_parts();
         return Ok(Response::from_parts(parts, Body::empty()));
     }
-    let (parts, body) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::new(body)))
+    Ok(response.map(|body| relay_body(body, active)))
+}
+
+#[derive(Clone)]
+struct RelayExecutor {
+    active: watch::Receiver<()>,
+    permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl<F> hyper::rt::Executor<F> for RelayExecutor
+where
+    F: Future + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let mut active = self.active.clone();
+        let permit = self.permit.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                _ = future => {},
+                _ = active.changed() => {},
+            }
+        });
+    }
+}
+
+fn relay_body(body: Incoming, active: watch::Sender<()>) -> Body {
+    Body::new(body.map_frame(move |frame| {
+        // Dropping the downstream body releases this request's loopback connection.
+        let _active = &active;
+        frame
+    }))
+}
+
+async fn proxy_http2(
+    req: Request<Incoming>,
+    stream: BoundaryDuplexStream,
+    executor: RelayExecutor,
+    active: watch::Sender<()>,
+) -> Response<Body> {
+    let handshake = hyper::client::conn::http2::handshake(executor.clone(), TokioIo::new(stream));
+    let Ok(Ok((mut sender, connection))) = tokio::time::timeout(CONNECT_TIMEOUT, handshake).await
+    else {
+        return error(StatusCode::BAD_GATEWAY);
+    };
+    executor.execute(connection);
+    let req = req.map(|body| {
+        body.map_frame(|mut frame| {
+            if let Some(trailers) = frame.trailers_mut() {
+                // Credentials are allowed only in the initial request headers.
+                sanitize_headers(trailers, false, false);
+            }
+            frame
+        })
+    });
+    let Ok(mut response) = sender.send_request(req).await else {
+        return error(StatusCode::BAD_GATEWAY);
+    };
+    strip_hop_headers(response.headers_mut(), false);
+    response.map(|body| relay_body(body, active))
 }
 
 #[cfg(test)]
 mod tests {
+    mod http2;
+
     use super::*;
     use futures::{SinkExt as _, StreamExt as _};
     use openshell_isolation_interface::contract::{BackendError, BoundaryDuplexStream};
@@ -1098,6 +1217,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         let mut config = installed(vec![route.clone()]);
         config.config_revision = 42;
@@ -1140,6 +1260,7 @@ mod tests {
                 authorization_mode: 1,
                 resource_version: 1,
                 application_hostname: String::new(),
+                backend_http_version: 0,
             };
             routes.install(&installed(vec![route.clone()]));
             let source = routes.installation_source();
@@ -1175,6 +1296,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         assert!(
@@ -1466,6 +1588,13 @@ mod tests {
                             .body(Body::from("upstream closed"))
                             .unwrap());
                     }
+                    if req.uri().path() == "/stream" {
+                        return Ok(Response::new(Body::from_stream(
+                            futures::stream::pending::<
+                                Result<hyper::body::Bytes, std::convert::Infallible>,
+                            >(),
+                        )));
+                    }
                     let body = format!(
                         "{} {} {} {}",
                         req.uri(),
@@ -1491,7 +1620,7 @@ mod tests {
     }
 
     struct Fixture {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         handle: Handle,
         address: SocketAddr,
         tls: Arc<rustls::ClientConfig>,
@@ -1537,6 +1666,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         let connector = Arc::new(Connector {
@@ -1544,7 +1674,7 @@ mod tests {
         });
         let handle = instance.start(rpc_test::loopback(connector.clone()));
         Fixture {
-            _directory: directory,
+            directory,
             handle,
             address,
             tls,
@@ -1899,6 +2029,7 @@ mod tests {
             authorization_mode: 1,
             resource_version: 1,
             application_hostname: String::new(),
+            backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
         for _ in 0..10 {
