@@ -67,6 +67,14 @@ rules:
     # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
     # name.
     verbs: ["create", "delete"]
+  {{- $proxyAuthSecret := get $kubernetesConfig "proxy_auth_secret_name" | default "" }}
+  {{- if and (include "openshell.supervisorEnabled" .) $proxyAuthSecret }}
+  # Shared instances snapshot the operator's proxy credential at creation.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $proxyAuthSecret | quote }}]
+    verbs: ["get"]
+  {{- end }}
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get"]

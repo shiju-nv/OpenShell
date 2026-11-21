@@ -595,9 +595,6 @@ impl KubernetesComputeConfig {
         Ok(())
     }
 
-    /// The shared supervisor serves only sandbox instances it can isolate: it
-    /// holds no per-sandbox workload identity, upstream proxy credential, or
-    /// proxy CA.
     pub fn validate_supervisor_topology(&self) -> Result<(), String> {
         match self.supervisor_topology {
             None => {
@@ -618,15 +615,6 @@ impl KubernetesComputeConfig {
                     && self.sandbox_runtime.app_listener.common.port == shared.runtime_port
                 {
                     return Err("supervisor.app_listener.port conflicts with shared_supervisor.runtime_port".into());
-                }
-                if self.https_proxy.is_some()
-                    || self.proxy_auth_secret_name.is_some()
-                    || self.proxy_ca_bundle.is_some()
-                {
-                    return Err(
-                        "supervisor_topology=gateway does not support upstream proxy settings"
-                            .into(),
-                    );
                 }
                 Ok(())
             }
@@ -1250,17 +1238,27 @@ mod tests {
                     .is_err()
             );
         }
-        // A shared supervisor holds no per-sandbox workload identity or proxy credential.
         let with_proxy = KubernetesComputeConfig {
             https_proxy: Some("http://proxy.example:3128".to_string()),
             ..gateway(Some(shared()))
         };
-        assert!(with_proxy.validate_supervisor_topology().is_err());
+        assert!(with_proxy.validate_supervisor_topology().is_ok());
+        assert!(with_proxy.validate_upstream_proxy_config().is_ok());
+        let with_credentials = KubernetesComputeConfig {
+            proxy_auth_secret_name: Some("egress-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            proxy_auth_allow_insecure: Some(true),
+            ..with_proxy
+        };
+        assert!(with_credentials.validate_supervisor_topology().is_ok());
+        assert!(with_credentials.validate_upstream_proxy_config().is_ok());
         let with_proxy_ca = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.example:3130".to_string()),
             proxy_ca_bundle: Some("/etc/proxy/ca.pem".to_string()),
             ..gateway(Some(shared()))
         };
-        assert!(with_proxy_ca.validate_supervisor_topology().is_err());
+        assert!(with_proxy_ca.validate_supervisor_topology().is_ok());
+        assert!(with_proxy_ca.validate_upstream_proxy_config().is_ok());
         let workspace = KubernetesComputeConfig {
             supervisor_topology: Some(SupervisorTopology::Workspace),
             ..KubernetesComputeConfig::default()

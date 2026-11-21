@@ -85,6 +85,22 @@ tests:
       - notExists:
           path: rules[*].resourceNames
 
+  - it: grants the named proxy Secret read in this workspace namespace
+    template: templates/role.yaml
+    set:
+      gateway.proxyAuthSecretName: proxy-auth
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: app-a
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["proxy-auth"]
+            verbs: ["get"]
+
   - it: binds the shared gateway service account
     template: templates/rolebinding.yaml
     set:

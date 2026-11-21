@@ -10,6 +10,9 @@ gateway:
   # -- Grant PVC metadata reads required when the gateway enables caller driver config.
   # Keep this aligned with server.drivers.kubernetes.allowDriverConfig in the gateway chart.
   allowDriverConfig: false
+  # -- Grant the gateway read access to this upstream proxy credential Secret in the workspace namespace.
+  # Set to the effective proxy_auth_secret_name for an authenticated proxy with shared supervisors.
+  proxyAuthSecretName: ""
   serviceAccount:
     # -- Name of the shared gateway ServiceAccount.
     name: openshell

@@ -871,6 +871,8 @@ impl SharedHost {
         let trust_dir = dir.join("trust");
         crate::sandbox_instance_host::prepare_private_dir(&trust_dir).map_err(failure)?;
         let ssh_socket = dir.join("ssh.sock");
+        let upstream_proxy_args =
+            stage_upstream_proxy(registration.upstream_proxy.as_ref(), dir).map_err(failure)?;
         let config = crate::SandboxInstanceConfig {
             app_router: self
                 .app_listener
@@ -891,11 +893,7 @@ impl SharedHost {
             policy_data: None,
             ssh_socket_path: Some(ssh_socket.to_string_lossy().into_owned()),
             shared_ssh_socket: false,
-            // The Kubernetes driver refuses the gateway topology when an
-            // upstream proxy is configured,
-            // and it configures no extra CA for dedicated supervisors.
-            upstream_proxy_args:
-                openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            upstream_proxy_args,
             additional_ca_bundle: None,
             policy_dns_ipv6_egress: self.policy_dns_ipv6_egress,
             nat64_prefixes: self.nat64_prefixes.clone(),
@@ -1005,6 +1003,36 @@ fn takeover_term(
             supervisor_instance_id,
             grant: secret(&takeover.grant)?,
         },
+    })
+}
+
+/// Stage the validated registration's proxy settings in its instance directory.
+fn stage_upstream_proxy(
+    proxy: Option<&openshell_supervisor_control::UpstreamProxyLaunch>,
+    dir: &Path,
+) -> Result<openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs> {
+    use openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs;
+
+    let Some(proxy) = proxy else {
+        return Ok(UpstreamProxyArgs::default());
+    };
+    let stage = |name: &str, contents: Option<&str>| -> Result<Option<String>> {
+        contents
+            .map(|contents| {
+                let path = dir.join(name);
+                write_private_file(&path, contents.as_bytes())?;
+                Ok(path.to_string_lossy().into_owned())
+            })
+            .transpose()
+    };
+    Ok(UpstreamProxyArgs {
+        https_proxy: Some(proxy.url.clone()),
+        no_proxy: proxy.no_proxy.clone(),
+        proxy_auth_file: stage("upstream-proxy-auth", proxy.credential.as_deref())?,
+        proxy_auth_allow_insecure: proxy.auth_allow_insecure,
+        proxy_connect_by_hostname: proxy.connect_by_hostname,
+        proxy_ca_bundle: stage("upstream-proxy-ca.pem", proxy.ca_bundle_pem.as_deref())?,
+        ..UpstreamProxyArgs::default()
     })
 }
 
@@ -1746,6 +1774,59 @@ mod tests {
                     .any(|assignment| assignment.route == "rt-00")
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upstream_proxy_files_and_settings_are_private_to_each_instance() {
+        use openshell_supervisor_control::UpstreamProxyLaunch;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            let dir = root.path().join(name);
+            crate::sandbox_instance_host::prepare_private_dir(&dir).unwrap();
+            let proxy = UpstreamProxyLaunch {
+                url: format!("https://{name}.example:3130"),
+                no_proxy: Some(format!("{name}.internal")),
+                credential: Some(format!("{name}:private-password")),
+                auth_allow_insecure: false,
+                connect_by_hostname: true,
+                ca_bundle_pem: None,
+            };
+            let args = stage_upstream_proxy(Some(&proxy), &dir).unwrap();
+            assert_eq!(args.https_proxy.as_deref(), Some(proxy.url.as_str()));
+            assert_eq!(args.no_proxy, proxy.no_proxy);
+            assert!(args.proxy_connect_by_hostname);
+            let credential_path = Path::new(args.proxy_auth_file.as_ref().unwrap());
+            assert_eq!(credential_path.parent(), Some(dir.as_path()));
+            assert_eq!(
+                std::fs::read_to_string(credential_path).unwrap(),
+                proxy.credential.unwrap()
+            );
+            assert_eq!(
+                std::fs::metadata(credential_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert!(
+                stage_upstream_proxy(
+                    Some(&UpstreamProxyLaunch {
+                        credential: Some("replacement:credential".to_string()),
+                        ..proxy
+                    }),
+                    &dir
+                )
+                .is_err()
+            );
+        }
+        let direct = stage_upstream_proxy(None, root.path()).unwrap();
+        assert!(direct.https_proxy.is_none());
+        assert!(direct.proxy_auth_file.is_none());
+        assert!(direct.proxy_ca_bundle.is_none());
     }
 
     /// A hosted instance whose stop path reports on `stopped`.

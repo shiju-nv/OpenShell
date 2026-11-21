@@ -266,13 +266,22 @@ fails closed.
   Shared supervisors receive final access tokens through their authenticated
   sessions. No SPIFFE socket is mounted in a shared supervisor or workload Pod.
 
-The topology does not support upstream proxies.
+- **Upstream proxy.** The gateway snapshots the operator's proxy settings,
+  credential Secret from the sandbox namespace, and CA bundle in the
+  generation's private launch record. Pool members stage the material in the
+  instance's private directory and use the same CONNECT path as dedicated
+  supervisors. Recovery and handoff reuse the record. Restart the sandbox
+  generation to pick up proxy changes. Upgrade the gateway and every pool
+  member before enabling these settings. The Helm chart grants the gateway
+  `get` on the configured credential Secret name in the sandbox namespace.
+
 With a live replacement supervisor and a takeover-capable runtime, the gateway
 can move a paused sandbox generation to the replacement using a signed takeover
 grant. Recovery preserves workload processes and memory, but proxied connections
 and interactive sessions must reconnect. If recovery exceeds the configured
 deadline, the runtime terminates the workload. It cannot recover a lost workload
 Pod or node. See [supervisor recovery](../../docs/kubernetes/high-availability.mdx#recover-from-a-supervisor-failure).
+
 Shared sandbox instances export no supervisor OTLP traces or OCSF events and do
 not relay agent traces; the driver warns at startup when the gateway configures
 any of them.

@@ -124,6 +124,15 @@ rules:
     resources: ["networkpolicies"]
     verbs: ["create", "get"]
   {{- end }}
+  {{- $proxyAuthSecret := get $kubernetesConfig "proxy_auth_secret_name" | default "" }}
+  {{- if and (eq $workspaceMode "managed") (include "openshell.supervisorEnabled" .) $proxyAuthSecret }}
+  # Read the configured proxy Secret in managed namespaces created at runtime.
+  # resourceNames limits this cluster-wide permission to that exact name.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $proxyAuthSecret | quote }}]
+    verbs: ["get"]
+  {{- end }}
   {{- if eq $workspaceMode "managed" }}
   # Operator-mode namespaces receive Secret permissions from the
   # openshell-workspace chart Role instead.

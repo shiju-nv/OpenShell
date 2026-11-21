@@ -966,17 +966,34 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: shared_supervisor is rendered by the chart; set only supervisor_topology
-  - it: rejects settings the shared supervisor cannot isolate
-    template: templates/supervisor.yaml
+  - it: accepts upstream proxy routing with shared supervisors
+    template: templates/gateway-config.yaml
     set:
       upstreamProxy:
-        url: http://proxy.example:3128
+        url: https://proxy.example:3130
+        noProxy: internal.example
+        connectByHostname: true
+        authSecret:
+          name: egress-auth
+          key: credentials
+        caBundle:
+          configMapName: egress-ca
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
     asserts:
-      - failedTemplate:
-          errorMessage: supervisor_topology=gateway does not support upstream proxy settings
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'https_proxy = "https://proxy.example:3130"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_auth_secret_name = "egress-auth"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'proxy_ca_bundle = ".*/ca.crt"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_topology = "gateway"'
   - it: rejects workspace until implemented
     template: templates/supervisor.yaml
     set:

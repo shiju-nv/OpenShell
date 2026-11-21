@@ -1536,12 +1536,17 @@ async fn handle_transparent_tcp_connection(
     let approved_real_ip_candidates = connector.addrs().to_vec();
     generation_guard.ensure_current()?;
     let dial_span = egress::dial_span(&connect_span);
-    let mut upstream =
-        dial_transparent_upstream(&upstream_proxy, &host, port, &approved_real_ip_candidates)
-            .instrument(dial_span.clone())
-            .await
-            .inspect_err(|_| egress::mark_error(&dial_span))
-            .into_diagnostic()?;
+    let mut upstream = dial_upstream(
+        &upstream_proxy,
+        &host,
+        None,
+        port,
+        &approved_real_ip_candidates,
+    )
+    .instrument(dial_span.clone())
+    .await
+    .inspect_err(|_| egress::mark_error(&dial_span))
+    .into_diagnostic()?;
     drop(dial_span);
     drop(connect_span);
     let upstream_socket_peer = upstream.peer_addr().into_diagnostic()?;
@@ -2842,6 +2847,7 @@ async fn handle_mediated_connection(
     let endpoint_observation_context = endpoint_observation_tx
         .as_ref()
         .and_then(EndpointObservationSender::capture);
+    let is_transparent = transparent_open.is_some();
     let mut policy_local_transparent = false;
     let mut metadata_transparent = false;
     let mut mapped_transparent_destination = None;
@@ -3393,8 +3399,9 @@ async fn handle_mediated_connection(
     }
 
     let dial_span = egress::dial_span(&connect_span);
+    let explicit_connect_host = (!is_transparent).then_some(raw_host_lc.as_str());
     let upstream_result = tokio::select! {
-        result = dial_upstream(&upstream_proxy, &host_lc, &raw_host_lc, port, connector.addrs())
+        result = dial_upstream(&upstream_proxy, &host_lc, explicit_connect_host, port, connector.addrs())
             .instrument(dial_span.clone()) => Some(result),
         () = connect_generation_guard.wait_until_stale() => None,
     };
@@ -4896,9 +4903,10 @@ fn validate_declared_endpoint_resolved_addrs(
 /// address, so the proxy performs no DNS resolution of its own and the
 /// tunnel stays bound to the answer that passed SSRF and `allowed_ips`
 /// validation; the hostname still travels inside the tunnel (TLS SNI,
-/// application `Host`). The operator opt-in `proxy_connect_by_hostname`
-/// sends the client-requested hostname instead, for proxies whose ACLs
-/// filter on hostnames, at the cost of re-opening proxy-side resolution.
+/// application `Host`). On an explicit CONNECT, the operator opt-in
+/// `proxy_connect_by_hostname` sends the client-requested hostname for
+/// proxies whose ACLs filter on hostnames. Transparent TCP always uses a
+/// resolver-approved address.
 ///
 /// Both paths return a [`upstream_proxy::PrefixedStream`]: for proxied
 /// dials it replays any tunneled bytes that arrived in the same read as the
@@ -4906,17 +4914,17 @@ fn validate_declared_endpoint_resolved_addrs(
 async fn dial_upstream(
     upstream_proxy: &Option<UpstreamProxyConfig>,
     host_lc: &str,
-    raw_host_lc: &str,
+    explicit_connect_host: Option<&str>,
     port: u16,
     addrs: &[SocketAddr],
 ) -> std::io::Result<upstream_proxy::PrefixedStream> {
     if let Some(cfg) = upstream_proxy.as_ref() {
         return match cfg.decision(host_lc, port, addrs) {
             upstream_proxy::ProxyDecision::Proxy(endpoint) => {
-                if cfg.connect_by_hostname() {
+                if let Some(host) = explicit_connect_host.filter(|_| cfg.connect_by_hostname()) {
                     upstream_proxy::connect_via(
                         endpoint,
-                        raw_host_lc,
+                        host,
                         port,
                         upstream_proxy::ConnectTarget::Hostname,
                     )
@@ -4926,36 +4934,6 @@ async fn dial_upstream(
                     // fallback the direct path's `TcpStream::connect` does.
                     upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
                 }
-            }
-            upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
-                Ok(upstream_proxy::PrefixedStream::without_prefix(
-                    connect_tcp_nodelay_best_effort(&direct_addrs[..]).await?,
-                ))
-            }
-        };
-    }
-    Ok(upstream_proxy::PrefixedStream::without_prefix(
-        connect_tcp_nodelay_best_effort(addrs).await?,
-    ))
-}
-
-/// Dial a policy-DNS-correlated transparent TCP destination.
-///
-/// Unlike explicit proxy traffic, transparent TCP must never honor the
-/// operator hostname-CONNECT compatibility mode: the corporate proxy must
-/// receive one of the resolver-approved addresses so it cannot perform a
-/// second, policy-bypassing DNS resolution.
-#[cfg(target_os = "linux")]
-async fn dial_transparent_upstream(
-    upstream_proxy: &Option<UpstreamProxyConfig>,
-    host_lc: &str,
-    port: u16,
-    addrs: &[SocketAddr],
-) -> std::io::Result<upstream_proxy::PrefixedStream> {
-    if let Some(cfg) = upstream_proxy.as_ref() {
-        return match cfg.decision(host_lc, port, addrs) {
-            upstream_proxy::ProxyDecision::Proxy(endpoint) => {
-                upstream_proxy::connect_via_validated(endpoint, host_lc, port, addrs).await
             }
             upstream_proxy::ProxyDecision::Direct(direct_addrs) => {
                 Ok(upstream_proxy::PrefixedStream::without_prefix(
@@ -8720,7 +8698,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let engine = PolicyEngine::from(Arc::new(
             native_identity_engine(
                 include_str!("../data/sandbox-policy.rego"),
-                &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
+                &policy_with_native_executable_paths(
+                    &POLICY_DNS_OPEN_POLICY.replace("protocol: tcp", "protocol: tcp, tls: skip"),
+                ),
             )
             .unwrap(),
         ));
@@ -8731,11 +8711,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             engine.current_generation(),
         );
 
-        let (_, _, _, transparent) = preauthorize_transparent_open(
+        let cache = Arc::new(BinaryIdentityCache::new());
+        let service = policy_dns_test_service(&store, &engine);
+        let (stream, identity, socket_addrs, transparent) = preauthorize_transparent_open(
             open,
-            Some(&policy_dns_test_service(&store, &engine)),
+            Some(&service),
             &engine,
-            &BinaryIdentityCache::new(),
+            &cache,
             None,
             None,
             false,
@@ -8747,9 +8729,65 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
         assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
         let (_, connector) = transparent
-            .and_then(|open| open.authorization)
+            .as_ref()
+            .and_then(|open| open.authorization.as_ref())
             .expect("transparent authorization");
         assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = UpstreamProxyConfig::from_args(&upstream_proxy::UpstreamProxyArgs {
+            https_proxy: Some(format!("http://{}", listener.local_addr().unwrap())),
+            proxy_connect_by_hostname: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let proxy = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "CONNECT 203.0.113.8:5432 HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let handler = Box::pin(handle_mediated_connection(
+            tokio::io::BufReader::new(stream),
+            identity,
+            socket_addrs,
+            transparent,
+            Some(service),
+            engine,
+            cache,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            AgentProposals::default(),
+            Arc::new(None),
+            Arc::new(None),
+            Arc::new(config),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(handler, proxy);
+            result.unwrap();
+        })
+        .await
+        .expect("proxy tunnel did not complete");
     }
 
     #[tokio::test]
@@ -13097,7 +13135,7 @@ network_policies:
         let stream = dial_upstream(
             &cfg,
             "api.example.com",
-            "api.example.com.",
+            Some("api.example.com."),
             443,
             &[], // addrs unused in the hostname branch
         )
@@ -13444,10 +13482,15 @@ network_policies:
         .unwrap();
         let approved = "203.0.113.27:6379".parse().unwrap();
 
-        let stream =
-            dial_transparent_upstream(&Some(config), "redis.openshell.demo", 6379, &[approved])
-                .await
-                .unwrap();
+        let stream = dial_upstream(
+            &Some(config),
+            "redis.openshell.demo",
+            None,
+            6379,
+            &[approved],
+        )
+        .await
+        .unwrap();
         let request = String::from_utf8(request_rx.await.unwrap()).unwrap();
 
         assert!(request.starts_with("CONNECT 203.0.113.27:6379 HTTP/1.1\r\n"));

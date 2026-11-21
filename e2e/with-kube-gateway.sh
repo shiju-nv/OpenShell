@@ -1631,14 +1631,23 @@ if [ "${OPENSHELL_E2E_KUBE_CORPORATE_PROXY:-0}" = "1" ]; then
   if [ "${CORPORATE_PROXY_MODE}" = "https-ca" ]; then
     CORPORATE_PROXY_SCHEME="https"
   fi
+  # Shared supervisors don't inherit the workload's host aliases. Use the
+  # already detected host IP for the operator's proxy connection.
+  CORPORATE_PROXY_HOST="${HOST_GATEWAY_IP}"
+  if [[ "${CORPORATE_PROXY_HOST}" == *:* ]]; then
+    CORPORATE_PROXY_HOST="[${CORPORATE_PROXY_HOST}]"
+  fi
+  # The base fixture uses canonical fields, which take precedence over the
+  # legacy upstreamProxy aliases. Override those same fields for each run.
   cat >"${CORPORATE_PROXY_VALUES}" <<EOF
-upstreamProxy:
-  url: ${CORPORATE_PROXY_SCHEME}://host.openshell.internal:${CORPORATE_PROXY_PORT}
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    https_proxy: ${CORPORATE_PROXY_SCHEME}://${CORPORATE_PROXY_HOST}:${CORPORATE_PROXY_PORT}
 EOF
   if [ "${CORPORATE_PROXY_MODE}" = "no-proxy" ]; then
     CORPORATE_PROXY_UPSTREAM_PORT="$(e2e_pick_port)"
     cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
-  noProxy: host.openshell.internal
+    no_proxy: host.openshell.internal
 EOF
   fi
   case "${CORPORATE_PROXY_MODE}" in
@@ -1677,7 +1686,7 @@ EOF
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=DNS:host.openshell.internal
+subjectAltName=DNS:host.openshell.internal,IP:${HOST_GATEWAY_IP}
 EXT
       openssl x509 -req -days 1 \
         -in "${CORPORATE_PROXY_TLS_DIR}/proxy.csr" \
@@ -1695,6 +1704,7 @@ EXT
         --dry-run=client -o yaml | kctl apply -f -
       CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=1
       cat >>"${CORPORATE_PROXY_VALUES}" <<EOF
+upstreamProxy:
   caBundle:
     configMapName: ${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}
 EOF

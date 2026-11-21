@@ -32,6 +32,11 @@ Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `gateway.allowDriverConfig=true` in every workspace release so caller-selected
 PVCs can be admitted.
 
+For a shared supervisor using an authenticated upstream proxy, set
+`gateway.proxyAuthSecretName` in each workspace release to the Secret name
+configured on the gateway. This grants the gateway `get` on that Secret in
+the workspace namespace.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -39,6 +44,7 @@ PVCs can be admitted.
 | fullnameOverride | string | `""` | Override the full generated resource name. |
 | gateway.allowDriverConfig | bool | `false` | Grant PVC metadata reads required when the gateway enables caller driver config. Keep this aligned with server.drivers.kubernetes.allowDriverConfig in the gateway chart. |
 | gateway.networkPolicy.podSelector | object | `{"app.kubernetes.io/instance":"openshell","app.kubernetes.io/name":"openshell"}` | Labels selecting gateway pods allowed to reach sandbox SSH. |
+| gateway.proxyAuthSecretName | string | `""` | Grant the gateway read access to this upstream proxy credential Secret in the workspace namespace. Set to the effective proxy_auth_secret_name for an authenticated proxy with shared supervisors. |
 | gateway.serviceAccount.name | string | `"openshell"` | Name of the shared gateway ServiceAccount. |
 | gateway.serviceAccount.namespace | string | `"openshell"` | Namespace containing the shared gateway ServiceAccount. |
 | nameOverride | string | `""` | Override the chart name used in generated resource names. |

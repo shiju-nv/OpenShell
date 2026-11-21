@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: Shared supervisor proxy Secret reads
+templates:
+  - templates/role.yaml
+  - templates/clusterrole.yaml
+release:
+  name: openshell
+  namespace: gateway
+
+tests:
+  - it: grants the configured proxy Secret read in the shared sandbox namespace
+    template: templates/role.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+      upstreamProxy:
+        url: https://proxy.example:3128
+        authSecret:
+          name: proxy-auth
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["proxy-auth"]
+            verbs: ["get"]
+
+  - it: keeps shared workspace proxy reads out of the ClusterRole
+    template: templates/clusterrole.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+      upstreamProxy:
+        url: https://proxy.example:3128
+        authSecret:
+          name: proxy-auth
+    asserts:
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
+
+  - it: keeps dedicated supervisor proxy credentials unreadable by the gateway
+    template: templates/role.yaml
+    set:
+      upstreamProxy:
+        url: https://proxy.example:3128
+        authSecret:
+          name: proxy-auth
+    asserts:
+      - notExists:
+          path: rules[*].resourceNames
+
+  - it: uses the effective proxy Secret name for managed namespaces
+    template: templates/clusterrole.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
+          supervisor_topology: gateway
+          proxy_auth_secret_name: schema-proxy-auth
+      upstreamProxy:
+        url: https://proxy.example:3128
+        authSecret:
+          name: legacy-proxy-auth
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            resourceNames: ["schema-proxy-auth"]
+            verbs: ["get"]
+
+  - it: leaves operator mode Secret access to workspace Roles
+    template: templates/clusterrole.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: operator
+          operator_namespace_label: workspaces.example/team=agents
+          supervisor_topology: gateway
+          https_proxy: https://proxy.example:3128
+          proxy_auth_secret_name: proxy-auth
+    asserts:
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]

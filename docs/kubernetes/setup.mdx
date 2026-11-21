@@ -379,10 +379,11 @@ upstreamProxy:
 
 ```
 
-Use `authAllowInsecure: true` only when you accept that Basic authentication is cleartext on the connection to an `http://` proxy. The initial release supports `http://` proxy endpoints and TLS CONNECT egress. It does not support HTTPS-to-proxy, custom corporate CA bundles, or forwarding plain HTTP egress through the proxy.
+Use `authAllowInsecure: true` only when you accept that Basic authentication is cleartext on the connection to an `http://` proxy. Use an `https://` URL to encrypt the connection to the proxy. Set `upstreamProxy.caBundle.configMapName` when the proxy uses a private CA or re-signs destination certificates. Plain HTTP forwarded through the supervisor's explicit HTTP proxy connects directly.
 
-The credential mounts only in the separately scheduled supervisor Pod. The
-sandbox workload cannot read it through its environment or volumes.
+Dedicated supervisor Pods mount the credential in a private volume. For shared
+supervisors, the gateway reads the Secret and delivers it in the sandbox
+generation's private launch material. See [Keep an Upstream Egress Proxy](high-availability.mdx#keep-an-upstream-egress-proxy).
 
 ## RBAC
 

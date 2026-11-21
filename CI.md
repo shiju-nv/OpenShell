@@ -235,8 +235,9 @@ Three opt-in labels enable the long-running E2E suites:
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
   with both managed and standalone compute drivers in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
-  (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
-  (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
+  (`replicaCount: 2` and bundled PostgreSQL), the shared-supervisor upstream
+  proxy test, and the credential-driver suite (Kubernetes Secrets plus Vault)
+  in `Branch E2E Checks`
 - `test:e2e:continuity` runs the continuity suites in `Branch E2E Checks`. Apply it
   with `test:e2e`, whose builds it reuses.
 

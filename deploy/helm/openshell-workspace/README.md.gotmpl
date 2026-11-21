@@ -32,5 +32,10 @@ Keep `sandboxServiceAccount.name` aligned with the gateway chart's
 `gateway.allowDriverConfig=true` in every workspace release so caller-selected
 PVCs can be admitted.
 
+For a shared supervisor using an authenticated upstream proxy, set
+`gateway.proxyAuthSecretName` in each workspace release to the Secret name
+configured on the gateway. This grants the gateway `get` on that Secret in
+the workspace namespace.
+
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

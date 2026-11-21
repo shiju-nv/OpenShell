@@ -58,6 +58,6 @@ pub use pool_limits::{
 };
 pub use registration::{
     INSTANCE_REMOVAL_GRACE, MAX_LAUNCH_MATERIAL_BYTES, ProxyCaMaterial, RegistrationError,
-    RegistrationTraceContext, SandboxInstanceRegistration, SecretPem,
+    RegistrationTraceContext, SandboxInstanceRegistration, SecretPem, UpstreamProxyLaunch,
 };
 pub use status::{SandboxInstancePhaseReport, SandboxInstanceStatusReport};

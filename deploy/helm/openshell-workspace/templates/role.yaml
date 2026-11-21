@@ -64,3 +64,9 @@ rules:
     verbs:
       - create
       - delete
+  {{- with .Values.gateway.proxyAuthSecretName }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ . | quote }}]
+    verbs: ["get"]
+  {{- end }}

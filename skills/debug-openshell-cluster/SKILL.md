@@ -1537,42 +1537,58 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 helm -n openshell get values openshell | grep -A12 upstreamProxy
 ```
 
-Both `http://host:port` and `https://host:port` forward proxies are supported;
-plain-HTTP egress is out of scope and always dials directly. The credential
-Secret named by `proxy_auth_secret_name` must exist in the sandbox namespace
+Both `http://host:port` and `https://host:port` forward proxies are supported.
+Explicit plain HTTP requests to the sandbox proxy connect directly. Eligible
+mediated TCP connections can use CONNECT through the upstream proxy. The
+credential Secret named by `proxy_auth_secret_name` must exist in the sandbox namespace
 with the key named by `proxy_auth_secret_key`, and Kubernetes will not create
 keys longer than 253 bytes or named `.`/`..`.
 
 An `https://` proxy with a private CA, or a TLS-intercepting proxy, also needs
-`upstreamProxy.caBundle.configMapName`. That ConfigMap lives in the **gateway's**
-release namespace, not the sandbox namespace, and the gateway reads it and
-stages the bundle into each sandbox's supervisor bootstrap Secret. A missing
-ConfigMap leaves the gateway Pod in `ContainerCreating`, like `oidc-ca` and
-`vault-ca`:
+`upstreamProxy.caBundle.configMapName`. Create the ConfigMap in the gateway
+release namespace. A missing ConfigMap leaves the gateway Pod in
+`ContainerCreating`, like `oidc-ca` and `vault-ca`.
 
 ```bash
 kubectl -n openshell get configmap <proxy-ca-configmap> -o jsonpath='{.data}' >/dev/null && echo "CA ConfigMap present"
 kubectl -n openshell describe pod -l app.kubernetes.io/name=openshell | grep -A5 'ContainerCreating\|MountVolume'
-kubectl -n <sandbox-namespace> get secret <supervisor-bootstrap-secret> -o jsonpath='{.data.upstream-proxy-ca\.pem}' | head -c 20
 ```
 
-An empty last command with `proxy_ca_bundle` set in the rendered TOML means the
-bundle never reached the sandbox; check the gateway logs for a `proxy_ca_bundle`
-error, which fails closed at startup rather than falling back to direct egress.
+With `supervisor_topology=gateway`, the gateway reads the credential Secret
+from the sandbox namespace and retains its value and the proxy CA in the
+generation's private supervisor launch Secret. Pool members stage files in each
+instance's private directory. A handoff restores the same values. Restart the
+sandbox generation after changing proxy settings, credentials, or trust.
+Upgrade the gateway and every pool member before enabling proxy settings.
+Missing or invalid credentials fail sandbox creation. In managed mode, confirm
+the credential Secret exists after the driver creates the namespace. In split
+or operator deployments, confirm each workspace chart sets
+`gateway.proxyAuthSecretName` to the name configured on the gateway. Check the
+grant and inspect the gateway and shared-supervisor logs for the error. Avoid
+dumping launch material because it contains credentials.
 
-The proxy arguments and credential mount belong only to the separate supervisor
-Pod. The workload Pod must never receive them. The credential is projected
+```bash
+kubectl auth can-i get secret/<proxy-auth-secret> -n <sandbox-namespace> --as=system:serviceaccount:<gateway-namespace>:<gateway-serviceaccount>
+```
+
+For dedicated supervisors, proxy arguments and the credential mount belong only
+to the separate supervisor Pod. The workload Pod must never receive credentials
+or bootstrap secrets. The credential is projected
 read-only as `openshell-upstream-proxy-auth` at
 `/run/openshell/upstream-proxy-auth` and passed by file path; it must never
 appear in environment variables, annotations, or command arguments.
 
 ```bash
+kubectl -n <sandbox-namespace> get secret <supervisor-bootstrap-secret> -o jsonpath='{.data.upstream-proxy-ca\.pem}' | head -c 20
 kubectl -n <sandbox-namespace> get secret <proxy-auth-secret> -o jsonpath='{.data}' >/dev/null && echo "secret present"
 kubectl -n <sandbox-namespace> get pod <supervisor-pod> -o jsonpath='{.spec.containers[0].command}' | grep -- '--upstream-'
 kubectl -n <sandbox-namespace> get pod <supervisor-pod> -o jsonpath='{.spec.containers[0].command}' | grep -- '--upstream-proxy-ca-bundle'
 kubectl -n <sandbox-namespace> get pod <supervisor-pod> -o jsonpath='{.spec.containers[0].volumeMounts}' | grep upstream-proxy-auth
 kubectl -n <sandbox-namespace> get events --sort-by=.lastTimestamp | grep -Ei 'secret|MountVolume' | tail -n 20
 ```
+
+If `proxy_ca_bundle` is set but the first command returns no bytes, check the
+gateway logs for a `proxy_ca_bundle` error.
 
 A missing Secret or wrong key leaves the pod stuck with a
 `MountVolume.SetUp failed` / `secret ... not found` event. If the pod starts but

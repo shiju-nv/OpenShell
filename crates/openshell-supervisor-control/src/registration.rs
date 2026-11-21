@@ -69,6 +69,66 @@ pub struct ProxyCaMaterial {
     pub private_key_pem: SecretPem,
 }
 
+/// Operator-owned proxy settings retained with one sandbox generation.
+///
+/// Persisted in private launch material for recovery, sent over the supervisor
+/// assignment stream, and staged in the hosted instance's private directory.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamProxyLaunch {
+    pub url: String,
+    pub no_proxy: Option<String>,
+    pub credential: Option<String>,
+    pub auth_allow_insecure: bool,
+    pub connect_by_hostname: bool,
+    pub ca_bundle_pem: Option<String>,
+}
+
+impl std::fmt::Debug for UpstreamProxyLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UpstreamProxyLaunch([REDACTED])")
+    }
+}
+
+impl UpstreamProxyLaunch {
+    /// Validate the same proxy boundary as dedicated supervisors, without
+    /// interpreting paths in another process's filesystem.
+    pub fn validate(&self) -> Result<(), RegistrationError> {
+        use openshell_core::driver_utils::{
+            MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES, UpstreamProxySettings,
+            parse_upstream_proxy_credential, validate_upstream_proxy_ca_bundle_pem,
+            validate_upstream_proxy_settings,
+        };
+
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some(&self.url),
+            no_proxy: self.no_proxy.as_deref(),
+            auth_file: self.credential.as_ref().map(|_| "upstream-proxy-auth"),
+            auth_allow_insecure: self.auth_allow_insecure.then_some(true),
+            connect_by_hostname: self.connect_by_hostname.then_some(true),
+            ca_bundle: self.ca_bundle_pem.as_ref().map(|_| "upstream-proxy-ca.pem"),
+            auth_setting_label: Some("proxy credential Secret"),
+        })
+        .map_err(RegistrationError::new)?;
+        if let Some(credential) = &self.credential {
+            if u64::try_from(credential.len()).unwrap_or(u64::MAX)
+                > MAX_UPSTREAM_PROXY_CREDENTIAL_BYTES
+            {
+                return Err(RegistrationError::new(
+                    "proxy credential exceeds its size limit",
+                ));
+            }
+            parse_upstream_proxy_credential(credential)
+                .map_err(|error| RegistrationError::new(format!("proxy credential {error}")))?;
+        }
+        if let Some(pem) = &self.ca_bundle_pem {
+            validate_upstream_proxy_ca_bundle_pem(pem, "shared registration", "proxy_ca_bundle")
+                .map_err(RegistrationError::new)?;
+        }
+        Ok(())
+    }
+}
+
 /// W3C trace context of the operation that created the generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +177,8 @@ pub struct SandboxInstanceRegistration {
     #[serde(default)]
     pub container_image: String,
     pub proxy_ca: ProxyCaMaterial,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<UpstreamProxyLaunch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<RegistrationTraceContext>,
 }
@@ -174,6 +236,9 @@ impl SandboxInstanceRegistration {
             || self.proxy_ca.private_key_pem.expose_secret().is_empty()
         {
             return Err(RegistrationError::new("proxy CA material is required"));
+        }
+        if let Some(proxy) = &self.upstream_proxy {
+            proxy.validate()?;
         }
         Ok(())
     }
@@ -233,6 +298,67 @@ impl SandboxInstanceRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upstream_proxy() -> UpstreamProxyLaunch {
+        UpstreamProxyLaunch {
+            url: "https://proxy.example:3130".to_string(),
+            no_proxy: Some("internal.example".to_string()),
+            credential: Some("operator:private-proxy-password".to_string()),
+            auth_allow_insecure: false,
+            connect_by_hostname: true,
+            ca_bundle_pem: None,
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_launch_roundtrips_without_debugging_credentials() {
+        let proxy = upstream_proxy();
+        proxy.validate().unwrap();
+        let decoded: UpstreamProxyLaunch =
+            serde_json::from_slice(&serde_json::to_vec(&proxy).unwrap()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.url, proxy.url);
+        assert_eq!(decoded.credential, proxy.credential);
+        assert_eq!(decoded.no_proxy, proxy.no_proxy);
+        assert!(decoded.connect_by_hostname);
+        assert!(!format!("{decoded:?}").contains("private-proxy-password"));
+    }
+
+    #[test]
+    fn upstream_proxy_launch_refuses_invalid_boundaries_without_quoting_secrets() {
+        let cases = [
+            UpstreamProxyLaunch {
+                url: "http://proxy.example:3128".to_string(),
+                ..upstream_proxy()
+            },
+            UpstreamProxyLaunch {
+                url: "http://operator:private-proxy-password@proxy.example:3128".to_string(),
+                ..upstream_proxy()
+            },
+            UpstreamProxyLaunch {
+                credential: Some("private-proxy-password".to_string()),
+                ..upstream_proxy()
+            },
+            UpstreamProxyLaunch {
+                credential: Some(format!("operator:{}", "x".repeat(4096))),
+                ..upstream_proxy()
+            },
+            UpstreamProxyLaunch {
+                ca_bundle_pem: Some("private-proxy-password".to_string()),
+                ..upstream_proxy()
+            },
+        ];
+        for proxy in cases {
+            let error = proxy.validate().unwrap_err().to_string();
+            assert!(!error.contains("private-proxy-password"), "{error}");
+        }
+        let acknowledged = UpstreamProxyLaunch {
+            url: "http://proxy.example:3128".to_string(),
+            auth_allow_insecure: true,
+            ..upstream_proxy()
+        };
+        acknowledged.validate().unwrap();
+    }
 
     #[test]
     fn assignments_must_agree_with_their_launch_material() {

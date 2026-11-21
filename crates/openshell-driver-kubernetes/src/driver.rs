@@ -3517,6 +3517,75 @@ impl KubernetesComputeDriver {
         })
     }
 
+    /// Snapshot proxy credentials from the workload namespace into the same
+    /// private generation record as its route and trust, including on takeover.
+    async fn shared_upstream_proxy_launch(
+        &self,
+        namespace: &str,
+        ca_bundle: Option<Vec<u8>>,
+    ) -> Result<Option<openshell_supervisor_control::UpstreamProxyLaunch>, KubernetesDriverError>
+    {
+        let Some(url) = &self.config.https_proxy else {
+            return Ok(None);
+        };
+        let credential = match (
+            self.config.proxy_auth_secret_name.as_deref(),
+            self.config.proxy_auth_secret_key.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(name), Some(key)) => {
+                let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
+                let secret = tokio::time::timeout(KUBE_API_TIMEOUT, secrets.get_opt(name))
+                    .await
+                    .map_err(|_| {
+                        KubernetesDriverError::Message(format!(
+                            "timed out reading proxy credential Secret {name} in namespace {namespace}"
+                        ))
+                    })?
+                    .map_err(KubernetesDriverError::from_kube)?
+                    .ok_or_else(|| {
+                        KubernetesDriverError::Precondition(format!(
+                            "proxy credential Secret {name} does not exist in namespace {namespace}"
+                        ))
+                    })?;
+                let value = secret
+                    .data
+                    .and_then(|mut data| data.remove(key))
+                    .ok_or_else(|| {
+                        KubernetesDriverError::Precondition(
+                            "proxy credential Secret is missing its configured key".to_string(),
+                        )
+                    })?;
+                Some(String::from_utf8(value.0).map_err(|_| {
+                    KubernetesDriverError::Precondition(
+                        "proxy credential Secret must contain UTF-8 user:pass".to_string(),
+                    )
+                })?)
+            }
+            _ => {
+                return Err(KubernetesDriverError::Precondition(
+                    "proxy_auth_secret_name and proxy_auth_secret_key must be set together".into(),
+                ));
+            }
+        };
+        let proxy = openshell_supervisor_control::UpstreamProxyLaunch {
+            url: url.clone(),
+            no_proxy: self.config.no_proxy.clone(),
+            credential,
+            auth_allow_insecure: self.config.proxy_auth_allow_insecure.unwrap_or(false),
+            connect_by_hostname: self.config.proxy_connect_by_hostname.unwrap_or(false),
+            ca_bundle_pem: ca_bundle.map(String::from_utf8).transpose().map_err(|_| {
+                KubernetesDriverError::Precondition(
+                    "proxy_ca_bundle must contain UTF-8 PEM".to_string(),
+                )
+            })?,
+        };
+        proxy
+            .validate()
+            .map_err(|error| KubernetesDriverError::Precondition(error.to_string()))?;
+        Ok(Some(proxy))
+    }
+
     /// Create one generation's gated supervisor Pod and return its UID.
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
     async fn create_sandbox_runtime_supervisor(
@@ -4015,6 +4084,9 @@ impl KubernetesComputeDriver {
                 .map_err(KubernetesDriverError::from_kube)?;
             }
             GenerationLaunchTarget::Shared { shared, route, .. } => {
+                let upstream_proxy = self
+                    .shared_upstream_proxy_launch(namespace, staged.upstream_proxy_ca_bundle)
+                    .await?;
                 self.create_generation_image_pull_secrets(
                     namespace,
                     names,
@@ -4029,6 +4101,7 @@ impl KubernetesComputeDriver {
                     provisioned.runtime_descriptor,
                     launch_authentication,
                     proxy_ca,
+                    upstream_proxy,
                 )?;
                 // The coordinator persists the launch material with the
                 // generation before it assigns the instance, so a restarted
@@ -5889,6 +5962,7 @@ fn shared_instance_registration(
     runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     proxy_ca: crate::sandbox_runtime::ProxyCaMaterial,
+    upstream_proxy: Option<openshell_supervisor_control::UpstreamProxyLaunch>,
 ) -> Result<SandboxInstanceRegistration, KubernetesDriverError> {
     Ok(SandboxInstanceRegistration {
         route: route.to_string(),
@@ -5922,6 +5996,7 @@ fn shared_instance_registration(
             certificate_pem: proxy_ca.certificate_pem,
             private_key_pem: openshell_supervisor_control::SecretPem::new(proxy_ca.private_key_pem),
         },
+        upstream_proxy,
         trace_context: RegistrationTraceContext::current(),
     })
 }
@@ -9134,6 +9209,7 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::ByteString;
 
     /// Serve Pod GETs over one reusable HTTP/1 connection per client,
     /// delaying a request for Pod `slow-<millis>` by that many milliseconds.
@@ -13594,6 +13670,97 @@ mod tests {
             shared_supervisor: None,
         };
         (driver, steps, bodies)
+    }
+
+    #[tokio::test]
+    async fn shared_proxy_launch_snapshots_credentials_from_each_sandbox_namespace() {
+        let ca = generate_proxy_ca_material().unwrap().certificate_pem;
+        for (namespace, path) in [
+            (
+                "workspace-a",
+                "/api/v1/namespaces/workspace-a/secrets/egress-auth",
+            ),
+            (
+                "workspace-b",
+                "/api/v1/namespaces/workspace-b/secrets/egress-auth",
+            ),
+        ] {
+            let credential = format!("{namespace}:private-password");
+            let secret = Secret {
+                data: Some(BTreeMap::from([(
+                    "credentials".to_string(),
+                    ByteString(credential.as_bytes().to_vec()),
+                )])),
+                ..Secret::default()
+            };
+            let config = KubernetesComputeConfig {
+                https_proxy: Some("https://proxy.example:3130".to_string()),
+                proxy_auth_secret_name: Some("egress-auth".to_string()),
+                proxy_auth_secret_key: Some("credentials".to_string()),
+                ..KubernetesComputeConfig::default()
+            };
+            let (driver, pending, _) = scripted_driver(
+                config,
+                vec![(
+                    http::Method::GET,
+                    path,
+                    kube_test_response(http::StatusCode::OK, serde_json::to_value(secret).unwrap()),
+                )],
+            );
+            let proxy = driver
+                .shared_upstream_proxy_launch(namespace, Some(ca.as_bytes().to_vec()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(proxy.credential.as_deref(), Some(credential.as_str()));
+            assert_eq!(proxy.ca_bundle_pem.as_deref(), Some(ca.as_str()));
+            assert!(pending.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_proxy_launch_refuses_missing_or_invalid_credentials() {
+        let path = "/api/v1/namespaces/workspace-a/secrets/egress-auth";
+        let config = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.example:3130".to_string()),
+            proxy_auth_secret_name: Some("egress-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let missing_secret = (
+            kube_test_not_found("secrets", "egress-auth"),
+            "proxy credential Secret egress-auth does not exist in namespace workspace-a",
+        );
+        let invalid = [
+            None,
+            Some(vec![0xff]),
+            Some(b"private-password".to_vec()),
+            Some(vec![b'x'; 4097]),
+        ];
+        let responses = std::iter::once(missing_secret).chain(invalid.map(|credential| {
+            let secret = Secret {
+                data: credential
+                    .map(|value| BTreeMap::from([("credentials".to_string(), ByteString(value))])),
+                ..Secret::default()
+            };
+            (
+                kube_test_response(http::StatusCode::OK, serde_json::to_value(secret).unwrap()),
+                "proxy credential",
+            )
+        }));
+        for (response, expected) in responses {
+            let (driver, _, _) =
+                scripted_driver(config.clone(), vec![(http::Method::GET, path, response)]);
+            let error = driver
+                .shared_upstream_proxy_launch("workspace-a", None)
+                .await
+                .unwrap_err();
+            let KubernetesDriverError::Precondition(message) = error else {
+                panic!("expected a proxy credential precondition, got {error}");
+            };
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("private-password"), "{message}");
+        }
     }
 
     fn pod_owner(name: &str, uid: &str) -> OwnerReference {

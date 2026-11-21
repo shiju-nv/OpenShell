@@ -613,6 +613,59 @@ more supervisors at once, set `supervisor.podDisruptionBudget.enabled` to
 helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.podDisruptionBudget.enabled=false
 ```
 
+### Keep an Upstream Egress Proxy
+
+Shared supervisors accept the same `upstreamProxy` settings as dedicated
+supervisors. Use this to route policy-approved HTTPS and eligible mediated
+TCP through an HTTP CONNECT proxy while applications keep their destination
+URLs and sandbox policies.
+
+Add the proxy settings to the topology values above:
+
+```yaml
+upstreamProxy:
+  url: https://proxy.example.test:3128
+  noProxy: ""
+  caBundle:
+    configMapName: egress-proxy-ca
+```
+
+Replace the URL with your proxy listener. The CA ConfigMap belongs in the
+gateway release namespace; include it when the proxy uses a private CA or
+re-signs destination certificates. The CA bundle counts toward the 256 KiB
+limit for each shared sandbox's serialized launch material. Include only the
+proxy's CA certificates.
+
+If proxy authentication is required, set `authSecret.name` and
+`authSecret.key` for an existing credential Secret in each sandbox namespace.
+For an authenticated `http://` proxy, also set `authAllowInsecure: true`.
+
+The gateway needs `get` access to that Secret in each sandbox namespace.
+
+- For a shared workspace where the gateway chart owns sandbox resources, the
+  chart adds the grant to the sandbox namespace Role.
+- For operator workspaces or [split gateway and workspace releases](/kubernetes/setup#split-gateway-and-workspace-releases),
+  set `gateway.proxyAuthSecretName` in each workspace release to the effective
+  Secret name configured on the gateway. Each workspace chart grants access in
+  its own namespace.
+- For managed workspaces, the gateway chart grants `get` on that exact Secret
+  name through the ClusterRole. The first sandbox creation can create the
+  namespace and then fail if the credential is missing. Provision the Secret
+  when the namespace appears and retry sandbox creation.
+
+For custom RBAC, grant the read in the sandbox namespaces the gateway owns.
+
+Upgrade the gateway and every pool member before enabling proxy settings.
+The gateway retains the proxy settings, credential, and CA bundle in both the
+generation's private supervisor launch Secret and the configured credential
+store. The replacement supervisor uses the same launch material on handoff.
+Restart the generation after
+changing proxy settings, credentials, or trust. Requests selected for proxying
+fail if the proxy is unavailable. `noProxy` selects direct exceptions.
+Explicit plain HTTP requests to the sandbox proxy connect directly. Set
+`connectByHostname: true` to send hostnames in upstream tunnels opened for
+explicit CONNECT requests. Mediated TCP tunnels use validated IP addresses.
+
 ### Recover from a Supervisor Failure
 
 When a supervisor fails, the gateway moves its sandboxes to a live supervisor.

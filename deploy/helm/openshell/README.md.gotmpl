@@ -510,6 +510,14 @@ Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
 which defaults to 1, so set `replicaCount` to the replica count you want in
 that upgrade.
 
+The shared topology supports `upstreamProxy` for policy-approved egress through an
+operator-managed HTTP CONNECT proxy. See
+[Keep an Upstream Egress Proxy](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#keep-an-upstream-egress-proxy)
+for configuration and upgrade requirements.
+
+For an authenticated proxy, set `gateway.proxyAuthSecretName` in each
+`openshell-workspace` release to the Secret name configured on the gateway.
+
 Set `supervisor.autoscaling.enabled=true` with the shared supervisor topology
 to autoscale its Deployment independently of the gateway. It uses average
 memory per Pod (`supervisor.autoscaling.targetMemoryAverageValue`, default

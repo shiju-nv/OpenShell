@@ -17,6 +17,10 @@
 //! gateway read, bootstrap-Secret key, supervisor mount, `--upstream-proxy-ca-bundle`
 //! argument — because the CONNECT handshake cannot succeed unless every link
 //! works.
+//!
+//! `mise run e2e:kubernetes:shared-supervisor-proxy` runs that same authenticated,
+//! private-CA test with gateway topology, covering generation launch material
+//! and private per-instance staging instead of a dedicated Pod's mounts.
 
 use std::io::Write as _;
 
@@ -53,7 +57,7 @@ def wrap(sock):
     };
     format!(
         r#"{tls_setup}
-import base64, select, socket, threading
+import base64, select, socket, ssl, threading
 expected = 'Basic ' + base64.b64encode(b'{USER}:{PASS}').decode()
 def head(c):
   data=b''
@@ -98,7 +102,10 @@ while True:
   c,_=s.accept()
   try: c=wrap(c)
   except OSError as e:
-    print('handshake-failed %s' % e, flush=True); c.close(); continue
+    # The host fixture's readiness probe opens and closes a plain TCP socket.
+    if not isinstance(e, ssl.SSLEOFError):
+      print('handshake-failed %s' % e, flush=True)
+    c.close(); continue
   threading.Thread(target=handle,args=(c,),daemon=True).start()
 "#
     )
@@ -213,6 +220,11 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
             .await
             .expect("start TLS upstream")
     };
+    // A live denied destination detects both proxy forwarding and direct
+    // fallback; a closed port would hide an unauthorized direct dial.
+    let denied_upstream = HostSupportContainer::start_python(&tls_upstream_script(), FIXTURE_PORT)
+        .await
+        .expect("start policy-denied TLS upstream");
 
     let mut policy = NamedTempFile::new().expect("create policy file");
     policy
@@ -225,7 +237,7 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
         .expect("UTF-8 policy path")
         .to_string();
     let allowed = format!("https://{HOST_ALIAS}:{}/", upstream.port);
-    let denied = format!("https://{HOST_ALIAS}:9/");
+    let denied = format!("https://{HOST_ALIAS}:{}/", denied_upstream.port);
     let script = format!(
         "import ssl, urllib.request\nctx=ssl._create_unverified_context()\n\n\ndef fetch(url):\n  try:\n    with urllib.request.urlopen(url,timeout=30,context=ctx) as r: return 'ok:'+r.read().decode()\n  except Exception as e: return 'err:'+str(e)\nprint('ALLOWED '+fetch({allowed:?}),flush=True)\nprint('DENIED '+fetch({denied:?}),flush=True)"
     );
@@ -233,24 +245,30 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
         .await
         .expect("create sandbox through corporate proxy");
     let output = &sandbox.create_output;
-    assert!(
-        output.contains(MARKER),
-        "approved HTTPS request must reach upstream through the proxy:\n{output}"
-    );
-    assert!(
-        output.contains("DENIED err:") && output.contains("403"),
-        "policy-denied request must fail closed with 403:\n{output}"
-    );
     let logs = proxy.logs().expect("read proxy logs");
+    assert!(
+        output.contains(&format!("ALLOWED ok:{MARKER}")),
+        "approved HTTPS request must reach upstream through the proxy:\n{output}\nProxy logs:\n{logs}"
+    );
+    assert!(
+        output.contains("DENIED err:"),
+        "request to the live policy-denied destination must fail closed:\n{output}"
+    );
     if mode == "no-proxy" {
         assert!(
             !logs.contains("CONNECT"),
             "NO_PROXY request must bypass the corporate proxy:\n{logs}"
         );
     } else {
+        let host_ip = std::env::var("OPENSHELL_E2E_HOST_GATEWAY_IP")
+            .expect("host gateway IP must be supplied by Kubernetes e2e wrapper")
+            .parse()
+            .expect("host gateway IP must be an IP address");
+        let target = std::net::SocketAddr::new(host_ip, upstream.port);
+        let expected_connect = format!("CONNECT {target} auth=ok");
         assert!(
-            logs.contains("auth=ok"),
-            "Secret credentials must reach proxy:\n{logs}"
+            logs.lines().any(|line| line == expected_connect),
+            "proxy must receive authenticated CONNECT to the validated IP and port:\n{logs}"
         );
         if mode == "https-ca" {
             // A staging failure anywhere in the chain (gateway read, Secret
@@ -267,7 +285,18 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
         );
     }
     assert!(
-        !logs.contains(":9 ") && !logs.contains(":9\n"),
+        !logs.contains(&format!(":{} ", denied_upstream.port)),
         "denied request must never reach proxy:\n{logs}"
     );
+    if mode != "no-proxy" {
+        drop(proxy);
+        let output = sandbox
+            .exec(&["python3", "-c", &script])
+            .await
+            .expect("retry sandbox requests after stopping the upstream proxy");
+        assert!(
+            output.contains("ALLOWED err:"),
+            "the approved request must fail when its proxy is down and its destination is still running:\n{output}"
+        );
+    }
 }

@@ -1638,24 +1638,27 @@ supervisor_image_pull_policy   = "if_not_present"
 # https_proxy                  = "http://proxy.corp.example:8080"
 # no_proxy                     = ".svc,.svc.cluster.local,10.96.0.0/12,10.244.0.0/16"
 # Proxy credentials must be an existing Secret in the sandbox namespace. The
-# key contains a `user:pass` value and is mounted only in the network
-# supervisor container, never in workload environment or command arguments.
+# key contains a `user:pass` value. The supervisor receives the credential in
+# a private file outside the workload's environment and command arguments.
 # proxy_auth_secret_name       = "corporate-proxy-auth"
 # proxy_auth_secret_key        = "credentials"
 # The gateway validates the Secret name/key syntax and their configuration
-# relationship at startup; it does not read the Secret from the Kubernetes API.
-# Kubernetes resolves the Secret when the Sandbox Pod starts. A missing key or
-# Secret prevents that Pod from starting; unreadable or malformed `user:pass`
-# content is validated fail-closed by the supervisor at startup and never
-# falls back to direct egress.
-# Proxy credentials mount only in the separately scheduled supervisor Pod.
+# relationship at startup. Dedicated supervisors mount the Secret; a missing
+# Secret/key blocks their Pod, and malformed contents fail supervisor startup.
+# With supervisor_topology = "gateway", the gateway reads and validates the
+# credential from the sandbox namespace and stores it with the generation's
+# private launch material. Pool members restore it in each instance's private
+# directory, including after a handoff. Restart the sandbox generation after
+# changing proxy settings, credentials, or trust. Upgrade the gateway and all
+# pool members before enabling proxy settings. Both topologies refuse invalid
+# credentials without a direct fallback.
 # Required with a credential Secret when the proxy URL is http://, because
 # Basic authentication is then cleartext on the connection to that proxy. An
 # https:// proxy carries the credential inside the verified TLS session and
 # needs no acknowledgement.
 # proxy_auth_allow_insecure    = true
-# Last resort for hostname-filtering proxy ACLs. The proxy resolves the target,
-# so its ACL becomes part of the egress boundary for proxied connections.
+# Last resort for hostname-filtering proxy ACLs. It lets the proxy resolve the
+# target of an explicit CONNECT request. Mediated TCP uses validated IPs.
 # proxy_connect_by_hostname    = true
 # CA bundle trusted for the corporate proxy, as a path on the gateway Pod's
 # filesystem. Needed for an https:// proxy whose certificate is not publicly

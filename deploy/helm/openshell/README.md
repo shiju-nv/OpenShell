@@ -509,6 +509,14 @@ Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
 which defaults to 1, so set `replicaCount` to the replica count you want in
 that upgrade.
 
+The shared topology supports `upstreamProxy` for policy-approved egress through an
+operator-managed HTTP CONNECT proxy. See
+[Keep an Upstream Egress Proxy](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#keep-an-upstream-egress-proxy)
+for configuration and upgrade requirements.
+
+For an authenticated proxy, set `gateway.proxyAuthSecretName` in each
+`openshell-workspace` release to the Secret name configured on the gateway.
+
 Set `supervisor.autoscaling.enabled=true` with the shared supervisor topology
 to autoscale its Deployment independently of the gateway. It uses average
 memory per Pod (`supervisor.autoscaling.targetMemoryAverageValue`, default
@@ -850,7 +858,7 @@ for peer identity policies, multi-node registrations, and authorization.
 | upstreamProxy.authAllowInsecure | bool | `false` | Required when authSecret is configured because Basic auth to an HTTP proxy is cleartext. |
 | upstreamProxy.authSecret.key | string | `""` | Secret key containing the proxy credential. |
 | upstreamProxy.authSecret.name | string | `""` | Existing Secret in the sandbox namespace containing a user:pass value. |
-| upstreamProxy.caBundle.configMapName | string | `""` | ConfigMap in the release namespace holding the corporate proxy CA bundle. Required for an https:// proxy with a private CA, and for a TLS-intercepting proxy that re-signs upstream certificates. The gateway reads it and stages it into each sandbox's immutable supervisor bootstrap Secret, so the anchor stays in the gateway's trust domain rather than the workload namespace. Supply only the CA that signs your proxy's certificate, or that the proxy re-signs intercepted upstream certificates with. Public roots already come from the supervisor image and its TLS stack, so a full merged trust bundle (for example an OpenShift config.openshift.io/inject-trusted-cabundle ConfigMap) adds hundreds of kilobytes of duplicated roots and can exceed the sandbox boundary's control-frame budget. |
+| upstreamProxy.caBundle.configMapName | string | `""` | ConfigMap in the release namespace holding the corporate proxy CA bundle. Required for an https:// proxy with a private CA, and for a TLS-intercepting proxy that re-signs upstream certificates. The gateway saves the bundle in the generation's supervisor bootstrap Secret for dedicated supervisors or private launch Secret for shared supervisors. Supply only the CA that signs your proxy's certificate, or that the proxy re-signs intercepted upstream certificates with. Public roots already come from the supervisor image and its TLS stack, so a full merged trust bundle (for example an OpenShift config.openshift.io/inject-trusted-cabundle ConfigMap) adds hundreds of kilobytes of duplicated roots and can exceed the sandbox boundary's control-frame budget. |
 | upstreamProxy.caBundle.key | string | `"ca.crt"` | Key inside that ConfigMap. Change this only to reuse an existing ConfigMap whose key is not ca.crt. |
 | upstreamProxy.connectByHostname | bool | `false` | Last-resort option for hostname-filtering proxy ACLs. It lets the proxy resolve CONNECT targets. |
 | upstreamProxy.noProxy | string | `""` | Comma-separated destinations that bypass only the corporate proxy. |
