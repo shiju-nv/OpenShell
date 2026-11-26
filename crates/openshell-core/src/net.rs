@@ -58,6 +58,14 @@ pub fn is_host_gateway_alias(host: &str) -> bool {
     .any(|alias| alias.eq_ignore_ascii_case(host))
 }
 
+/// Parse a CIDR or treat a bare IP address as a single-address network.
+pub fn parse_ip_network(value: &str) -> Option<IpNet> {
+    value
+        .parse()
+        .ok()
+        .or_else(|| value.parse::<IpAddr>().ok().map(IpNet::from))
+}
+
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
 ///

@@ -40,7 +40,7 @@ use openshell_core::endpoint_status::{
 use openshell_core::net::{
     BLOCKED_CONTROL_PLANE_PORTS, POLICY_LOCAL_ADDRESS, POLICY_LOCAL_HOST,
     connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
-    normalize_host_lookup_key, set_tcp_nodelay_best_effort,
+    normalize_host_lookup_key, parse_ip_network, set_tcp_nodelay_best_effort,
 };
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -5020,19 +5020,8 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
     let mut errors = Vec::new();
 
     for entry in raw {
-        // Try as CIDR first, then as bare IP (convert to /32 or /128)
-        let parsed = entry.parse::<ipnet::IpNet>().or_else(|_| {
-            entry
-                .parse::<IpAddr>()
-                .map(|ip| match ip {
-                    IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::from(v4)),
-                    IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::from(v6)),
-                })
-                .map_err(|_| ())
-        });
-
-        match parsed {
-            Ok(n) => {
+        match parse_ip_network(entry) {
+            Some(n) => {
                 // Reject entries that overlap always-blocked ranges — these
                 // would be silently denied at runtime by is_always_blocked_ip
                 // and cause confusing UX (accepted in policy, never works).
@@ -5063,7 +5052,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
                 nets.push(n);
             }
-            Err(()) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
+            None => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
 

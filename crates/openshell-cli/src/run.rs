@@ -5960,9 +5960,9 @@ pub fn sandbox_policy_lint(policy_path: &str) -> Result<()> {
             miette::bail!("policy is invalid:\n- {}", violations.join("\n- "));
         }
     };
-    for warning in openshell_policy::control_plane_port_warnings(&policy) {
+    openshell_policy::report_control_plane_port_warnings(&policy, |warning| {
         eprintln!("Warning: {warning}");
-    }
+    });
     println!("Policy is valid (offline): {policy_path}");
     println!("Gateway checks for providers, external middleware, images and drivers are not run.");
     Ok(())

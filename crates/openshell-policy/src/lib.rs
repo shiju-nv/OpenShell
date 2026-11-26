@@ -2672,47 +2672,67 @@ pub fn validate_and_canonicalize_authored_policy(
 ///
 /// Exact hosts and explicit IP constraints select the supervisor's guarded
 /// destination modes. Driver aliases and the sandbox-local policy API have
-/// their own routing rules.
-#[must_use]
-pub fn control_plane_port_warnings(policy: &SandboxPolicy) -> Vec<String> {
+/// their own routing rules. Call `report` once per distinct blocked port on
+/// each applicable endpoint.
+pub fn report_control_plane_port_warnings(
+    policy: &SandboxPolicy,
+    mut report: impl FnMut(fmt::Arguments<'_>),
+) {
     use openshell_core::net::{
         BLOCKED_CONTROL_PLANE_PORTS, POLICY_LOCAL_ADDRESS, POLICY_LOCAL_HOST,
-        is_host_gateway_alias, normalize_host_lookup_key,
+        is_always_blocked_net, is_host_gateway_alias, normalize_host_lookup_key, parse_ip_network,
     };
     use openshell_core::policy_l7::selector_ports;
 
-    let mut warnings = Vec::new();
     let mut rules: Vec<_> = policy.network_policies.iter().collect();
     rules.sort_by_key(|(name, _)| *name);
     for (name, rule) in rules {
         for (index, endpoint) in rule.endpoints.iter().enumerate() {
+            let ports = selector_ports(endpoint);
+            let mut blocked_ports = BLOCKED_CONTROL_PLANE_PORTS
+                .iter()
+                .copied()
+                .filter(|&port| ports.contains(&u32::from(port)))
+                .peekable();
+            if blocked_ports.peek().is_none() {
+                continue;
+            }
             let host = &endpoint.host;
-            let lookup_host = normalize_host_lookup_key(host);
-            if host.contains(char::is_whitespace)
-                || is_host_gateway_alias(host)
-                || lookup_host.eq_ignore_ascii_case(POLICY_LOCAL_HOST)
-                || lookup_host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|ip| ip.to_canonical() == IpAddr::V4(POLICY_LOCAL_ADDRESS))
+            let exact_host = !host.is_empty() && !host.contains('*');
+            if (!exact_host && endpoint.allowed_ips.is_empty())
+                || host.contains(char::is_whitespace)
             {
                 continue;
             }
-            let exact_host = !host.is_empty() && !host.contains('*');
-            if !exact_host && endpoint.allowed_ips.is_empty() {
+            let lookup_host = normalize_host_lookup_key(host);
+            let ip = lookup_host.parse::<IpAddr>().ok();
+            if is_host_gateway_alias(host)
+                || lookup_host.eq_ignore_ascii_case(POLICY_LOCAL_HOST)
+                || ip.is_some_and(|ip| ip.to_canonical() == IpAddr::V4(POLICY_LOCAL_ADDRESS))
+            {
+                continue;
+            }
+            // Proxy request parsing removes IPv6 authority brackets. A selector
+            // written with those brackets cannot match the resulting host.
+            if host.starts_with('[') && host.ends_with(']') && ip.is_some_and(|ip| ip.is_ipv6()) {
+                continue;
+            }
+            // The runtime must accept the IP constraints to reach the port check.
+            if endpoint
+                .allowed_ips
+                .iter()
+                .any(|value| parse_ip_network(value).is_none_or(is_always_blocked_net))
+            {
                 continue;
             }
             let selector = if host.is_empty() { "<any-host>" } else { host };
-            let ports = selector_ports(endpoint);
-            for &port in BLOCKED_CONTROL_PLANE_PORTS {
-                if ports.contains(&u32::from(port)) {
-                    warnings.push(format!(
-                        "network policy {name:?} endpoint[{index}] ({selector:?}) uses blocked control-plane port {port} for TCP egress"
-                    ));
-                }
+            for port in blocked_ports {
+                report(format_args!(
+                    "network policy {name:?} endpoint[{index}] ({selector:?}) lists blocked control-plane port {port} for TCP egress"
+                ));
             }
         }
     }
-    warnings
 }
 
 /// Reject authored rule keys reserved for provider composition.
