@@ -9,7 +9,7 @@ fn policy_lint_warns_for_statically_blocked_control_plane_ports() {
     let file = dir.path().join("policy.yaml");
     std::fs::write(
         &file,
-        r#"
+        r"
 version: 1
 network_policies:
   cluster-api:
@@ -39,7 +39,7 @@ network_policies:
       - {host: policy.local, port: 6443}
       - {host: 198.18.0.1, port: 6443}
       - {host: '::ffff:198.18.0.1', port: 6443}
-"#,
+",
     )
     .unwrap();
 
