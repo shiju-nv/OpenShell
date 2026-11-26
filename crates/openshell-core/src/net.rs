@@ -21,6 +21,43 @@ use tokio::net::TcpStream;
 
 pub mod nat64;
 
+/// Control-plane ports blocked by the supervisor when a destination can admit
+/// private addresses.
+pub const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
+    2379,  // etcd client
+    2380,  // etcd peer
+    6443,  // Kubernetes API server
+    10250, // kubelet API
+    10255, // kubelet read-only
+];
+
+/// Hostname of the sandbox-local policy API.
+pub const POLICY_LOCAL_HOST: &str = "policy.local";
+
+/// Address reserved for the sandbox-local policy API in the synthetic IPv4 pool.
+pub const POLICY_LOCAL_ADDRESS: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+
+/// Strip IPv6 brackets and the DNS root dot for destination lookups.
+pub fn normalize_host_lookup_key(host: &str) -> &str {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    host.strip_suffix('.').unwrap_or(host)
+}
+
+/// Check for a driver-injected alias eligible for trusted host-gateway routing.
+pub fn is_host_gateway_alias(host: &str) -> bool {
+    let host = normalize_host_lookup_key(host);
+    [
+        "host.openshell.internal",
+        "host.containers.internal",
+        "host.docker.internal",
+    ]
+    .iter()
+    .any(|alias| alias.eq_ignore_ascii_case(host))
+}
+
 /// Check if a hostname is a known cloud metadata hostname that resolves to an
 /// always-blocked metadata service.
 ///

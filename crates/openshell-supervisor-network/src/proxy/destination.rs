@@ -9,14 +9,15 @@
 //! Shared external destination validation and upstream dial boundary.
 
 use super::{
-    AddressBinding, BLOCKED_CONTROL_PLANE_PORTS, DestinationCheckError,
-    implicit_allowed_ips_for_ip_host, is_cloud_metadata_ip, is_host_gateway_alias,
-    is_link_local_ip, normalize_host_lookup_key, parse_allowed_ips, resolve_and_check_allowed_ips,
-    resolve_and_check_declared_endpoint, resolve_and_check_trusted_gateway,
-    resolve_and_reject_internal, resolve_socket_addrs,
+    AddressBinding, DestinationCheckError, implicit_allowed_ips_for_ip_host, is_cloud_metadata_ip,
+    parse_allowed_ips, resolve_and_check_allowed_ips, resolve_and_check_declared_endpoint,
+    resolve_and_check_trusted_gateway, resolve_and_reject_internal, resolve_socket_addrs,
 };
 use ipnet::IpNet;
-use openshell_core::net::{connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip};
+use openshell_core::net::{
+    BLOCKED_CONTROL_PLANE_PORTS, connect_tcp_nodelay_best_effort, is_always_blocked_ip,
+    is_host_gateway_alias, is_internal_ip, is_link_local_ip, normalize_host_lookup_key,
+};
 use openshell_policy_runtime_interface::DestinationPolicy;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;

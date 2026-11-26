@@ -8,10 +8,11 @@ use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
-use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, wire};
+use crate::policy_dns::{PolicyDnsService, SocketTrustedResolver, wire};
 use crate::policy_engine::PolicyEngine;
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::net::POLICY_LOCAL_ADDRESS;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};

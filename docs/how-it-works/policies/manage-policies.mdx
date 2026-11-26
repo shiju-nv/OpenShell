@@ -21,6 +21,10 @@ gateway or sandbox is required. Schema and conversion errors stop validation;
 after parsing, safety, credential-binding, ambiguity and built-in middleware
 errors are reported together.
 
+Lint warns about control-plane port conflicts it can identify from the file
+alone. Each warning shows the rule, host, and blocked port. Lint still succeeds
+if the policy is otherwise valid.
+
 A successful lint uses this CLI version's validation rules. It does not check
 attached providers, registered external middleware, image identity, or driver
 requirements, and does not establish that the sandbox will start. To validate

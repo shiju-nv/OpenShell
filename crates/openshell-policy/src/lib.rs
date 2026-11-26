@@ -2668,6 +2668,53 @@ pub fn validate_and_canonicalize_authored_policy(
     }
 }
 
+/// Report blocked control-plane ports in a validated authored YAML policy.
+///
+/// Exact hosts and explicit IP constraints select the supervisor's guarded
+/// destination modes. Driver aliases and the sandbox-local policy API have
+/// their own routing rules.
+#[must_use]
+pub fn control_plane_port_warnings(policy: &SandboxPolicy) -> Vec<String> {
+    use openshell_core::net::{
+        BLOCKED_CONTROL_PLANE_PORTS, POLICY_LOCAL_ADDRESS, POLICY_LOCAL_HOST,
+        is_host_gateway_alias, normalize_host_lookup_key,
+    };
+    use openshell_core::policy_l7::selector_ports;
+
+    let mut warnings = Vec::new();
+    let mut rules: Vec<_> = policy.network_policies.iter().collect();
+    rules.sort_by_key(|(name, _)| *name);
+    for (name, rule) in rules {
+        for (index, endpoint) in rule.endpoints.iter().enumerate() {
+            let host = &endpoint.host;
+            let lookup_host = normalize_host_lookup_key(host);
+            if host.contains(char::is_whitespace)
+                || is_host_gateway_alias(host)
+                || lookup_host.eq_ignore_ascii_case(POLICY_LOCAL_HOST)
+                || lookup_host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.to_canonical() == IpAddr::V4(POLICY_LOCAL_ADDRESS))
+            {
+                continue;
+            }
+            let exact_host = !host.is_empty() && !host.contains('*');
+            if !exact_host && endpoint.allowed_ips.is_empty() {
+                continue;
+            }
+            let selector = if host.is_empty() { "<any-host>" } else { host };
+            let ports = selector_ports(endpoint);
+            for &port in BLOCKED_CONTROL_PLANE_PORTS {
+                if ports.contains(&u32::from(port)) {
+                    warnings.push(format!(
+                        "network policy {name:?} endpoint[{index}] ({selector:?}) uses blocked control-plane port {port} for TCP egress"
+                    ));
+                }
+            }
+        }
+    }
+    warnings
+}
+
 /// Reject authored rule keys reserved for provider composition.
 pub fn validate_authored_rule_names(
     policy: &SandboxPolicy,

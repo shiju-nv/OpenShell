@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-pub const POLICY_LOCAL_HOST: &str = "policy.local";
+pub use openshell_core::net::POLICY_LOCAL_HOST;
 
 /// Filesystem path of the static agent guidance bundle inside the sandbox.
 ///

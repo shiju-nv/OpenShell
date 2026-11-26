@@ -5951,11 +5951,17 @@ pub fn sandbox_policy_lint(policy_path: &str) -> Result<()> {
             violations.push(format!("middleware config '{name}' is invalid: {error}"));
         }
     }
-    if let Err(error) = openshell_policy::validate_and_canonicalize_authored_policy(policy) {
-        violations.extend(error);
-    }
-    if !violations.is_empty() {
-        miette::bail!("policy is invalid:\n- {}", violations.join("\n- "));
+    let policy = match openshell_policy::validate_and_canonicalize_authored_policy(policy) {
+        Ok(policy) if violations.is_empty() => policy,
+        result => {
+            if let Err(errors) = result {
+                violations.extend(errors);
+            }
+            miette::bail!("policy is invalid:\n- {}", violations.join("\n- "));
+        }
+    };
+    for warning in openshell_policy::control_plane_port_warnings(&policy) {
+        eprintln!("Warning: {warning}");
     }
     println!("Policy is valid (offline): {policy_path}");
     println!("Gateway checks for providers, external middleware, images and drivers are not run.");
